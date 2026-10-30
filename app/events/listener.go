@@ -69,10 +69,16 @@ type TelegramListener struct {
 	WarnWindow              time.Duration // sliding window for counting warns
 	Warnings                Warnings      // storage for admin /warn records
 	AdmitDocuments          bool          // admit text-less documents for detector checks and locator-backed counters
+	AdmitContacts           bool          // admit text-less shared contacts, same as AdmitDocuments
+	AdmitAudio              bool          // admit text-less audio files, same as AdmitDocuments
+	CaptchaEnabled          bool          // verify new members of the primary chat with a motion captcha
+	CaptchaTimeout          time.Duration // time to solve the captcha before the member is removed
+	CaptchaMessage          string        // captcha prompt with {user} and {timeout} placeholders
 
 	adminHandler    *admin
 	reportsHandler  *userReports
-	dmUsers         dmUsers // recent DM senders, stored in memory for admin UI
+	captcha         *captcha // nil when captcha is disabled
+	dmUsers         dmUsers  // recent DM senders, stored in memory for admin UI
 	chatID          int64
 	adminChatID     int64
 	linkedChannelID int64 // channel linked to the discussion group, resolved at startup
@@ -174,6 +180,17 @@ func (l *TelegramListener) Do(ctx context.Context) error {
 			l.AggressiveCleanupLimit)
 	}
 
+	if l.CaptchaEnabled {
+		switch {
+		case l.TrainingMode || l.Dry:
+			log.Printf("[WARN] captcha disabled in training and dry modes")
+		default:
+			l.captcha = newCaptcha(l.TbAPI, l.chatID, l.CaptchaTimeout, l.CaptchaMessage)
+			defer l.captcha.Stop()
+			log.Printf("[INFO] captcha enabled, timeout %v", l.CaptchaTimeout)
+		}
+	}
+
 	u := tbapi.NewUpdate(0)
 	u.Timeout = 60
 	u.AllowedUpdates = []string{"message", "edited_message", "callback_query", "message_reaction"}
@@ -212,6 +229,11 @@ func (l *TelegramListener) Do(ctx context.Context) error {
 			// handle admin chat inline buttons - route based on callback prefix
 			if update.CallbackQuery != nil {
 				callbackData := update.CallbackQuery.Data
+
+				if strings.HasPrefix(callbackData, captchaPrefix) {
+					l.procCaptchaCallback(update.CallbackQuery)
+					continue
+				}
 
 				// delegate report callbacks (prefixes R+, R-, R?, R!, RX) to reportsHandler
 				if len(callbackData) >= 3 && callbackData[:1] == "R" {
@@ -276,6 +298,9 @@ func (l *TelegramListener) Do(ctx context.Context) error {
 
 			// handle left member messages, i.e. "blah blah removed from the chat"
 			if update.Message.LeftChatMember != nil {
+				if l.captcha != nil && update.Message.Chat.ID == l.chatID {
+					l.captcha.Cancel(update.Message.LeftChatMember.ID)
+				}
 				if l.SuppressJoinMessage {
 					// delete the stored join message when user leaves
 					err := l.procLeftChatMemberMessage(update)
@@ -392,19 +417,26 @@ func (l *TelegramListener) procEvents(update tbapi.Update) error {
 		return nil
 	}
 
+	// a member with an unsolved captcha is muted; anything that got through before the mute is removed
+	if l.captcha != nil && fromChat == l.chatID && update.Message.From != nil && l.captcha.IsPending(update.Message.From.ID) {
+		l.deleteSystemMessage(update.Message.MessageID, fromChat, "unverified member")
+		return nil
+	}
+
 	log.Printf("[DEBUG] %s", string(msgJSON))
 	msg := transform(update.Message)
 
-	// a text-less document is admitted only when the documents check is on. once admitted it is stored by
-	// the locator, inflating the per-user count --max-short-msg-count bans on, and it reaches the checks
-	// that need no message text: stop-words (matched against username and user ID too), username-symbols,
-	// lua plugins and CAS, which is on by default and bans permanently
-	documentAdmitted := msg.WithDocument && l.AdmitDocuments
+	// a text-less document, contact or audio file is admitted only when its meta check is on. once admitted
+	// it is stored by the locator, inflating the per-user count --max-short-msg-count bans on, and it reaches
+	// the checks that need no message text: stop-words (matched against username and user ID too),
+	// username-symbols, lua plugins and CAS, which is on by default and bans permanently
+	metaAdmitted := (msg.WithDocument && l.AdmitDocuments) || (msg.WithContact && l.AdmitContacts) ||
+		(msg.WithAudio && l.AdmitAudio)
 
 	// ignore messages with empty text, no media, no video, no video note, no forward, no external reply,
-	// no admitted document
+	// no admitted document, contact or audio
 	if strings.TrimSpace(msg.Text) == "" && msg.Image == nil && !msg.WithVideoNote && !msg.WithVideo &&
-		!msg.WithForward && !msg.WithExternalReply && !documentAdmitted {
+		!msg.WithForward && !msg.WithExternalReply && !metaAdmitted {
 		// an edit that removed the text is not checked, so its earlier text would keep counting as a duplicate
 		if update.Message.EditDate != 0 {
 			l.Bot.ForgetMessage(*msg)
@@ -588,6 +620,7 @@ func (l *TelegramListener) procUserReply(ctx context.Context, update tbapi.Updat
 // procJoin runs the Lua join checks for every new member of the monitored group and bans the flagged ones.
 // it checks the members, not the sender of the service message, so a member added by someone else is
 // checked too. the bot itself and superusers are skipped; approved users are skipped by Bot.OnJoin.
+// a member who passes is verified with the captcha when it is enabled.
 func (l *TelegramListener) procJoin(ctx context.Context, msg *tbapi.Message) error {
 	if msg.Chat.ID != l.chatID {
 		return nil
@@ -608,6 +641,9 @@ func (l *TelegramListener) procJoin(ctx context.Context, msg *tbapi.Message) err
 
 		resp := l.Bot.OnJoin(user)
 		if resp.BanInterval <= 0 {
+			if err := l.startCaptcha(msg, member, user); err != nil {
+				errs = multierror.Append(errs, err)
+			}
 			continue
 		}
 
@@ -633,6 +669,32 @@ func (l *TelegramListener) procJoin(ctx context.Context, msg *tbapi.Message) err
 		return fmt.Errorf("failed to process join check: %w", err)
 	}
 	return nil
+}
+
+// procCaptchaCallback passes a captcha keypad press to the captcha. with the captcha disabled, a press on a
+// message left from an earlier run is still answered, otherwise the client spins until it times out
+func (l *TelegramListener) procCaptchaCallback(query *tbapi.CallbackQuery) {
+	if l.captcha == nil {
+		if _, err := l.TbAPI.Request(tbapi.NewCallback(query.ID, captchaExpired)); err != nil {
+			log.Printf("[WARN] failed to answer captcha callback: %v", err)
+		}
+		return
+	}
+	if err := l.captcha.HandleCallback(query); err != nil {
+		log.Printf("[WARN] failed to process captcha callback: %v", err)
+	}
+}
+
+// startCaptcha verifies a member who passed the join check. bots, approved users and members added
+// by a superuser are trusted
+func (l *TelegramListener) startCaptcha(msg *tbapi.Message, member tbapi.User, user bot.User) error {
+	if l.captcha == nil || member.IsBot || l.Bot.IsApprovedUser(member.ID) {
+		return nil
+	}
+	if msg.From != nil && msg.From.ID != member.ID && l.SuperUsers.IsSuper(msg.From.UserName, msg.From.ID) {
+		return nil
+	}
+	return l.captcha.Start(user)
 }
 
 // joinBanCause names the plugins that flagged a member on join, sorted for a stable notification text

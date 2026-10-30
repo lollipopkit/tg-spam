@@ -191,6 +191,12 @@ type options struct {
 		Window    time.Duration `long:"window" env:"WINDOW" default:"720h" description:"sliding window for counting warns"`
 	} `group:"warn" namespace:"warn" env-namespace:"WARN"`
 
+	Captcha struct {
+		Enabled bool          `long:"enabled" env:"ENABLED" description:"verify new members with a motion captcha"`
+		Timeout time.Duration `long:"timeout" env:"TIMEOUT" default:"2m" description:"time to solve the captcha before the member is removed"`
+		Message string        `long:"message" env:"MESSAGE" default:"{user}, enter the number moving in the animation within {timeout}, otherwise you will be removed from the chat. Tap the animation if it does not play." description:"captcha prompt, {user} and {timeout} are replaced"`
+	} `group:"captcha" namespace:"captcha" env-namespace:"CAPTCHA"`
+
 	Files struct {
 		SamplesDataPath string        `long:"samples" env:"SAMPLES" description:"samples data path, defaults to dynamic data path"`
 		DynamicDataPath string        `long:"dynamic" env:"DYNAMIC" default:"data" description:"dynamic data path"`
@@ -544,6 +550,11 @@ func execute(ctx context.Context, settings *config.Settings, reloadNormalize fun
 		WarnWindow:              settings.Warn.Window,
 		Warnings:                warningsStore,
 		AdmitDocuments:          settings.Meta.DocumentsOnly,
+		AdmitContacts:           settings.Meta.ContactOnly,
+		AdmitAudio:              settings.Meta.AudiosOnly,
+		CaptchaEnabled:          settings.Captcha.Enabled,
+		CaptchaTimeout:          settings.Captcha.Timeout,
+		CaptchaMessage:          settings.Captcha.Message,
 	}
 
 	if settings.Delete.JoinMessages {

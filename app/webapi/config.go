@@ -574,6 +574,18 @@ func updateSettingsFromForm(settings *config.Settings, r *http.Request) {
 		}
 	}
 
+	// captcha. captchaEnabled is a rendered checkbox, so its absence means unchecked; the timeout and the
+	// message are gated on form key presence like warnWindow, so unrelated saves preserve them
+	settings.Captcha.Enabled = r.FormValue("captchaEnabled") == "on"
+	if _, ok := r.Form["captchaTimeout"]; ok {
+		if d, err := time.ParseDuration(r.FormValue("captchaTimeout")); err == nil {
+			settings.Captcha.Timeout = d
+		}
+	}
+	if _, ok := r.Form["captchaMessage"]; ok {
+		settings.Captcha.Message = r.FormValue("captchaMessage")
+	}
+
 	// service-message deletion. These flags are not rendered in the ConfigDB UI
 	// form; gate the writes on form presence so unrelated saves don't wipe them.
 	if _, ok := r.Form["deleteJoinMessages"]; ok {
