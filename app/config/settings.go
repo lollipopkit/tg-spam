@@ -8,11 +8,27 @@ import (
 	"fmt"
 	"math"
 	"reflect"
+	"strings"
 	"time"
+	"unicode/utf16"
 
 	"github.com/umputun/tg-spam/app/storage"
 	"github.com/umputun/tg-spam/lib/tgspam"
 )
+
+// captcha timeout bounds. the lower one leaves a member time to read the prompt, the upper one keeps the join
+// restriction (timeout plus a grace minute) well within the 366 days telegram accepts
+const (
+	MinCaptchaTimeout = 10 * time.Second
+	MaxCaptchaTimeout = 24 * time.Hour
+)
+
+// MaxCaptchaMessageLen bounds the captcha caption template in UTF-16 units, the way telegram counts its
+// 1024 caption limit, with each {user} counted as the longest display name and {timeout} as "23h59m59s"
+const MaxCaptchaMessageLen = 1024
+
+// captchaMentionLen is the longest {user} expansion: 64 first name, a space, 64 last name
+const captchaMentionLen = 129
 
 // Settings represents application configuration independent of source (CLI, DB, etc)
 type Settings struct {
@@ -40,6 +56,7 @@ type Settings struct {
 	Reactions     ReactionsSettings     `json:"reactions" yaml:"reactions" db:"reactions"`
 	Report        ReportSettings        `json:"report" yaml:"report" db:"report"`
 	Warn          WarnSettings          `json:"warn" yaml:"warn" db:"warn"`
+	Captcha       CaptchaSettings       `json:"captcha" yaml:"captcha" db:"captcha"`
 
 	// spam detection settings
 	SimilarityThreshold float64 `json:"similarity_threshold" yaml:"similarity_threshold" db:"similarity_threshold"`
@@ -219,6 +236,13 @@ type WarnSettings struct {
 	Window    time.Duration `json:"window" yaml:"window" db:"warn_window"`
 }
 
+// CaptchaSettings contains new member verification settings
+type CaptchaSettings struct {
+	Enabled bool          `json:"enabled" yaml:"enabled" db:"captcha_enabled"`
+	Timeout time.Duration `json:"timeout" yaml:"timeout" db:"captcha_timeout"`
+	Message string        `json:"message" yaml:"message" db:"captcha_message"`
+}
+
 // LuaPluginsSettings contains Lua plugins settings
 type LuaPluginsSettings struct {
 	Enabled        bool     `json:"enabled" yaml:"enabled" db:"lua_plugins_enabled"`
@@ -322,6 +346,14 @@ func (s *Settings) Validate() error {
 	if s.Warn.Threshold > 0 && s.Warn.Window > storage.WarningsRetention {
 		return fmt.Errorf("warn.window (%v) exceeds storage retention (%v); older rows are pruned and would not be counted",
 			s.Warn.Window, storage.WarningsRetention)
+	}
+	if s.Captcha.Enabled && (s.Captcha.Timeout < MinCaptchaTimeout || s.Captcha.Timeout > MaxCaptchaTimeout) {
+		return fmt.Errorf("captcha.timeout (%v) must be between %v and %v", s.Captcha.Timeout, MinCaptchaTimeout, MaxCaptchaTimeout)
+	}
+	if s.Captcha.Enabled {
+		if err := validateCaptchaMessage(s.Captcha.Message); err != nil {
+			return err
+		}
 	}
 	if s.MaxShortMsgCount < 0 {
 		return fmt.Errorf("max-short-msg-count (%d) must be >= 0 (0 disables)", s.MaxShortMsgCount)
@@ -428,6 +460,21 @@ func (s *Settings) IsCASEnabled() bool {
 // IsStartupMessageEnabled returns true if a startup message is configured
 func (s *Settings) IsStartupMessageEnabled() bool {
 	return s.Message.Startup != ""
+}
+
+// validateCaptchaMessage rejects an empty captcha caption and one that can exceed telegram's caption limit
+// once the placeholders are expanded. a caption over the limit fails every send and lets members in unverified
+func validateCaptchaMessage(msg string) error {
+	if strings.TrimSpace(msg) == "" {
+		return fmt.Errorf("captcha.message must not be empty")
+	}
+	expanded := strings.ReplaceAll(msg, "{user}", strings.Repeat("x", captchaMentionLen))
+	expanded = strings.ReplaceAll(expanded, "{timeout}", "23h59m59s")
+	if n := len(utf16.Encode([]rune(expanded))); n > MaxCaptchaMessageLen {
+		return fmt.Errorf("captcha.message is too long, %d characters with placeholders expanded, max %d",
+			n, MaxCaptchaMessageLen)
+	}
+	return nil
 }
 
 // zeroAwarePaths lists Settings field paths where the zero value is a meaningful

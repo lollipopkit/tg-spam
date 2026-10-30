@@ -3,6 +3,7 @@ package config
 import (
 	"encoding/json"
 	"math"
+	"strings"
 	"testing"
 	"time"
 
@@ -812,6 +813,40 @@ func TestSettings_Validate(t *testing.T) {
 			}
 			require.Error(t, err)
 			assert.Contains(t, err.Error(), tt.wantErr)
+		})
+	}
+}
+
+func TestSettings_ValidateCaptcha(t *testing.T) {
+	captcha := func(timeout time.Duration, msg string) *Settings {
+		return &Settings{Captcha: CaptchaSettings{Enabled: true, Timeout: timeout, Message: msg}}
+	}
+	tests := []struct {
+		name    string
+		s       *Settings
+		wantErr string
+	}{
+		{name: "valid", s: captcha(2*time.Minute, "{user}, enter the number within {timeout}")},
+		{name: "disabled is not validated", s: &Settings{Captcha: CaptchaSettings{Timeout: time.Second}}},
+		{name: "timeout bounds inclusive", s: captcha(MinCaptchaTimeout, "x")},
+		{name: "max timeout", s: captcha(MaxCaptchaTimeout, "x")},
+		{name: "timeout too short", s: captcha(5*time.Second, "x"), wantErr: "captcha.timeout (5s) must be between 10s and 24h0m0s"},
+		{name: "timeout too long", s: captcha(25*time.Hour, "x"), wantErr: "captcha.timeout (25h0m0s) must be between"},
+		{name: "empty message", s: captcha(time.Minute, "  "), wantErr: "captcha.message must not be empty"},
+		{name: "message at the limit", s: captcha(time.Minute, "{user}"+strings.Repeat("字", 1024-129))},
+		{name: "message over the limit with the mention expanded",
+			s: captcha(time.Minute, "{user}"+strings.Repeat("字", 1024-128)), wantErr: "captcha.message is too long, 1025"},
+		{name: "emoji count as two units", s: captcha(time.Minute, strings.Repeat("🙂", 513)),
+			wantErr: "captcha.message is too long, 1026"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := tt.s.Validate()
+			if tt.wantErr == "" {
+				require.NoError(t, err)
+				return
+			}
+			require.ErrorContains(t, err, tt.wantErr)
 		})
 	}
 }

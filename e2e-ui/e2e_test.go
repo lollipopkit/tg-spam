@@ -254,7 +254,7 @@ func TestSettings_PageLoads(t *testing.T) {
 	assert.Contains(t, title, "Settings")
 }
 
-func TestSettings_WarnAutoBanPersists(t *testing.T) {
+func TestSettings_WarnAndCaptchaPersist(t *testing.T) {
 	const (
 		warnPort       = 18091
 		warnDBPath     = "/tmp/tg-spam-e2e-warn.db"
@@ -263,6 +263,8 @@ func TestSettings_WarnAutoBanPersists(t *testing.T) {
 		warnUser       = "tg-spam"
 		warnThreshold  = "5"
 		warnWindowText = "168h0m0s"
+		captchaTimeout = "5m0s"
+		captchaMessage = "{user}, введите число за {timeout}"
 	)
 	warnURL := fmt.Sprintf("http://localhost:%d", warnPort)
 
@@ -339,10 +341,19 @@ func TestSettings_WarnAutoBanPersists(t *testing.T) {
 	defaultWindow, err := page.Locator("#warnWindow").InputValue()
 	require.NoError(t, err)
 	assert.Equal(t, "720h0m0s", defaultWindow)
+	captchaChecked, err := page.Locator("#captchaEnabled").IsChecked()
+	require.NoError(t, err)
+	assert.False(t, captchaChecked)
+	defaultCaptchaTimeout, err := page.Locator("#captchaTimeout").InputValue()
+	require.NoError(t, err)
+	assert.Equal(t, "2m0s", defaultCaptchaTimeout)
 
 	// change values and save
 	require.NoError(t, page.Locator("#warnThreshold").Fill(warnThreshold))
 	require.NoError(t, page.Locator("#warnWindow").Fill(warnWindowText))
+	require.NoError(t, page.Locator("#captchaEnabled").Check())
+	require.NoError(t, page.Locator("#captchaTimeout").Fill(captchaTimeout))
+	require.NoError(t, page.Locator("#captchaMessage").Fill(captchaMessage))
 	require.NoError(t, page.Locator("button[type='submit']:has-text('Save Changes')").Click())
 
 	// wait for the save success alert
@@ -363,6 +374,15 @@ func TestSettings_WarnAutoBanPersists(t *testing.T) {
 	got, err = page.Locator("#warnWindow").InputValue()
 	require.NoError(t, err)
 	assert.Equal(t, warnWindowText, got)
+	captchaChecked, err = page.Locator("#captchaEnabled").IsChecked()
+	require.NoError(t, err)
+	assert.True(t, captchaChecked)
+	got, err = page.Locator("#captchaTimeout").InputValue()
+	require.NoError(t, err)
+	assert.Equal(t, captchaTimeout, got)
+	got, err = page.Locator("#captchaMessage").InputValue()
+	require.NoError(t, err)
+	assert.Equal(t, captchaMessage, got)
 }
 
 func TestSettings_MaxShortMsgCountPersists(t *testing.T) {

@@ -3076,58 +3076,51 @@ func TestTelegramListener_ForwardedGiveaway(t *testing.T) {
 	require.Len(t, mockLogger.SaveCalls(), 1)
 }
 
-func TestTelegramListener_CaptionlessDocumentIntake(t *testing.T) {
+func TestTelegramListener_TextlessMetaIntake(t *testing.T) {
+	document := func(m *tbapi.Message) { m.Document = &tbapi.Document{FileID: "doc1"} }
+	contact := func(m *tbapi.Message) { m.Contact = &tbapi.Contact{PhoneNumber: "+100", FirstName: "Ads"} }
+	audio := func(m *tbapi.Message) { m.Audio = &tbapi.Audio{FileID: "audio1"} }
 	tests := []struct {
-		name           string
-		admitDocuments bool
-		wantChecked    bool
+		name        string
+		attach      func(m *tbapi.Message)
+		mutate      func(l *TelegramListener)
+		wantChecked bool
 	}{
-		{name: "documents check on, message reaches the detector", admitDocuments: true, wantChecked: true},
-		{name: "documents check off, message dropped on intake", admitDocuments: false, wantChecked: false},
+		{name: "document, check on", attach: document, mutate: func(l *TelegramListener) { l.AdmitDocuments = true },
+			wantChecked: true},
+		{name: "document, check off", attach: document, mutate: func(l *TelegramListener) {}},
+		{name: "document, other checks on", attach: document,
+			mutate: func(l *TelegramListener) { l.AdmitContacts, l.AdmitAudio = true, true }},
+		{name: "contact, check on", attach: contact, mutate: func(l *TelegramListener) { l.AdmitContacts = true },
+			wantChecked: true},
+		{name: "contact, check off", attach: contact, mutate: func(l *TelegramListener) {}},
+		{name: "audio, check on", attach: audio, mutate: func(l *TelegramListener) { l.AdmitAudio = true }, wantChecked: true},
+		{name: "audio, check off", attach: audio, mutate: func(l *TelegramListener) {}},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			mockLogger := &mocks.SpamLoggerMock{SaveFunc: func(msg *bot.Message, response *bot.Response) {}}
-			mockAPI := &mocks.TbAPIMock{
-				GetChatFunc: func(config tbapi.ChatInfoConfig) (tbapi.ChatFullInfo, error) {
-					return tbapi.ChatFullInfo{Chat: tbapi.Chat{ID: 123}}, nil
-				},
-				GetChatAdministratorsFunc: func(config tbapi.ChatAdministratorsConfig) ([]tbapi.ChatMember, error) {
-					return nil, nil
-				},
-			}
 			botMock := &mocks.BotMock{
 				OnMessageFunc: func(msg bot.Message, checkOnly bool) bot.Response { return bot.Response{} },
 			}
-
 			locator, teardown := prepTestLocator(t)
 			defer teardown()
 
 			l := TelegramListener{
-				SpamLogger:     mockLogger,
-				TbAPI:          mockAPI,
-				Bot:            botMock,
-				Group:          "gr",
-				Locator:        locator,
-				SuperUsers:     SuperUsers{"super"},
-				chatID:         123,
-				AdmitDocuments: tt.admitDocuments,
+				SpamLogger: &mocks.SpamLoggerMock{SaveFunc: func(msg *bot.Message, response *bot.Response) {}},
+				TbAPI:      &mocks.TbAPIMock{},
+				Bot:        botMock,
+				Group:      "gr",
+				Locator:    locator,
+				SuperUsers: SuperUsers{"super"},
+				chatID:     123,
 			}
+			tt.mutate(&l)
 
-			update := tbapi.Update{
-				Message: &tbapi.Message{
-					Chat:      tbapi.Chat{ID: 123},
-					From:      &tbapi.User{ID: 456, UserName: "user"},
-					Date:      time.Now().Unix(),
-					Text:      "", // no caption
-					Document:  &tbapi.Document{FileID: "doc1"},
-					MessageID: 789,
-				},
-			}
-
-			err := l.procEvents(update)
-			require.NoError(t, err)
+			msg := &tbapi.Message{Chat: tbapi.Chat{ID: 123}, From: &tbapi.User{ID: 456, UserName: "user"},
+				Date: time.Now().Unix(), MessageID: 789}
+			tt.attach(msg)
+			require.NoError(t, l.procEvents(tbapi.Update{Message: msg}))
 
 			if !tt.wantChecked {
 				// with the check off the message must be dropped before the locator, otherwise it would
@@ -3135,13 +3128,14 @@ func TestTelegramListener_CaptionlessDocumentIntake(t *testing.T) {
 				assert.Empty(t, botMock.OnMessageCalls())
 				count, cErr := locator.CountUserMessages(context.Background(), "456")
 				require.NoError(t, cErr)
-				assert.Equal(t, 0, count, "caption-less document must not be stored in the locator")
+				assert.Equal(t, 0, count, "text-less message must not be stored in the locator")
 				return
 			}
 
 			require.Len(t, botMock.OnMessageCalls(), 1)
-			assert.True(t, botMock.OnMessageCalls()[0].Msg.WithDocument)
-			assert.Empty(t, botMock.OnMessageCalls()[0].Msg.Text)
+			got := botMock.OnMessageCalls()[0].Msg
+			assert.True(t, got.WithDocument || got.WithContact || got.WithAudio)
+			assert.Empty(t, got.Text)
 		})
 	}
 }

@@ -484,6 +484,29 @@ Notes:
 - Repeat bans are intentional: if an already-banned user is warned again, the threshold check fires again and re-bans them. Telegram treats banning an already-banned user as a no-op, so this is safe and serves as audit visibility for repeat offenders.
 - Toggling `--warn.threshold` from `0` to a positive value (or vice versa) requires a process restart: the warnings storage is wired only at startup. Runtime changes via the settings UI are persisted but take effect only after the next restart.
 
+### Join Captcha
+
+`--captcha.enabled` / `$CAPTCHA_ENABLED` verifies new members of the primary group before they can post. Disabled by default. The challenge is built to be easy for people and hard for bots driven by vision models: the bot posts an animation of black and white noise in which a three-digit number is visible only while it plays. Noise inside the digits scrolls down and noise outside scrolls up, so the eye picks the digits out of the motion, while every single frame, and the average of all frames, is uniform noise with nothing to read.
+
+When a member joins:
+
+1. The Lua join checks run first; a member they flag is banned as before and gets no captcha. A member who is already restricted (soft-banned, or muted by an admin) gets no captcha either and keeps the restriction
+2. The member is muted and the bot posts the animation with `--captcha.message` as its caption and a shuffled digit keypad with a backspace button. `{user}` becomes a mention of the member, `{timeout}` the time limit
+3. Entering the right number lifts the mute, so the group's default permissions apply, and deletes the captcha. Each press only shows progress; the number is checked once all three digits are in, so a guess has a 1 in 1000 chance. Presses by anyone else are ignored
+4. A wrong number, or no answer within `--captcha.timeout` (default `2m`, allowed `10s` to `24h`), deletes the captcha and bans the member for a cooldown: 5 minutes after the first failure, doubling with each further one up to 24 hours. Telegram lifts the ban when it ends, so a person who failed can join again later, while guessing by rejoining stays slow. Failures older than 24 hours are forgotten, and solving a captcha clears them
+
+Messages that reach the group from a member with an unsolved captcha are deleted. A member who leaves before answering has their captcha removed, and this counts as a failure without a ban, so leaving and rejoining for a fresh challenge runs into the cooldown. Superusers, group administrators, approved users, bots and members added by a superuser skip the captcha. The verification runs in the background, so a burst of joins does not hold up the bot; the timeout starts once the member can see the challenge.
+
+Notes:
+
+- The bot needs the "ban users" and "delete messages" admin rights.
+- The caption is sent as HTML with the template text escaped, so it can't carry formatting. It must not be empty and must fit Telegram's 1024-character caption limit with `{user}` counted as the longest possible name. Example in another language: `--captcha.message="{user}，请在 {timeout} 内输入动图中移动的数字，否则会被移出群组。"`
+- The captcha is driven by join service messages, so it does not run for a member whose join produces no such message. `--delete.join-messages` is fine: the bot receives the message before deleting it.
+- A program written for this particular captcha can recover the digits by comparing consecutive frames. The captcha targets generic automation and general-purpose models; the message spam checks still apply once a member is in.
+- Telegram converts the GIF to an MP4 animation. The noise uses large blocks moving at 10 frames per second so the motion survives that, but check it in your group's clients before relying on it; the default caption tells members to tap the animation if their client does not autoplay.
+- Pending captchas and failure counts are kept in memory. On shutdown the pending captcha messages are deleted; the mute expires one minute after the timeout on its own, so a restart never leaves a member muted for good, and such a member is not removed either.
+- In `--training` and `--dry` modes the captcha is disabled. Changing the captcha settings in the web UI takes effect after a restart.
+
 ### Lua Plugins Support
 
 TG-Spam supports custom spam detection through Lua plugins. This allows users to extend the spam detection capabilities without modifying the Go codebase.
@@ -809,6 +832,11 @@ report:
 warn:
       --warn.threshold=                 auto-ban after N warns within window (0=disabled) (default: 0) [$WARN_THRESHOLD]
       --warn.window=                    sliding window for counting warns (default: 720h) [$WARN_WINDOW]
+
+captcha:
+      --captcha.enabled                 verify new members with a motion captcha [$CAPTCHA_ENABLED]
+      --captcha.timeout=                time to solve the captcha before the member is removed (default: 2m) [$CAPTCHA_TIMEOUT]
+      --captcha.message=                captcha prompt, {user} and {timeout} are replaced (default: {user}, enter the number moving in the animation within {timeout}, otherwise you will be removed from the chat. Tap the animation if it does not play.) [$CAPTCHA_MESSAGE]
 
 files:
       --files.samples=                  samples data path, defaults to dynamic data path [$FILES_SAMPLES]
