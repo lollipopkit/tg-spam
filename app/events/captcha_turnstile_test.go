@@ -162,6 +162,8 @@ func TestCaptcha_WithTurnstile(t *testing.T) {
 	assert.Equal(t, "https://V.Example.com", c.turnstile.cfg.PublicURL)
 	assert.Equal(t, "v.example.com", c.turnstile.host, "lower-cased, as siteverify reports it")
 	assert.Equal(t, time.Minute+captchaGrace, c.turnstile.loginAge)
+	assert.Empty(t, c.turnstile.cfg.BotToken, "only the derived login key is kept")
+	assert.Equal(t, sha256.Sum256([]byte(testBotToken)), c.turnstile.loginKey)
 }
 
 func TestCaptcha_TurnstileJoin(t *testing.T) {
@@ -172,8 +174,8 @@ func TestCaptcha_TurnstileJoin(t *testing.T) {
 		require.Len(t, api.SendCalls(), 1)
 		msg := api.SendCalls()[0].C.(tbapi.MessageConfig)
 		assert.Equal(t, int64(123), msg.ChatID)
-		assert.Equal(t, `<a href="tg://user?id=42">New</a>, press the button below and complete the check within 1m, `+
-			`otherwise you will be removed from the chat.`, msg.Text)
+		assert.Equal(t, `<a href="tg://user?id=42">New</a>，请在 1m 内点击下方按钮完成验证，否则会被移出群组。`, msg.Text,
+			"the default prompt in the member's language")
 		button := msg.ReplyMarkup.(tbapi.InlineKeyboardMarkup).InlineKeyboard[0][0]
 		assert.Equal(t, "点击验证", button.Text, "button in the member's language")
 		nonce := postedNonce(t, c)
@@ -271,6 +273,27 @@ func TestCaptcha_TurnstileJoin(t *testing.T) {
 		assert.Empty(t, c.nonces)
 		c.mu.Unlock()
 		assert.Len(t, requestsOf[tbapi.RestrictChatMemberConfig](api), 1, "still muted, not let in unverified")
+		assert.True(t, c.turnstile.refused.Load(), "domain refusal remembered")
+
+		c.Start(bot.User{ID: 43}, "")
+		c.running.Wait()
+		require.Len(t, api.SendCalls(), 3, "no second login button attempt")
+		_, ok = api.SendCalls()[2].C.(tbapi.AnimationConfig)
+		assert.True(t, ok)
+	})
+
+	t.Run("other send errors are not remembered", func(t *testing.T) {
+		c, api, _ := newTurnstileCaptcha(t, time.Minute, "verify.example.com")
+		c.render = stubRender
+		api.SendFunc = func(cfg tbapi.Chattable) (tbapi.Message, error) {
+			if _, ok := cfg.(tbapi.MessageConfig); ok {
+				return tbapi.Message{}, errors.New("timeout")
+			}
+			return tbapi.Message{MessageID: 78}, nil
+		}
+		c.Start(bot.User{ID: 42}, "")
+		c.running.Wait()
+		assert.False(t, c.turnstile.refused.Load())
 	})
 
 	t.Run("only the member's own telegram login opens the page", func(t *testing.T) {
@@ -306,6 +329,8 @@ func TestCaptcha_TurnstileJoin(t *testing.T) {
 		assert.Equal(t, http.StatusNotFound, rec.Code)
 		assert.Contains(t, rec.Body.String(), "Эта проверка устарела")
 		assert.NotContains(t, rec.Body.String(), "data-sitekey")
+		assert.Equal(t, "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'; base-uri 'none'",
+			rec.Header().Get("Content-Security-Policy"), "no scripts on a page without the widget")
 		assert.Equal(t, http.StatusNotFound, doPage(c, http.MethodPost, "nope", "good", nil).Code)
 		assert.Empty(t, fake.forms, "no siteverify for an unknown page")
 
@@ -423,4 +448,25 @@ func TestCaptcha_ServeTurnstileError(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, ln.Close())
 	require.Error(t, c.ServeTurnstile(context.Background(), ln), "a dead listener is an error for Do to stop on")
+}
+
+func TestCaptcha_TurnstileFallbackTestTimeoutTellsNumber(t *testing.T) {
+	c, api, _ := newTurnstileCaptcha(t, 50*time.Millisecond, "verify.example.com")
+	c.render = stubRender
+	c.turnstile.refused.Store(true)
+	c.StartTest(bot.User{ID: 42}, "")
+	c.running.Wait()
+	code := pendingTestCode(t, c, 42)
+	require.Eventually(t, func() bool { return len(api.SendCalls()) == 2 }, time.Second, 10*time.Millisecond)
+	assert.Contains(t, api.SendCalls()[1].C.(tbapi.MessageConfig).Text, "the number was "+code,
+		"the fallback animation's number is told")
+}
+
+func pendingTestCode(t *testing.T, c *captcha, userID int64) string {
+	t.Helper()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	p, ok := c.tests[userID]
+	require.True(t, ok)
+	return p.code
 }

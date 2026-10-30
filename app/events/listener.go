@@ -199,8 +199,10 @@ func (l *TelegramListener) Do(ctx context.Context) error {
 					return fmt.Errorf("turnstile captcha: %w", err)
 				}
 				turnstileErr = make(chan error, 1)
+				pageCtx, stopPage := context.WithCancel(ctx) // the page server lives as long as Do
+				defer stopPage()
 				go func() {
-					if err := l.captcha.ServeTurnstile(ctx, ln); err != nil {
+					if err := l.captcha.ServeTurnstile(pageCtx, ln); err != nil {
 						turnstileErr <- err
 					}
 				}()
@@ -748,7 +750,12 @@ func (l *TelegramListener) startCaptcha(msg *tbapi.Message, member tbapi.User, u
 	if msg.From != nil && msg.From.ID != member.ID && l.SuperUsers.IsSuper(msg.From.UserName, msg.From.ID) {
 		return
 	}
-	l.captcha.Start(user, member.LanguageCode)
+	// telegram fills language_code on the update's sender, a member who joined by themselves is the sender
+	lang := member.LanguageCode
+	if msg.From != nil && msg.From.ID == member.ID && msg.From.LanguageCode != "" {
+		lang = msg.From.LanguageCode
+	}
+	l.captcha.Start(user, lang)
 }
 
 // joinBanCause names the plugins that flagged a member on join, sorted for a stable notification text

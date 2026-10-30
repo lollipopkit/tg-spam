@@ -200,7 +200,7 @@ type options struct {
 			SiteKey string `long:"site-key" env:"SITE_KEY" description:"Cloudflare Turnstile site key, switches the captcha to Turnstile"`
 			Secret  string `long:"secret" env:"SECRET" description:"Cloudflare Turnstile secret"`
 			URL     string `long:"url" env:"URL" description:"public https url the Turnstile page is reachable at"`
-			Listen  string `long:"listen" env:"LISTEN" default:":8081" description:"listen address of the Turnstile page"`
+			Listen  string `long:"listen" env:"LISTEN" default:"127.0.0.1:8081" description:"listen address of the Turnstile page"`
 		} `group:"turnstile" namespace:"turnstile" env-namespace:"TURNSTILE"`
 	} `group:"captcha" namespace:"captcha" env-namespace:"CAPTCHA"`
 

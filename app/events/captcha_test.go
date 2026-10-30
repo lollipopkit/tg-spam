@@ -671,6 +671,22 @@ func TestProcJoin_Captcha(t *testing.T) {
 		assert.Empty(t, api.RequestCalls())
 	})
 
+	t.Run("the language of a member who joined by themselves comes from the sender", func(t *testing.T) {
+		l, _ := setup(t, false)
+		from := tbapi.User{ID: 42, LanguageCode: "ru"}
+		require.NoError(t, l.procJoin(context.Background(), join(from, tbapi.User{ID: 42})))
+		l.captcha.mu.Lock()
+		assert.Equal(t, "ru", l.captcha.pending[42].lang)
+		l.captcha.mu.Unlock()
+
+		l, _ = setup(t, false)
+		require.NoError(t, l.procJoin(context.Background(), join(tbapi.User{ID: 1, LanguageCode: "ru"},
+			tbapi.User{ID: 43, LanguageCode: "zh"})))
+		l.captcha.mu.Lock()
+		assert.Equal(t, "zh", l.captcha.pending[43].lang, "an inviter's language is not the member's")
+		l.captcha.mu.Unlock()
+	})
+
 	t.Run("member added by a regular user gets a captcha", func(t *testing.T) {
 		l, _ := setup(t, false)
 		require.NoError(t, l.procJoin(context.Background(), join(tbapi.User{ID: 1, UserName: "friend"}, tbapi.User{ID: 43})))
@@ -841,7 +857,7 @@ func TestCaptcha_Test(t *testing.T) {
 		require.Len(t, api.SendCalls(), 1)
 		anim := api.SendCalls()[0].C.(tbapi.AnimationConfig)
 		assert.Equal(t, int64(42), anim.ChatID)
-		assert.Equal(t, c.prompt(bot.User{ID: 42, Username: "admin"}), anim.Caption)
+		assert.Equal(t, c.prompt(&pendingCaptcha{user: bot.User{ID: 42, Username: "admin"}}), anim.Caption)
 		assert.Empty(t, api.RequestCalls(), "no status read, mute or ban")
 		assert.False(t, c.IsPending(42), "not a join captcha")
 	})

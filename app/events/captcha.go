@@ -67,6 +67,7 @@ type pendingCaptcha struct {
 	msgID  int    // captcha message, 0 until posted
 	code   string // the number to choose, or the page nonce in Turnstile mode; set when posted
 	chosen string // candidate the member pressed
+	page   bool   // posted as a turnstile page rather than the animation
 	lang   string // member's telegram language, for the texts the bot shows them
 	timer  *time.Timer
 }
@@ -218,14 +219,6 @@ func (c *captcha) solved(p *pendingCaptcha) {
 	log.Printf("[INFO] captcha solved by %s", p.user)
 }
 
-// default captcha prompts, used when --captcha.message is empty
-const (
-	defaultMotionMessage = "{user}, choose the number moving in the animation within {timeout}, " +
-		"otherwise you will be removed from the chat. Tap the animation if it does not play."
-	defaultTurnstileMessage = "{user}, press the button below and complete the check within {timeout}, " +
-		"otherwise you will be removed from the chat."
-)
-
 // texts the bot shows members itself, by language; the prompt in the chat is --captcha.message
 const (
 	txtExpired = iota
@@ -245,6 +238,8 @@ const (
 	txtPageFailed
 	txtPageExpired
 	txtPageLogin
+	txtPromptMotion    // default caption of the animation, with {user} and {timeout}
+	txtPromptTurnstile // default caption of the turnstile button
 )
 
 var captchaTexts = map[string][]string{
@@ -259,14 +254,18 @@ var captchaTexts = map[string][]string{
 			"doubling with each further failure (test only, nothing happened to you)",
 		txtTestTimeout: "captcha test timed out after %s, the number was %s. a member would be removed " +
 			"(test only, nothing happened to you)",
-		txtTestError:       "captcha test failed: %s",
-		txtVerifyButton:    "Verify",
-		txtPageTitle:       "Verification",
-		txtPageHint:        "Complete the check below to be let into the chat.",
-		txtPageDone:        "Verified. You can go back to Telegram.",
-		txtPageFailed:      "The check did not pass. Please try again.",
-		txtPageExpired:     "This verification has expired or is already done.",
-		txtPageLogin:       "Open this page with the button in Telegram and allow the login, it tells the bot who you are.",
+		txtTestError:    "captcha test failed: %s",
+		txtVerifyButton: "Verify",
+		txtPageTitle:    "Verification",
+		txtPageHint:     "Complete the check below to be let into the chat.",
+		txtPageDone:     "Verified. You can go back to Telegram.",
+		txtPageFailed:   "The check did not pass. Please try again.",
+		txtPageExpired:  "This verification has expired or is already done.",
+		txtPageLogin:    "Open this page with the button in Telegram and allow the login, it tells the bot who you are.",
+		txtPromptMotion: "{user}, choose the number moving in the animation within {timeout}, otherwise you will be " +
+			"removed from the chat. Tap the animation if it does not play.",
+		txtPromptTurnstile: "{user}, press the button below and complete the check within {timeout}, " +
+			"otherwise you will be removed from the chat.",
 		txtTestTimeoutPage: "captcha test timed out after %s. a member would be removed (test only, nothing happened to you)",
 	},
 	"zh": { //nolint:gosec // user-facing texts, not credentials
@@ -286,6 +285,8 @@ var captchaTexts = map[string][]string{
 		txtPageFailed:      "验证未通过，请重试。",
 		txtPageExpired:     "此验证已失效或已完成。",
 		txtPageLogin:       "请在 Telegram 里点按钮打开此页面，并允许登录，bot 需要据此确认你的身份。",
+		txtPromptMotion:    "{user}，请在 {timeout} 内选择动图中移动的数字，否则会被移出群组。动图不动请点一下。",
+		txtPromptTurnstile: "{user}，请在 {timeout} 内点击下方按钮完成验证，否则会被移出群组。",
 		txtTestTimeoutPage: "验证测试已超时（%s）。成员会被移出（仅为测试，你不受影响）",
 	},
 	"ru": { //nolint:gosec // user-facing texts, not credentials
@@ -299,14 +300,18 @@ var captchaTexts = map[string][]string{
 			"при каждой следующей ошибке срок удваивается (это только тест, вас это не затронуло)",
 		txtTestTimeout: "время теста истекло (%s), верное число %s. участник был бы удалён " +
 			"(это только тест, вас это не затронуло)",
-		txtTestError:       "тест не удался: %s",
-		txtVerifyButton:    "Пройти проверку",
-		txtPageTitle:       "Проверка",
-		txtPageHint:        "Пройдите проверку ниже, чтобы писать в чате.",
-		txtPageDone:        "Проверка пройдена. Можно вернуться в Telegram.",
-		txtPageFailed:      "Проверка не пройдена. Попробуйте ещё раз.",
-		txtPageExpired:     "Эта проверка устарела или уже пройдена.",
-		txtPageLogin:       "Откройте эту страницу кнопкой в Telegram и разрешите вход, так бот узнает, кто вы.",
+		txtTestError:    "тест не удался: %s",
+		txtVerifyButton: "Пройти проверку",
+		txtPageTitle:    "Проверка",
+		txtPageHint:     "Пройдите проверку ниже, чтобы писать в чате.",
+		txtPageDone:     "Проверка пройдена. Можно вернуться в Telegram.",
+		txtPageFailed:   "Проверка не пройдена. Попробуйте ещё раз.",
+		txtPageExpired:  "Эта проверка устарела или уже пройдена.",
+		txtPageLogin:    "Откройте эту страницу кнопкой в Telegram и разрешите вход, так бот узнает, кто вы.",
+		txtPromptMotion: "{user}, выберите число, которое движется на анимации, в течение {timeout}, иначе вы будете " +
+			"удалены из чата. Нажмите на анимацию, если она не воспроизводится.",
+		txtPromptTurnstile: "{user}, нажмите кнопку ниже и пройдите проверку в течение {timeout}, иначе вы будете " +
+			"удалены из чата.",
 		txtTestTimeoutPage: "время теста истекло (%s). участник был бы удалён (это только тест, вас это не затронуло)",
 	},
 }
@@ -409,7 +414,7 @@ func (c *captcha) expireTest(p *pendingCaptcha) {
 		return
 	}
 	deleteMessage(c.tbAPI, p.chatID, p.msgID, "captcha")
-	if c.turnstile != nil {
+	if p.page {
 		c.sendText(p.chatID, captchaText(p.lang, txtTestTimeoutPage, compactDuration(c.timeout)))
 		return
 	}
@@ -465,7 +470,7 @@ func (c *captcha) posted(m map[int64]*pendingCaptcha, p *pendingCaptcha, msgID i
 	c.mu.Lock()
 	current := m[p.user.ID] == p
 	if current {
-		p.msgID, p.code = msgID, code
+		p.msgID, p.code, p.page = msgID, code, page
 		p.timer = time.AfterFunc(c.timeout, func() { onTimeout(p) })
 		if page {
 			c.nonces[code] = p
@@ -495,7 +500,7 @@ func (c *captcha) take(m map[int64]*pendingCaptcha, userID int64, want *pendingC
 
 // forgetNonce drops the page of a Turnstile captcha, call with mu held
 func (c *captcha) forgetNonce(p *pendingCaptcha) {
-	if c.turnstile != nil && c.nonces[p.code] == p {
+	if p.page && c.nonces[p.code] == p {
 		delete(c.nonces, p.code)
 	}
 }
@@ -504,18 +509,23 @@ func (c *captcha) forgetNonce(p *pendingCaptcha) {
 // a button opening the challenge page. it returns the sent message and the code, the number or the nonce
 // with page set, so only a page nonce is registered as one
 func (c *captcha) challenge(chatID int64, p *pendingCaptcha) (sent tbapi.Message, code string, page bool, err error) {
-	if c.turnstile != nil {
+	if c.turnstile != nil && !c.turnstile.refused.Load() {
 		nonce := newNonce()
-		sent, err = c.sendTurnstile(chatID, nonce, c.prompt(p.user), p.lang)
+		sent, err = c.sendTurnstile(chatID, nonce, c.prompt(p), p.lang)
 		if err == nil {
 			return sent, nonce, true, nil
 		}
-		// a login button is refused while the bot's domain is not set, falling back keeps members verified
-		log.Printf("[ERROR] turnstile button for %s failed, is the bot domain set with @BotFather /setdomain? "+
-			"falling back to the animation: %v", p.user, err)
+		// a login button is refused while the bot's domain is not set; falling back keeps members verified,
+		// and remembering the refusal spares a failing send per join until a restart
+		if strings.Contains(err.Error(), "BOT_DOMAIN_INVALID") && !c.turnstile.refused.Swap(true) {
+			log.Printf("[ERROR] telegram refuses the turnstile login button, set the bot domain with @BotFather "+
+				"/setdomain and restart; the animation is used until then: %v", err)
+		} else {
+			log.Printf("[WARN] turnstile button for %s failed, falling back to the animation: %v", p.user, err)
+		}
 	}
 	code = newCaptchaCode()
-	sent, err = c.send(chatID, p.user, code, c.motionPrompt(p.user))
+	sent, err = c.send(chatID, p.user, code, c.motionPrompt(p))
 	return sent, code, false, err
 }
 
@@ -691,25 +701,27 @@ func (c *captcha) send(chatID int64, user bot.User, code, caption string) (tbapi
 	return msg, nil
 }
 
-func (c *captcha) prompt(user bot.User) string {
+// prompt is the caption of p's challenge: --captcha.message, or the mode's default in the member's language
+func (c *captcha) prompt(p *pendingCaptcha) string {
 	message := c.message
 	switch {
 	case message != "":
 	case c.turnstile != nil:
-		message = defaultTurnstileMessage
+		message = captchaText(p.lang, txtPromptTurnstile)
 	default:
-		message = defaultMotionMessage
+		message = captchaText(p.lang, txtPromptMotion)
 	}
-	return c.expandPrompt(user, message)
+	return c.expandPrompt(p.user, message)
 }
 
-// motionPrompt is the prompt of the animation. when the turnstile button falls back it is the default one,
-// since a prompt written for turnstile asks to press a button the animation doesn't have
-func (c *captcha) motionPrompt(user bot.User) string {
+// motionPrompt is the caption of the animation. when the turnstile button falls back it is the animation's
+// default in the member's language, since a prompt written for turnstile asks to press a button the
+// animation doesn't have
+func (c *captcha) motionPrompt(p *pendingCaptcha) string {
 	if c.turnstile == nil {
-		return c.prompt(user)
+		return c.prompt(p)
 	}
-	return c.expandPrompt(user, defaultMotionMessage)
+	return c.expandPrompt(p.user, captchaText(p.lang, txtPromptMotion))
 }
 
 // expandPrompt fills the {user} mention and the {timeout} of a prompt template, escaped for HTML

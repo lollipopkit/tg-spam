@@ -17,6 +17,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	tbapi "github.com/OvyFlash/telegram-bot-api"
@@ -38,7 +39,7 @@ type TurnstileConfig struct {
 	Secret    string // secret of the widget, for siteverify
 	PublicURL string // https base url without a path; its host must be a widget domain and the bot's domain
 	Listen    string // address of the page server, meant to be reached only through a tunnel or proxy
-	BotToken  string // telegram bot token, checks the login data
+	BotToken  string // telegram bot token, only the key derived from it to check login data is kept
 }
 
 const turnstileVerifyURL = "https://challenges.cloudflare.com/turnstile/v0/siteverify"
@@ -50,6 +51,8 @@ type turnstile struct {
 	verifyURL string
 	client    *http.Client
 	loginAge  time.Duration // max age of telegram login data, the captcha timeout with a grace
+	loginKey  [32]byte      // sha256 of the bot token, the HMAC key of telegram login data
+	refused   atomic.Bool   // telegram refused the login button (bot domain not set), use the animation
 }
 
 // WithTurnstile switches the captcha to Turnstile. it must be called before the captcha is used
@@ -62,8 +65,10 @@ func (c *captcha) WithTurnstile(cfg TurnstileConfig) error {
 	}
 	u, _ := url.Parse(cfg.PublicURL)
 	cfg.PublicURL = strings.TrimSuffix(cfg.PublicURL, "/")
+	loginKey := sha256.Sum256([]byte(cfg.BotToken))
+	cfg.BotToken = "" // only the derived key is kept
 	c.turnstile = &turnstile{cfg: cfg, host: strings.ToLower(u.Hostname()), verifyURL: turnstileVerifyURL,
-		client: &http.Client{Timeout: 10 * time.Second}, loginAge: c.timeout + captchaGrace}
+		client: &http.Client{Timeout: 10 * time.Second}, loginAge: c.timeout + captchaGrace, loginKey: loginKey}
 	return nil
 }
 
@@ -99,17 +104,16 @@ func (c *captcha) solveNonce(nonce string) bool {
 	c.mu.Lock()
 	p, ok := c.nonces[nonce]
 	test := ok && c.tests[p.user.ID] == p
-	if ok {
-		m := c.pending
-		if test {
-			m = c.tests
-		}
-		delete(m, p.user.ID)
-		stopTimer(p)
-		c.forgetNonce(p)
-	}
 	c.mu.Unlock()
 	if !ok {
+		return false
+	}
+	m := c.pending
+	if test {
+		m = c.tests
+	}
+	// take removes only this very entry, so a page can never resolve a newer captcha of the member
+	if c.take(m, p.user.ID, p) == nil {
 		return false
 	}
 	deleteMessage(c.tbAPI, p.chatID, p.msgID, "captcha")
@@ -140,8 +144,7 @@ func (t *turnstile) telegramLogin(q url.Values) (int64, error) {
 	for _, k := range keys {
 		lines = append(lines, k+"="+q.Get(k))
 	}
-	secret := sha256.Sum256([]byte(t.cfg.BotToken))
-	mac := hmac.New(sha256.New, secret[:])
+	mac := hmac.New(sha256.New, t.loginKey[:])
 	mac.Write([]byte(strings.Join(lines, "\n")))
 	got, err := hex.DecodeString(hash)
 	if err != nil || !hmac.Equal(got, mac.Sum(nil)) {
@@ -324,15 +327,19 @@ main{max-width:22rem;padding:2rem 1.5rem;text-align:center}
 // renderPage writes a challenge page, with the Turnstile widget when widget is set. the form posts to the
 // page url itself, query included, so the telegram login data comes along
 func (c *captcha) renderPage(w http.ResponseWriter, r *http.Request, status int, lang, text string, widget bool) {
-	scriptNonce := newNonce()
 	h := w.Header()
 	h.Set("Content-Type", "text/html; charset=utf-8")
 	h.Set("Cache-Control", "no-store")
 	h.Set("X-Content-Type-Options", "nosniff")
 	h.Set("Referrer-Policy", "no-referrer")
-	h.Set("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; "+
-		"script-src https://challenges.cloudflare.com 'nonce-"+scriptNonce+"'; frame-src https://challenges.cloudflare.com; "+
-		"connect-src https://challenges.cloudflare.com; form-action 'self'; frame-ancestors 'none'; base-uri 'none'")
+	csp := "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'; base-uri 'none'"
+	scriptNonce := ""
+	if widget {
+		scriptNonce = newNonce()
+		csp += "; script-src https://challenges.cloudflare.com 'nonce-" + scriptNonce + "'; " +
+			"frame-src https://challenges.cloudflare.com; connect-src https://challenges.cloudflare.com; form-action 'self'"
+	}
+	h.Set("Content-Security-Policy", csp)
 	w.WriteHeader(status)
 	err := turnstilePage.Execute(w, struct {
 		Lang, WidgetLang, Title, Text, SiteKey, ScriptNonce, Nonce string
