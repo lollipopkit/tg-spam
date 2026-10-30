@@ -5,7 +5,7 @@ added: 2026-08-30
 ---
 # media meta checks measure quoted text as if the sender wrote it
 
-`ImagesCheck` (:96), `VideosCheck` (:119), `AudioCheck` (:142) and `ContactCheck` (:164) all test
+`ImagesCheck` (:96), `VideosCheck` (:119) and `AudioCheck` (:142) all test
 `req.Msg`, which `SpamFilter.OnMessage` (`app/bot/spam.go`) has already concatenated with `Quote` or
 `ReplyTo.Text`. So a caption-less image, video, or audio file posted as a reply to a message longer than
 `--min-msg-len` arrives with `req.Msg` above the threshold and the check does not fire — the sender wrote

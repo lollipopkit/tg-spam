@@ -189,17 +189,16 @@ func DocumentsCheck(minTextLen int) MetaCheck {
 }
 
 // ContactCheck is a function that returns a MetaCheck function.
-// It checks if the message has a shared contact and the message is empty (i.e. it contains only contact).
+// It flags any message with a shared contact. A contact carries no caption, so every contact is a
+// "contact without text"; req.Msg is not consulted, as it holds only quoted or replied-to text, which is
+// someone else's. Like every check it only runs for members who are not approved yet, unless paranoid
+// mode is on.
 func ContactCheck() MetaCheck {
 	return func(req spamcheck.Request) spamcheck.Response {
-		if req.Meta.HasContact && req.Msg == "" {
-			return spamcheck.Response{
-				Name:    "contact",
-				Spam:    true,
-				Details: "contact without text",
-			}
+		if req.Meta.HasContact {
+			return spamcheck.Response{Name: "contact", Spam: true, Details: "shared contact"}
 		}
-		return spamcheck.Response{Spam: false, Name: "contact", Details: "no contact without text"}
+		return spamcheck.Response{Name: "contact", Spam: false, Details: "no shared contact"}
 	}
 }
 

@@ -94,7 +94,7 @@ type options struct {
 		VideosOnly      bool   `long:"video-only" env:"VIDEO_ONLY" description:"enable video only check"`
 		DocumentsOnly   bool   `long:"document-only" env:"DOCUMENT_ONLY" description:"enable document only check"`
 		AudiosOnly      bool   `long:"audio-only" env:"AUDIO_ONLY" description:"enable audio only check"`
-		ContactOnly     bool   `long:"contact-only" env:"CONTACT_ONLY" description:"enable contact only check"`
+		ContactOnly     bool   `long:"contact-only" env:"CONTACT_ONLY" description:"flag any shared contact as spam"`
 		Forward         bool   `long:"forward" env:"FORWARD" description:"enable forward check"`
 		Keyboard        bool   `long:"keyboard" env:"KEYBOARD" description:"enable keyboard check"`
 		UsernameSymbols string `long:"username-symbols" env:"USERNAME_SYMBOLS" description:"prohibited symbols in username, disabled by default"`
