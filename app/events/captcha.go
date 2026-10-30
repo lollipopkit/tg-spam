@@ -22,7 +22,7 @@ const captchaPrefix = "C"
 const (
 	captchaCodeLen   = 3
 	captchaBackspace = "b"
-	captchaSenders   = 4 // concurrent renders and uploads, the update loop never waits for them
+	captchaWorkers   = 4 // concurrent verifications, each makes a few API calls, renders and uploads
 
 	// a failed captcha bans for captchaCooldown, doubled on every further failure up to captchaMaxCooldown.
 	// failures older than captchaMaxCooldown are forgotten
@@ -39,8 +39,8 @@ const captchaGrace = time.Minute
 // shows a number only in motion (see renderMotionCaptcha) with a shuffled keypad under it. entering the
 // number lifts the mute. a wrong number, the timeout or leaving with the captcha unsolved is a failure:
 // the member is banned for a cooldown that doubles with each failure, so guessing by rejoining stays slow.
-// safe for concurrent use: callbacks come from the update loop, timeouts from timer goroutines and posting
-// from sender goroutines.
+// safe for concurrent use: callbacks come from the update loop, timeouts from timer goroutines and the
+// verification itself from worker goroutines.
 type captcha struct {
 	tbAPI   TbAPI
 	chatID  int64
@@ -48,18 +48,19 @@ type captcha struct {
 	message string                            // prompt template with {user} and {timeout} placeholders
 	render  func(code string) ([]byte, error) // draws the challenge image
 
-	senders chan struct{}  // limits concurrent posting
-	posting sync.WaitGroup // in-flight posts, waited for by Stop
+	workers chan struct{}  // limits concurrent verifications
+	running sync.WaitGroup // verifications in progress, waited for by Stop
 
 	mu       sync.Mutex
 	pending  map[int64]*pendingCaptcha // by user ID
 	failures map[int64]captchaFailure  // by user ID
+	muted    map[int64]time.Time       // members under the captcha's own mute, by user ID, to its expiry
 }
 
 type pendingCaptcha struct {
 	user    bot.User
 	msgID   int    // captcha message, 0 until posted
-	code    string // the number to enter
+	code    string // the number to enter, set when posted
 	entered string // digits pressed so far
 	timer   *time.Timer
 }
@@ -71,83 +72,100 @@ type captchaFailure struct {
 
 func newCaptcha(tbAPI TbAPI, chatID int64, timeout time.Duration, message string) *captcha {
 	return &captcha{tbAPI: tbAPI, chatID: chatID, timeout: timeout, message: message, render: renderMotionCaptcha,
-		senders: make(chan struct{}, captchaSenders), pending: make(map[int64]*pendingCaptcha),
-		failures: make(map[int64]captchaFailure)}
+		workers: make(chan struct{}, captchaWorkers), pending: make(map[int64]*pendingCaptcha),
+		failures: make(map[int64]captchaFailure), muted: make(map[int64]time.Time)}
 }
 
-// Start verifies a member who has just joined. a member already restricted (soft-banned or muted by an
-// admin) is left alone, so rejoining can't lift a restriction. a member still in a failure cooldown is
-// banned for the rest of it without a challenge. otherwise the member is muted and the challenge is posted
-// in the background; a challenge already pending for the member is replaced
-func (c *captcha) Start(user bot.User) error {
-	status, err := c.memberStatus(user.ID)
-	if err != nil {
-		return fmt.Errorf("failed to get member status of %s for captcha: %w", user, err)
+// Start verifies a member who has just joined. it only marks the member pending, so their messages are
+// deleted from now on, and leaves the API calls to a worker: the update loop never waits for them. a
+// captcha already pending for the member is replaced
+func (c *captcha) Start(user bot.User) {
+	p := &pendingCaptcha{user: user}
+	c.mu.Lock()
+	prev := c.pending[user.ID]
+	c.pending[user.ID] = p
+	prevMsgID := 0
+	if prev != nil {
+		prevMsgID = prev.msgID
+		stopTimer(prev)
 	}
-	if status == "restricted" {
-		log.Printf("[INFO] %s is restricted already, captcha skipped", user)
-		return nil
+	c.mu.Unlock()
+	deleteMessage(c.tbAPI, c.chatID, prevMsgID, "captcha")
+
+	c.running.Add(1)
+	go c.verify(p)
+}
+
+// verify runs a pending captcha up to the posted challenge. a member still in a failure cooldown is banned
+// for the rest of it. administrators and members restricted by anyone but the captcha are left alone: muting
+// a restricted member would replace a soft ban or an admin mute with one that expires. with the status
+// unknown the member is verified anyway. the timeout starts once the challenge is posted, a member waiting
+// for a worker can't time out before seeing it
+func (c *captcha) verify(p *pendingCaptcha) {
+	defer c.running.Done()
+	c.workers <- struct{}{}
+	defer func() { <-c.workers }()
+
+	user := p.user
+	if !c.isCurrent(p) {
+		return
 	}
 	if left := c.cooldownLeft(user.ID); left > 0 {
-		return c.ban(user, left, "rejoined during captcha cooldown")
+		c.take(user.ID, p)
+		if err := c.remove(user, left, "rejoined during captcha cooldown"); err != nil {
+			log.Printf("[WARN] %v", err)
+		}
+		return
 	}
 
-	mute := tbapi.RestrictChatMemberConfig{
-		ChatMemberConfig: tbapi.ChatMemberConfig{ChatConfig: tbapi.ChatConfig{ChatID: c.chatID}, UserID: user.ID},
-		UntilDate:        time.Now().Add(c.timeout + captchaGrace).Unix(),
-		Permissions:      &tbapi.ChatPermissions{},
+	status, err := c.memberStatus(user.ID)
+	switch {
+	case err != nil:
+		log.Printf("[WARN] can't get member status of %s, verifying anyway: %v", user, err)
+	case status == "restricted" && !c.isMutedByCaptcha(user.ID):
+		c.take(user.ID, p)
+		log.Printf("[INFO] %s is restricted already, captcha skipped", user)
+		return
+	case status != "member" && status != "restricted":
+		c.take(user.ID, p)
+		log.Printf("[INFO] %s is %s, captcha skipped", user, status)
+		return
 	}
-	if err := c.request(mute); err != nil {
-		return fmt.Errorf("failed to mute %s for captcha: %w", user, err)
+
+	if !c.isCurrent(p) {
+		return
+	}
+	if merr := c.mute(user, c.timeout+captchaGrace); merr != nil {
+		c.take(user.ID, p)
+		log.Printf("[WARN] failed to mute %s for captcha, not verified: %v", user, merr)
+		return
 	}
 
 	code := make([]byte, captchaCodeLen)
 	for i := range code {
 		code[i] = byte('0' + rand.IntN(10)) //nolint:gosec // math/rand/v2 is seeded from the OS entropy
 	}
-	p := &pendingCaptcha{user: user, code: string(code)}
-	c.mu.Lock()
-	prev := c.pending[user.ID]
-	c.pending[user.ID] = p
-	p.timer = time.AfterFunc(c.timeout, func() { c.expire(p) })
-	c.mu.Unlock()
-	if prev != nil {
-		prev.timer.Stop()
-		c.deleteMessage(prev.msgID)
-	}
-
-	c.posting.Add(1)
-	go c.post(p)
-	return nil
-}
-
-// post renders and sends the challenge. if it can't be posted the member is unmuted, an unsolvable captcha
-// must not lock them out. a challenge resolved while it was being posted is deleted right away
-func (c *captcha) post(p *pendingCaptcha) {
-	defer c.posting.Done()
-	c.senders <- struct{}{}
-	sent, err := c.send(p.user, p.code)
-	<-c.senders
-
+	sent, err := c.send(user, string(code))
 	if err != nil {
-		if c.take(p.user.ID, p) != nil {
-			c.unmute(p.user)
+		if c.take(user.ID, p) != nil {
+			c.unmute(user)
 		}
-		log.Printf("[WARN] failed to send captcha to %s: %v", p.user, err)
+		log.Printf("[WARN] failed to send captcha to %s, unmuted: %v", user, err)
 		return
 	}
 
 	c.mu.Lock()
-	current := c.pending[p.user.ID] == p
+	current := c.pending[user.ID] == p
 	if current {
-		p.msgID = sent.MessageID
+		p.msgID, p.code = sent.MessageID, string(code)
+		p.timer = time.AfterFunc(c.timeout, func() { c.expire(p) })
 	}
 	c.mu.Unlock()
 	if !current {
-		c.deleteMessage(sent.MessageID)
+		deleteMessage(c.tbAPI, c.chatID, sent.MessageID, "captcha")
 		return
 	}
-	log.Printf("[INFO] captcha sent to %s, timeout %v", p.user, c.timeout)
+	log.Printf("[INFO] captcha sent to %s, timeout %v", user, c.timeout)
 }
 
 // HandleCallback processes a keypad press. only the member the captcha was sent to can solve it. the
@@ -155,15 +173,15 @@ func (c *captcha) post(p *pendingCaptcha) {
 func (c *captcha) HandleCallback(query *tbapi.CallbackQuery) error {
 	userID, key, err := parseCaptchaData(query.Data)
 	if err != nil {
-		c.answer(query.ID, captchaExpired)
+		answerCallback(c.tbAPI, query.ID, captchaExpired)
 		return err
 	}
 	if query.Message == nil || query.Message.Chat.ID != c.chatID {
-		c.answer(query.ID, captchaExpired)
+		answerCallback(c.tbAPI, query.ID, captchaExpired)
 		return nil
 	}
 	if query.From == nil || query.From.ID != userID {
-		c.answer(query.ID, "this verification is for another user")
+		answerCallback(c.tbAPI, query.ID, "this verification is for another user")
 		return nil
 	}
 
@@ -171,7 +189,7 @@ func (c *captcha) HandleCallback(query *tbapi.CallbackQuery) error {
 	p, ok := c.pending[userID]
 	if !ok || p.msgID != query.Message.MessageID {
 		c.mu.Unlock()
-		c.answer(query.ID, captchaExpired)
+		answerCallback(c.tbAPI, query.ID, captchaExpired)
 		return nil
 	}
 	if key == captchaBackspace {
@@ -184,19 +202,19 @@ func (c *captcha) HandleCallback(query *tbapi.CallbackQuery) error {
 	if len(p.entered) < len(p.code) {
 		progress := strings.Repeat("● ", len(p.entered)) + strings.Repeat("○ ", len(p.code)-len(p.entered))
 		c.mu.Unlock()
-		c.answer(query.ID, strings.TrimSpace(progress))
+		answerCallback(c.tbAPI, query.ID, strings.TrimSpace(progress))
 		return nil
 	}
 	delete(c.pending, userID)
-	p.timer.Stop()
+	stopTimer(p)
 	c.mu.Unlock()
 
-	c.deleteMessage(p.msgID)
+	deleteMessage(c.tbAPI, c.chatID, p.msgID, "captcha")
 	if p.entered != p.code {
-		c.answer(query.ID, "wrong answer")
+		answerCallback(c.tbAPI, query.ID, "wrong answer")
 		return c.fail(p.user, "wrong answer", true)
 	}
-	c.answer(query.ID, "verified")
+	answerCallback(c.tbAPI, query.ID, "verified")
 	c.mu.Lock()
 	delete(c.failures, userID)
 	c.mu.Unlock()
@@ -223,26 +241,26 @@ func (c *captcha) Cancel(userID int64) {
 	if p == nil {
 		return
 	}
-	c.deleteMessage(p.msgID)
+	deleteMessage(c.tbAPI, c.chatID, p.msgID, "captcha")
 	if err := c.fail(p.user, "left the chat", false); err != nil {
 		log.Printf("[WARN] %v", err)
 	}
 }
 
-// Stop cancels all pending captchas and deletes their messages, waiting for challenges being posted.
-// the muted members are released by their restriction expiry
+// Stop cancels all pending captchas and deletes their messages, waiting for verifications in progress.
+// the muted members are released by their mute expiry
 func (c *captcha) Stop() {
 	c.mu.Lock()
 	msgIDs := make([]int, 0, len(c.pending))
 	for id, p := range c.pending {
-		p.timer.Stop()
+		stopTimer(p)
 		msgIDs = append(msgIDs, p.msgID)
 		delete(c.pending, id)
 	}
 	c.mu.Unlock()
-	c.posting.Wait() // posts find their captcha gone and delete what they sent
+	c.running.Wait() // verifications find their captcha gone and delete what they posted
 	for _, id := range msgIDs {
-		c.deleteMessage(id)
+		deleteMessage(c.tbAPI, c.chatID, id, "captcha")
 	}
 }
 
@@ -250,7 +268,7 @@ func (c *captcha) expire(p *pendingCaptcha) {
 	if c.take(p.user.ID, p) == nil {
 		return // solved, replaced or canceled in the meantime
 	}
-	c.deleteMessage(p.msgID)
+	deleteMessage(c.tbAPI, c.chatID, p.msgID, "captcha")
 	if err := c.fail(p.user, "timeout", true); err != nil {
 		log.Printf("[WARN] %v", err)
 	}
@@ -265,8 +283,22 @@ func (c *captcha) take(userID int64, want *pendingCaptcha) *pendingCaptcha {
 		return nil
 	}
 	delete(c.pending, userID)
-	p.timer.Stop()
+	stopTimer(p)
 	return p
+}
+
+// isCurrent reports whether p is still the member's pending captcha
+func (c *captcha) isCurrent(p *pendingCaptcha) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.pending[p.user.ID] == p
+}
+
+// stopTimer stops the timeout of a posted captcha, call with mu held
+func stopTimer(p *pendingCaptcha) {
+	if p.timer != nil {
+		p.timer.Stop()
+	}
 }
 
 // fail records a failed captcha and, with remove set, bans the member for the cooldown it earns
@@ -288,7 +320,7 @@ func (c *captcha) fail(user bot.User, reason string, remove bool) error {
 	if !remove {
 		return nil
 	}
-	return c.ban(user, cooldownFor(f.count), reason)
+	return c.remove(user, cooldownFor(f.count), reason)
 }
 
 // cooldownLeft returns how long the member is still barred from a new captcha
@@ -311,23 +343,55 @@ func cooldownFor(failures int) time.Duration {
 	return min(d, captchaMaxCooldown)
 }
 
-// ban removes the member until the cooldown ends, telegram lifts the ban by itself then. a ban shorter than
-// a minute is extended, telegram treats less than 30 seconds as forever
-func (c *captcha) ban(user bot.User, d time.Duration, reason string) error {
-	d = max(d, time.Minute)
-	err := c.request(tbapi.BanChatMemberConfig{
+// remove bans the member until the cooldown ends, telegram lifts the ban by itself then. if the ban fails
+// the member is muted for the cooldown instead, a failed captcha must not leave them free to post
+func (c *captcha) remove(user bot.User, d time.Duration, reason string) error {
+	err := banUserOrChannel(banRequest{tbAPI: c.tbAPI, userID: user.ID, chatID: c.chatID, duration: d,
+		userName: user.String()})
+	if err == nil {
+		log.Printf("[INFO] %s removed for %v, captcha %s", user, d.Round(time.Second), reason)
+		return nil
+	}
+	if merr := c.mute(user, d); merr != nil {
+		return fmt.Errorf("failed to remove %s after captcha %s: %w, and to mute: %w", user, reason, err, merr)
+	}
+	return fmt.Errorf("failed to remove %s after captcha %s, muted for %v instead: %w", user, reason, d, err)
+}
+
+// mute takes every permission from the member for d. the mute expires on its own, so a member whose
+// captcha is lost is not muted for good. it is recorded, telling it apart from other restrictions on rejoin
+func (c *captcha) mute(user bot.User, d time.Duration) error {
+	until := time.Now().Add(max(d, time.Minute)) // under 30 seconds is forever for telegram
+	err := c.request(tbapi.RestrictChatMemberConfig{
 		ChatMemberConfig: tbapi.ChatMemberConfig{ChatConfig: tbapi.ChatConfig{ChatID: c.chatID}, UserID: user.ID},
-		UntilDate:        time.Now().Add(d).Unix(),
+		UntilDate:        until.Unix(),
+		Permissions:      &tbapi.ChatPermissions{},
 	})
 	if err != nil {
-		return fmt.Errorf("failed to remove %s after captcha %s: %w", user, reason, err)
+		return err
 	}
-	log.Printf("[INFO] %s removed for %v, captcha %s", user, d.Round(time.Second), reason)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	now := time.Now()
+	for id, t := range c.muted {
+		if t.Before(now) {
+			delete(c.muted, id)
+		}
+	}
+	c.muted[user.ID] = until
 	return nil
 }
 
-// unmute lifts the captcha restriction. per the Bot API, passing true for all permissions lifts a
-// restriction, the member is then a regular member bound by the chat's default permissions
+// isMutedByCaptcha reports whether the member's restriction is the captcha's own mute
+func (c *captcha) isMutedByCaptcha(userID int64) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	until, ok := c.muted[userID]
+	return ok && until.After(time.Now())
+}
+
+// unmute lifts the captcha mute. per the Bot API, passing true for all permissions lifts a restriction,
+// the member is then a regular member bound by the chat's default permissions
 func (c *captcha) unmute(user bot.User) {
 	err := c.request(tbapi.RestrictChatMemberConfig{
 		ChatMemberConfig:              tbapi.ChatMemberConfig{ChatConfig: tbapi.ChatConfig{ChatID: c.chatID}, UserID: user.ID},
@@ -338,8 +402,12 @@ func (c *captcha) unmute(user bot.User) {
 			CanEditTag: true, CanChangeInfo: true, CanInviteUsers: true, CanPinMessages: true, CanManageTopics: true},
 	})
 	if err != nil {
-		log.Printf("[WARN] failed to unmute %s, the restriction expires in %v: %v", user, c.timeout+captchaGrace, err)
+		log.Printf("[WARN] failed to unmute %s, the mute expires by itself: %v", user, err)
+		return
 	}
+	c.mu.Lock()
+	delete(c.muted, user.ID)
+	c.mu.Unlock()
 }
 
 func (c *captcha) memberStatus(userID int64) (string, error) {
@@ -408,24 +476,6 @@ func (c *captcha) request(cfg tbapi.Chattable) error {
 		return fmt.Errorf("response is not Ok: %s", string(resp.Result))
 	}
 	return nil
-}
-
-func (c *captcha) answer(queryID, text string) {
-	if _, err := c.tbAPI.Request(tbapi.NewCallback(queryID, text)); err != nil {
-		log.Printf("[WARN] failed to answer captcha callback: %v", err)
-	}
-}
-
-// deleteMessage deletes a captcha message, msgID 0 is a captcha not posted yet
-func (c *captcha) deleteMessage(msgID int) {
-	if msgID == 0 {
-		return
-	}
-	_, err := c.tbAPI.Request(tbapi.DeleteMessageConfig{BaseChatMessage: tbapi.BaseChatMessage{
-		MessageID: msgID, ChatConfig: tbapi.ChatConfig{ChatID: c.chatID}}})
-	if err != nil {
-		log.Printf("[WARN] failed to delete captcha message %d: %v", msgID, err)
-	}
 }
 
 func parseCaptchaData(data string) (userID int64, key string, err error) {

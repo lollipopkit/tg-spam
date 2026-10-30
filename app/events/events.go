@@ -65,6 +65,27 @@ func escapeMarkDownV1Text(text string) string {
 	return text
 }
 
+// deleteMessage deletes a message, logging the outcome. msgID 0 means there is no message
+func deleteMessage(tbAPI TbAPI, chatID int64, msgID int, what string) {
+	if msgID == 0 {
+		return
+	}
+	_, err := tbAPI.Request(tbapi.DeleteMessageConfig{BaseChatMessage: tbapi.BaseChatMessage{
+		MessageID: msgID, ChatConfig: tbapi.ChatConfig{ChatID: chatID}}})
+	if err != nil {
+		log.Printf("[WARN] failed to delete %s message %d: %v", what, msgID, err)
+		return
+	}
+	log.Printf("[DEBUG] %s message %d deleted", what, msgID)
+}
+
+// answerCallback answers a callback query, so the client stops its progress indicator
+func answerCallback(tbAPI TbAPI, queryID, text string) {
+	if _, err := tbAPI.Request(tbapi.NewCallback(queryID, text)); err != nil {
+		log.Printf("[WARN] failed to answer callback: %v", err)
+	}
+}
+
 // markdownV1LinkLabel makes text safe as a legacy markdown link label. Telegram copies a label verbatim
 // up to the first "]" and applies no escapes inside it, so "\\]" cannot keep "]" in the label and other
 // escapes would show as text. "]" is removed instead: left in an arbitrary first+last display name it

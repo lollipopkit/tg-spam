@@ -38,8 +38,8 @@ func stubRender(string) ([]byte, error) { return []byte("gif"), nil }
 // startPosted starts a captcha and waits until the challenge is posted
 func startPosted(t *testing.T, c *captcha, user bot.User) {
 	t.Helper()
-	require.NoError(t, c.Start(user))
-	c.posting.Wait()
+	c.Start(user)
+	c.running.Wait()
 }
 
 // captchaKeys returns the posted keypad buttons
@@ -207,19 +207,69 @@ func TestCaptcha_StartSkipsAndErrors(t *testing.T) {
 	t.Run("restricted member keeps the restriction", func(t *testing.T) {
 		api := newCaptchaAPI("restricted")
 		c := newCaptcha(api, 123, time.Minute, testCaptchaMsg)
-		require.NoError(t, c.Start(bot.User{ID: 42}))
+		startPosted(t, c, bot.User{ID: 42})
 		assert.Empty(t, requestsOf[tbapi.RestrictChatMemberConfig](api))
 		assert.Empty(t, api.SendCalls())
 		assert.False(t, c.IsPending(42))
 	})
 
-	t.Run("member status unknown, nothing done", func(t *testing.T) {
-		api := newCaptchaAPI("member")
-		api.RequestFunc = func(c tbapi.Chattable) (*tbapi.APIResponse, error) { return nil, errors.New("api down") }
+	t.Run("member restricted by the captcha's own mute is verified again", func(t *testing.T) {
+		api := newCaptchaAPI("restricted")
 		c := newCaptcha(api, 123, time.Minute, testCaptchaMsg)
-		require.ErrorContains(t, c.Start(bot.User{ID: 42}), "api down")
-		assert.Len(t, api.RequestCalls(), 1)
-		assert.False(t, c.IsPending(42))
+		c.render = stubRender
+		defer c.Stop()
+		require.NoError(t, c.mute(bot.User{ID: 42}, time.Minute))
+		startPosted(t, c, bot.User{ID: 42})
+		assert.Len(t, api.SendCalls(), 1)
+		assert.True(t, c.IsPending(42))
+	})
+
+	for _, status := range []string{"administrator", "creator", "left", "kicked"} {
+		t.Run(status+" is skipped", func(t *testing.T) {
+			api := newCaptchaAPI(status)
+			c := newCaptcha(api, 123, time.Minute, testCaptchaMsg)
+			startPosted(t, c, bot.User{ID: 42})
+			assert.Empty(t, requestsOf[tbapi.RestrictChatMemberConfig](api))
+			assert.Empty(t, api.SendCalls())
+			assert.False(t, c.IsPending(42))
+		})
+	}
+
+	t.Run("pending from the start, before any API call", func(t *testing.T) {
+		api := newCaptchaAPI("member")
+		c := newCaptcha(api, 123, time.Minute, testCaptchaMsg)
+		c.render = stubRender
+		defer c.Stop()
+		c.workers <- struct{}{} // occupy every worker
+		c.workers <- struct{}{}
+		c.workers <- struct{}{}
+		c.workers <- struct{}{}
+		c.Start(bot.User{ID: 42})
+		assert.True(t, c.IsPending(42))
+		assert.Empty(t, api.RequestCalls())
+		for range captchaWorkers {
+			<-c.workers
+		}
+		c.running.Wait()
+		assert.Len(t, api.SendCalls(), 1)
+	})
+
+	t.Run("member status unknown, verified anyway", func(t *testing.T) {
+		api := newCaptchaAPI("member")
+		inner := api.RequestFunc
+		api.RequestFunc = func(cfg tbapi.Chattable) (*tbapi.APIResponse, error) {
+			if _, ok := cfg.(tbapi.GetChatMemberConfig); ok {
+				return nil, errors.New("api down")
+			}
+			return inner(cfg)
+		}
+		c := newCaptcha(api, 123, time.Minute, testCaptchaMsg)
+		c.render = stubRender
+		defer c.Stop()
+		startPosted(t, c, bot.User{ID: 42})
+		assert.Len(t, requestsOf[tbapi.RestrictChatMemberConfig](api), 1)
+		assert.Len(t, api.SendCalls(), 1)
+		assert.True(t, c.IsPending(42))
 	})
 
 	t.Run("mute fails, nothing sent", func(t *testing.T) {
@@ -232,8 +282,7 @@ func TestCaptcha_StartSkipsAndErrors(t *testing.T) {
 			return inner(cfg)
 		}
 		c := newCaptcha(api, 123, time.Minute, testCaptchaMsg)
-		require.ErrorContains(t, c.Start(bot.User{ID: 42}), "not enough rights")
-		c.posting.Wait()
+		startPosted(t, c, bot.User{ID: 42})
 		assert.Empty(t, api.SendCalls())
 		assert.False(t, c.IsPending(42))
 	})
@@ -247,6 +296,7 @@ func TestCaptcha_StartSkipsAndErrors(t *testing.T) {
 		assert.Len(t, requestsOf[tbapi.RestrictChatMemberConfig](api), 2)
 		assertLifted(t, api, 42)
 		assert.False(t, c.IsPending(42))
+		assert.False(t, c.isMutedByCaptcha(42))
 	})
 
 	t.Run("send fails, member unmuted", func(t *testing.T) {
@@ -264,12 +314,43 @@ func TestCaptcha_StartSkipsAndErrors(t *testing.T) {
 		c := newCaptcha(api, 123, time.Minute, testCaptchaMsg)
 		c.render = stubRender
 		require.NoError(t, c.fail(bot.User{ID: 42}, "left the chat", false))
-		require.NoError(t, c.Start(bot.User{ID: 42}))
-		c.posting.Wait()
+		startPosted(t, c, bot.User{ID: 42})
 		assertBannedFor(t, api, 42, captchaCooldown)
+		assert.Empty(t, requestsOf[tbapi.GetChatMemberConfig](api), "cooldown is checked before the status")
 		assert.Empty(t, requestsOf[tbapi.RestrictChatMemberConfig](api))
 		assert.Empty(t, api.SendCalls())
 		assert.False(t, c.IsPending(42))
+	})
+
+	t.Run("leave and rejoin under the captcha mute hits the cooldown", func(t *testing.T) {
+		api := newCaptchaAPI("member")
+		c := newCaptcha(api, 123, time.Minute, testCaptchaMsg)
+		c.render = stubRender
+		startPosted(t, c, bot.User{ID: 42})
+		c.Cancel(42)
+		api.RequestFunc = newCaptchaAPI("restricted").RequestFunc
+		startPosted(t, c, bot.User{ID: 42})
+		assertBannedFor(t, api, 42, captchaCooldown)
+		assert.Len(t, api.SendCalls(), 1, "no second challenge")
+		assert.False(t, c.IsPending(42))
+	})
+
+	t.Run("ban fails, member muted for the cooldown instead", func(t *testing.T) {
+		api := newCaptchaAPI("member")
+		inner := api.RequestFunc
+		api.RequestFunc = func(cfg tbapi.Chattable) (*tbapi.APIResponse, error) {
+			if _, ok := cfg.(tbapi.BanChatMemberConfig); ok {
+				return nil, errors.New("ban failed")
+			}
+			return inner(cfg)
+		}
+		c := newCaptcha(api, 123, time.Minute, testCaptchaMsg)
+		err := c.fail(bot.User{ID: 42}, "timeout", true)
+		require.ErrorContains(t, err, "muted for 5m0s instead")
+		mutes := requestsOf[tbapi.RestrictChatMemberConfig](api)
+		require.Len(t, mutes, 1)
+		assert.Equal(t, &tbapi.ChatPermissions{}, mutes[0].Permissions)
+		assert.InDelta(t, time.Now().Add(captchaCooldown).Unix(), mutes[0].UntilDate, 2)
 	})
 }
 
@@ -376,6 +457,18 @@ func TestCaptcha_Timeout(t *testing.T) {
 	assert.Equal(t, 1, failuresOf(c, 42))
 }
 
+func TestCaptcha_TimeoutStartsWhenPosted(t *testing.T) {
+	api := newCaptchaAPI("member")
+	c := newCaptcha(api, 123, 50*time.Millisecond, testCaptchaMsg)
+	defer c.Stop()
+	c.render = func(string) ([]byte, error) { time.Sleep(100 * time.Millisecond); return []byte("gif"), nil }
+	startPosted(t, c, bot.User{ID: 42})
+	assert.True(t, c.IsPending(42), "a slow post does not eat the timeout")
+	assert.Empty(t, requestsOf[tbapi.BanChatMemberConfig](api))
+	require.Eventually(t, func() bool { return len(requestsOf[tbapi.BanChatMemberConfig](api)) == 1 },
+		time.Second, 10*time.Millisecond)
+}
+
 func TestCaptcha_Restart(t *testing.T) {
 	api := newCaptchaAPI("member")
 	c := newCaptcha(api, 123, 100*time.Millisecond, testCaptchaMsg)
@@ -409,7 +502,7 @@ func TestCaptcha_Cancel(t *testing.T) {
 	assert.Empty(t, requestsOf[tbapi.BanChatMemberConfig](api), "no ban for a member who left, no timeout")
 
 	// rejoining right away runs into the cooldown
-	require.NoError(t, c.Start(bot.User{ID: 42}))
+	startPosted(t, c, bot.User{ID: 42})
 	assertBannedFor(t, api, 42, captchaCooldown)
 	assert.Len(t, api.SendCalls(), 1)
 }
@@ -417,15 +510,16 @@ func TestCaptcha_Cancel(t *testing.T) {
 func TestCaptcha_ResolvedWhilePosting(t *testing.T) {
 	api := newCaptchaAPI("member")
 	c := newCaptcha(api, 123, time.Minute, testCaptchaMsg)
-	release := make(chan struct{})
-	c.render = func(string) ([]byte, error) { <-release; return []byte("gif"), nil }
+	rendering, release := make(chan struct{}), make(chan struct{})
+	c.render = func(string) ([]byte, error) { close(rendering); <-release; return []byte("gif"), nil }
 
-	require.NoError(t, c.Start(bot.User{ID: 42}))
+	c.Start(bot.User{ID: 42})
+	<-rendering
 	assert.Equal(t, []string{captchaExpired}, press(t, c, api, 42, 42, 77, "1"), "not posted yet")
 	c.Cancel(42)
 	assert.Empty(t, deletedIDs(api), "nothing posted to delete yet")
 	close(release)
-	c.posting.Wait()
+	c.running.Wait()
 	assert.Equal(t, []int{77}, deletedIDs(api), "the post finds its captcha gone and deletes the message")
 }
 
@@ -435,10 +529,11 @@ func TestCaptcha_Stop(t *testing.T) {
 	c.render = stubRender
 	startPosted(t, c, bot.User{ID: 42})
 
-	release := make(chan struct{})
-	c.render = func(string) ([]byte, error) { <-release; return []byte("gif"), nil }
+	rendering, release := make(chan struct{}), make(chan struct{})
+	c.render = func(string) ([]byte, error) { close(rendering); <-release; return []byte("gif"), nil }
 	api.SendFunc = func(c tbapi.Chattable) (tbapi.Message, error) { return tbapi.Message{MessageID: 78}, nil }
-	require.NoError(t, c.Start(bot.User{ID: 43}))
+	c.Start(bot.User{ID: 43})
+	<-rendering
 
 	stopped := make(chan struct{})
 	go func() { c.Stop(); close(stopped) }()
@@ -563,7 +658,7 @@ func TestProcJoin_Captcha(t *testing.T) {
 	t.Run("member who passed the join check gets a captcha", func(t *testing.T) {
 		l, api := setup(t, false)
 		require.NoError(t, l.procJoin(context.Background(), join(tbapi.User{ID: 42}, tbapi.User{ID: 42, FirstName: "New"})))
-		l.captcha.posting.Wait()
+		l.captcha.running.Wait()
 		assert.True(t, l.captcha.IsPending(42))
 		assert.Len(t, api.SendCalls(), 1)
 	})
@@ -588,18 +683,18 @@ func TestProcJoin_Captcha(t *testing.T) {
 		assert.True(t, l.captcha.IsPending(43))
 	})
 
-	t.Run("captcha error is returned and does not stop the next member", func(t *testing.T) {
+	t.Run("every member is verified on its own", func(t *testing.T) {
 		l, api := setup(t, false)
 		inner := api.RequestFunc
 		api.RequestFunc = func(cfg tbapi.Chattable) (*tbapi.APIResponse, error) {
-			if m, ok := cfg.(tbapi.GetChatMemberConfig); ok && m.UserID == 42 {
+			if m, ok := cfg.(tbapi.RestrictChatMemberConfig); ok && m.UserID == 42 {
 				return nil, errors.New("api down")
 			}
 			return inner(cfg)
 		}
-		err := l.procJoin(context.Background(), join(tbapi.User{ID: 1}, tbapi.User{ID: 42}, tbapi.User{ID: 43}))
-		require.ErrorContains(t, err, "api down")
-		assert.False(t, l.captcha.IsPending(42))
+		require.NoError(t, l.procJoin(context.Background(), join(tbapi.User{ID: 1}, tbapi.User{ID: 42}, tbapi.User{ID: 43})))
+		l.captcha.running.Wait()
+		assert.False(t, l.captcha.IsPending(42), "mute failed")
 		assert.True(t, l.captcha.IsPending(43))
 	})
 
@@ -644,7 +739,10 @@ func TestTelegramListener_DoCaptcha(t *testing.T) {
 		NewChatMembers: []tbapi.User{member}, MessageID: 55}}
 	// slipped through before the mute
 	updChan <- tbapi.Update{Message: &tbapi.Message{Chat: tbapi.Chat{ID: 123}, From: &member, Text: "buy now", MessageID: 56}}
-	l.captcha.posting.Wait()
+	updChan <- tbapi.Update{Message: &tbapi.Message{Chat: tbapi.Chat{ID: 123}, From: &member, Text: "/report", MessageID: 58,
+		ReplyToMessage: &tbapi.Message{MessageID: 10, Chat: tbapi.Chat{ID: 123}, From: &tbapi.User{ID: 7}}}}
+	updChan <- tbapi.Update{EditedMessage: &tbapi.Message{Chat: tbapi.Chat{ID: 123}, From: &member, Text: "edit", MessageID: 56}}
+	l.captcha.running.Wait()
 	code := pendingCode(t, l.captcha, 42)
 	updChan <- tbapi.Update{CallbackQuery: captchaQuery(99, 77, "C42:"+code[:1])}
 	for _, d := range digitsOf(code) {
@@ -655,7 +753,8 @@ func TestTelegramListener_DoCaptcha(t *testing.T) {
 	close(updChan)
 	require.EqualError(t, <-done, "telegram update chan closed")
 
-	assert.Equal(t, []int{55, 56, 77}, deletedIDs(api), "join message, the unverified member's message, the solved captcha")
+	assert.Equal(t, []int{55, 56, 58, 56, 77}, deletedIDs(api),
+		"join message, the unverified member's message, reply command and edit, the solved captcha")
 	answers := make([]string, 0, 4)
 	for _, a := range requestsOf[tbapi.CallbackConfig](api) {
 		answers = append(answers, a.Text)
@@ -687,7 +786,10 @@ func TestTelegramListener_DoCaptchaCanceledOnLeave(t *testing.T) {
 
 	require.EqualError(t, l.Do(context.Background()), "telegram update chan closed")
 	assert.False(t, l.captcha.IsPending(42))
-	assert.ElementsMatch(t, []int{55, 77}, deletedIDs(api), "join message and the captcha message, posted or in flight")
+	deleted := deletedIDs(api)
+	require.NotEmpty(t, deleted)
+	assert.Equal(t, 55, deleted[0], "join message")
+	assert.Len(t, deleted[1:], len(api.SendCalls()), "a captcha posted before or after the leave is deleted")
 	assert.Empty(t, requestsOf[tbapi.BanChatMemberConfig](api))
 	assert.Equal(t, 1, failuresOf(l.captcha, 42))
 }

@@ -495,7 +495,7 @@ When a member joins:
 3. Entering the right number lifts the mute, so the group's default permissions apply, and deletes the captcha. Each press only shows progress; the number is checked once all three digits are in, so a guess has a 1 in 1000 chance. Presses by anyone else are ignored
 4. A wrong number, or no answer within `--captcha.timeout` (default `2m`, allowed `10s` to `24h`), deletes the captcha and bans the member for a cooldown: 5 minutes after the first failure, doubling with each further one up to 24 hours. Telegram lifts the ban when it ends, so a person who failed can join again later, while guessing by rejoining stays slow. Failures older than 24 hours are forgotten, and solving a captcha clears them
 
-Messages that reach the group from a member with an unsolved captcha are deleted. A member who leaves before answering has their captcha removed, and this counts as a failure without a ban, so leaving and rejoining for a fresh challenge runs into the cooldown. Superusers, approved users, bots and members added by a superuser skip the captcha.
+Messages that reach the group from a member with an unsolved captcha are deleted. A member who leaves before answering has their captcha removed, and this counts as a failure without a ban, so leaving and rejoining for a fresh challenge runs into the cooldown. Superusers, group administrators, approved users, bots and members added by a superuser skip the captcha. The verification runs in the background, so a burst of joins does not hold up the bot; the timeout starts once the member can see the challenge.
 
 Notes:
 
