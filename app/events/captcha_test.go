@@ -810,3 +810,234 @@ func TestTelegramListener_DoCaptchaDisabledInDryMode(t *testing.T) {
 	require.Len(t, answers, 1, "a press on a left-over captcha is still answered")
 	assert.Equal(t, captchaExpired, answers[0].Text)
 }
+
+func TestCaptcha_Test(t *testing.T) {
+	sentTexts := func(api *mocks.TbAPIMock) []string {
+		var res []string
+		for _, c := range api.SendCalls() {
+			if m, ok := c.C.(tbapi.MessageConfig); ok {
+				res = append(res, m.Text)
+			}
+		}
+		return res
+	}
+	start := func(t *testing.T, timeout time.Duration) (*captcha, *mocks.TbAPIMock, string) {
+		t.Helper()
+		api := newCaptchaAPI("member")
+		c := newCaptcha(api, 123, timeout, testCaptchaMsg)
+		c.render = stubRender
+		t.Cleanup(c.Stop)
+		c.StartTest(bot.User{ID: 42, Username: "admin"})
+		c.running.Wait()
+		c.mu.Lock()
+		p, ok := c.tests[42]
+		c.mu.Unlock()
+		require.True(t, ok)
+		return c, api, p.code
+	}
+	pressDM := func(t *testing.T, c *captcha, keys ...string) {
+		t.Helper()
+		for _, k := range keys {
+			q := captchaQuery(42, 77, "C42:"+k)
+			q.Message.Chat.ID = 42
+			require.NoError(t, c.HandleCallback(q))
+		}
+	}
+
+	t.Run("posted in the private chat with the join caption, nothing done to the member", func(t *testing.T) {
+		c, api, _ := start(t, time.Minute)
+		require.Len(t, api.SendCalls(), 1)
+		anim := api.SendCalls()[0].C.(tbapi.AnimationConfig)
+		assert.Equal(t, int64(42), anim.ChatID)
+		assert.Equal(t, c.prompt(bot.User{ID: 42, Username: "admin"}), anim.Caption)
+		assert.Empty(t, api.RequestCalls(), "no status read, mute or ban")
+		assert.False(t, c.IsPending(42), "not a join captcha")
+	})
+
+	t.Run("right number passes", func(t *testing.T) {
+		c, api, code := start(t, time.Minute)
+		pressDM(t, c, digitsOf(code)...)
+		assert.Equal(t, []string{"captcha test passed, a member entering this would be let in"}, sentTexts(api))
+		assert.Equal(t, []int{77}, deletedIDs(api))
+		assert.Empty(t, requestsOf[tbapi.RestrictChatMemberConfig](api))
+		assert.Empty(t, requestsOf[tbapi.BanChatMemberConfig](api))
+		assert.Zero(t, failuresOf(c, 42))
+	})
+
+	t.Run("wrong number tells the right one, no ban, no failure", func(t *testing.T) {
+		c, api, code := start(t, time.Minute)
+		wrong := wrongCode(code)
+		pressDM(t, c, digitsOf(wrong)...)
+		assert.Equal(t, []string{fmt.Sprintf("captcha test failed: entered %s, the number was %s. a member would be "+
+			"removed for 5m, doubling with each further failure (test only, nothing happened to you)", wrong, code)},
+			sentTexts(api))
+		assert.Empty(t, requestsOf[tbapi.BanChatMemberConfig](api))
+		assert.Zero(t, failuresOf(c, 42))
+	})
+
+	t.Run("timeout tells the number", func(t *testing.T) {
+		c, api, code := start(t, 50*time.Millisecond)
+		require.Eventually(t, func() bool { return len(sentTexts(api)) == 1 }, time.Second, 10*time.Millisecond)
+		assert.Equal(t, []string{"captcha test timed out after " + compactDuration(50*time.Millisecond) +
+			", the number was " + code + ". a member would be removed (test only, nothing happened to you)"},
+			sentTexts(api))
+		assert.Equal(t, []int{77}, deletedIDs(api))
+		assert.Empty(t, requestsOf[tbapi.BanChatMemberConfig](api))
+		assert.Zero(t, failuresOf(c, 42))
+	})
+
+	t.Run("a test press does not solve a join captcha", func(t *testing.T) {
+		c, api, code := start(t, time.Minute)
+		c.Start(bot.User{ID: 42})
+		c.running.Wait()
+		pressDM(t, c, digitsOf(code)...)
+		assert.True(t, c.IsPending(42), "join captcha untouched")
+		assert.Len(t, sentTexts(api), 1)
+	})
+
+	t.Run("press in a private chat without a test has expired", func(t *testing.T) {
+		api := newCaptchaAPI("member")
+		c := newCaptcha(api, 123, time.Minute, testCaptchaMsg)
+		pressDM(t, c, "1")
+		answers := requestsOf[tbapi.CallbackConfig](api)
+		require.Len(t, answers, 1)
+		assert.Equal(t, captchaExpired, answers[0].Text)
+	})
+
+	t.Run("send fails, reported in the private chat", func(t *testing.T) {
+		api := newCaptchaAPI("member")
+		api.SendFunc = func(cfg tbapi.Chattable) (tbapi.Message, error) {
+			if _, ok := cfg.(tbapi.AnimationConfig); ok {
+				return tbapi.Message{}, errors.New("upload failed")
+			}
+			return tbapi.Message{}, nil
+		}
+		c := newCaptcha(api, 123, time.Minute, testCaptchaMsg)
+		c.render = stubRender
+		c.StartTest(bot.User{ID: 42})
+		c.running.Wait()
+		assert.Equal(t, []string{"captcha test failed: send animation: upload failed"}, sentTexts(api))
+		c.mu.Lock()
+		assert.Empty(t, c.tests)
+		c.mu.Unlock()
+	})
+
+	t.Run("a replaced test is not rendered, its failure not reported", func(t *testing.T) {
+		api := newCaptchaAPI("member")
+		c := newCaptcha(api, 123, time.Minute, testCaptchaMsg)
+		defer c.Stop()
+		renders := 0
+		c.render = func(string) ([]byte, error) { renders++; return []byte("gif"), nil }
+		for range captchaWorkers {
+			c.workers <- struct{}{} // hold the workers so both tests queue
+		}
+		c.StartTest(bot.User{ID: 42})
+		c.StartTest(bot.User{ID: 42})
+		for range captchaWorkers {
+			<-c.workers
+		}
+		c.running.Wait()
+		assert.Equal(t, 1, renders, "only the newer test is rendered")
+		assert.Len(t, api.SendCalls(), 1)
+
+		api.SendFunc = func(cfg tbapi.Chattable) (tbapi.Message, error) {
+			if _, ok := cfg.(tbapi.AnimationConfig); ok {
+				return tbapi.Message{}, errors.New("upload failed")
+			}
+			return tbapi.Message{}, nil
+		}
+		rendering, release := make(chan struct{}), make(chan struct{})
+		c.render = func(string) ([]byte, error) { close(rendering); <-release; return []byte("gif"), nil }
+		c.StartTest(bot.User{ID: 43})
+		<-rendering
+		c.mu.Lock()
+		delete(c.tests, 43) // resolved while being sent
+		c.mu.Unlock()
+		close(release)
+		c.running.Wait()
+		assert.Empty(t, sentTexts(api), "no failure reported for a test no longer current")
+	})
+
+	t.Run("stop deletes a pending test", func(t *testing.T) {
+		c, api, _ := start(t, time.Minute)
+		c.Stop()
+		assert.Equal(t, []int{77}, deletedIDs(api))
+		assert.Equal(t, int64(42), requestsOf[tbapi.DeleteMessageConfig](api)[0].ChatID)
+	})
+}
+
+func TestTelegramListener_procCaptchaTest(t *testing.T) {
+	dm := func(from tbapi.User, text string) tbapi.Update {
+		return tbapi.Update{Message: &tbapi.Message{Chat: tbapi.Chat{ID: from.ID, Type: "private"}, From: &from, Text: text}}
+	}
+	setup := func(withCaptcha bool) (*TelegramListener, *mocks.TbAPIMock) {
+		api := newCaptchaAPI("member")
+		l := &TelegramListener{TbAPI: api, SuperUsers: SuperUsers{"admin"}, BotUsername: "TgSpamBot"}
+		l.chatID = 123
+		if withCaptcha {
+			l.captcha = newCaptcha(api, 123, time.Minute, testCaptchaMsg)
+			l.captcha.render = stubRender
+		}
+		return l, api
+	}
+
+	for _, text := range []string{"/captcha", " /CAPTCHA ", "/captcha@tgspambot"} {
+		t.Run("superuser "+text, func(t *testing.T) {
+			l, api := setup(true)
+			defer l.captcha.Stop()
+			require.NoError(t, l.procEvents(dm(tbapi.User{ID: 42, UserName: "admin", FirstName: "Ad"}, text)))
+			l.captcha.running.Wait()
+			require.Len(t, api.SendCalls(), 1)
+			assert.Equal(t, int64(42), api.SendCalls()[0].C.(tbapi.AnimationConfig).ChatID)
+			assert.Len(t, l.GetDMUsers(), 1, "still recorded as a DM sender")
+		})
+	}
+
+	t.Run("other text or another bot's command is ignored", func(t *testing.T) {
+		l, api := setup(true)
+		defer l.captcha.Stop()
+		for _, text := range []string{"hi", "/captcha now", "/captcha@otherbot"} {
+			require.NoError(t, l.procEvents(dm(tbapi.User{ID: 42, UserName: "admin"}, text)))
+		}
+		l.captcha.running.Wait()
+		assert.Empty(t, api.SendCalls())
+	})
+
+	t.Run("an edit into the command is ignored", func(t *testing.T) {
+		l, api := setup(true)
+		defer l.captcha.Stop()
+		upd := dm(tbapi.User{ID: 42, UserName: "admin"}, "/captcha")
+		upd.Message.EditDate = 1
+		require.NoError(t, l.procEvents(upd))
+		l.captcha.running.Wait()
+		assert.Empty(t, api.SendCalls())
+	})
+
+	t.Run("works when the admin chat is the superuser's private chat", func(t *testing.T) {
+		l, api := setup(true)
+		defer l.captcha.Stop()
+		upd := dm(tbapi.User{ID: 42, UserName: "admin"}, "/captcha")
+		l.adminChatID = 42
+		require.True(t, l.isAdminChat(upd.Message.Chat.ID, "admin", 42))
+		require.True(t, l.procCaptchaTest(upd.Message), "Do calls it before the admin handler")
+		l.captcha.running.Wait()
+		assert.Len(t, api.SendCalls(), 1)
+		assert.False(t, l.procCaptchaTest(&tbapi.Message{Chat: tbapi.Chat{ID: 123, Type: "supergroup"},
+			From: &tbapi.User{ID: 42, UserName: "admin"}, Text: "/captcha"}), "not in a group")
+	})
+
+	t.Run("non-superuser is ignored", func(t *testing.T) {
+		l, api := setup(true)
+		defer l.captcha.Stop()
+		require.NoError(t, l.procEvents(dm(tbapi.User{ID: 7, UserName: "someone"}, "/captcha")))
+		l.captcha.running.Wait()
+		assert.Empty(t, api.SendCalls())
+	})
+
+	t.Run("captcha disabled is said so", func(t *testing.T) {
+		l, api := setup(false)
+		require.NoError(t, l.procEvents(dm(tbapi.User{ID: 42, UserName: "admin"}, "/captcha")))
+		require.Len(t, api.SendCalls(), 1)
+		assert.Equal(t, "captcha is disabled", api.SendCalls()[0].C.(tbapi.MessageConfig).Text)
+	})
+}

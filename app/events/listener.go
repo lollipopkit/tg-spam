@@ -216,6 +216,10 @@ func (l *TelegramListener) Do(ctx context.Context) error {
 			// or forwards of undetected spam by admins to admin's chat (in this case MsgHandler will process them and ban/train)
 			if update.Message != nil && update.Message.From != nil &&
 				l.isAdminChat(update.Message.Chat.ID, update.Message.From.UserName, update.Message.From.ID) {
+				// the admin chat can be a superuser's private chat with the bot
+				if l.procCaptchaTest(update.Message) {
+					continue
+				}
 				if l.DisableAdminSpamForward {
 					continue
 				}
@@ -416,6 +420,7 @@ func (l *TelegramListener) procEvents(update tbapi.Update) error {
 			DisplayName: displayName,
 			Timestamp:   time.Now(),
 		})
+		l.procCaptchaTest(update.Message)
 		return nil
 	}
 
@@ -669,6 +674,34 @@ func (l *TelegramListener) procJoin(ctx context.Context, msg *tbapi.Message) err
 		return fmt.Errorf("failed to process join check: %w", err)
 	}
 	return nil
+}
+
+// procCaptchaTest posts a test captcha to a superuser who sends /captcha to the bot in a private chat, so the
+// challenge can be checked in real clients. limited to superusers: every test renders and uploads an animation.
+// edits are ignored, editing a message into the command must not start a test. reports whether it handled msg
+func (l *TelegramListener) procCaptchaTest(msg *tbapi.Message) bool {
+	if msg.Chat.Type != "private" || msg.From == nil || msg.EditDate != 0 {
+		return false
+	}
+	text := strings.ToLower(strings.TrimSpace(msg.Text))
+	if text != "/captcha" && (l.BotUsername == "" || text != "/captcha@"+strings.ToLower(l.BotUsername)) {
+		return false
+	}
+	if !l.SuperUsers.IsSuper(msg.From.UserName, msg.From.ID) {
+		log.Printf("[DEBUG] captcha test requested by non-superuser %s (%d), ignored", msg.From.UserName, msg.From.ID)
+		return true
+	}
+	if l.captcha == nil {
+		if _, err := l.TbAPI.Send(tbapi.NewMessage(msg.Chat.ID, "captcha is disabled")); err != nil {
+			log.Printf("[WARN] failed to answer captcha test request: %v", err)
+		}
+		return true
+	}
+	user := bot.User{ID: msg.From.ID, Username: msg.From.UserName, FirstName: strings.TrimSpace(msg.From.FirstName),
+		LastName: strings.TrimSpace(msg.From.LastName)}
+	user.DisplayName = strings.TrimSpace(user.FirstName + " " + user.LastName)
+	l.captcha.StartTest(user)
+	return true
 }
 
 // procCaptchaCallback passes a captcha keypad press to the captcha. with the captcha disabled, a press on a

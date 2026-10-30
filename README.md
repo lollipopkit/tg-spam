@@ -500,6 +500,7 @@ Messages that reach the group from a member with an unsolved captcha are deleted
 Notes:
 
 - The bot needs the "ban users" and "delete messages" admin rights.
+- To check how the animation looks in your members' clients, send `/captcha` to the bot in a private chat. A superuser (group admins included) gets the same challenge there; nothing happens whatever is entered, and the bot replies with the result, or the number once the timeout passes. The command is ignored for other users, since every challenge renders and uploads an animation.
 - The caption is sent as HTML with the template text escaped, so it can't carry formatting. It must not be empty and must fit Telegram's 1024-character caption limit with `{user}` counted as the longest possible name. Example in another language: `--captcha.message="{user}，请在 {timeout} 内输入动图中移动的数字，否则会被移出群组。"`
 - The captcha is driven by join service messages, so it does not run for a member whose join produces no such message. `--delete.join-messages` is fine: the bot receives the message before deleting it.
 - A program written for this particular captcha can recover the digits by comparing consecutive frames. The captcha targets generic automation and general-purpose models; the message spam checks still apply once a member is in.
