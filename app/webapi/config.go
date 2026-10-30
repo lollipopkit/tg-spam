@@ -585,6 +585,16 @@ func updateSettingsFromForm(settings *config.Settings, r *http.Request) {
 	if _, ok := r.Form["captchaMessage"]; ok {
 		settings.Captcha.Message = r.FormValue("captchaMessage")
 	}
+	// turnstile, the secret is a credential and never in the form
+	if _, ok := r.Form["captchaTurnstileSiteKey"]; ok {
+		settings.Captcha.Turnstile.SiteKey = strings.TrimSpace(r.FormValue("captchaTurnstileSiteKey"))
+	}
+	if _, ok := r.Form["captchaTurnstileURL"]; ok {
+		settings.Captcha.Turnstile.URL = strings.TrimSpace(r.FormValue("captchaTurnstileURL"))
+	}
+	if _, ok := r.Form["captchaTurnstileListen"]; ok {
+		settings.Captcha.Turnstile.Listen = strings.TrimSpace(r.FormValue("captchaTurnstileListen"))
+	}
 
 	// service-message deletion. These flags are not rendered in the ConfigDB UI
 	// form; gate the writes on form presence so unrelated saves don't wipe them.

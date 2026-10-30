@@ -821,6 +821,9 @@ func TestSettings_ValidateCaptcha(t *testing.T) {
 	captcha := func(timeout time.Duration, msg string) *Settings {
 		return &Settings{Captcha: CaptchaSettings{Enabled: true, Timeout: timeout, Message: msg}}
 	}
+	turnstile := func(ts TurnstileSettings) *Settings {
+		return &Settings{Captcha: CaptchaSettings{Enabled: true, Timeout: time.Minute, Turnstile: ts}}
+	}
 	tests := []struct {
 		name    string
 		s       *Settings
@@ -832,7 +835,27 @@ func TestSettings_ValidateCaptcha(t *testing.T) {
 		{name: "max timeout", s: captcha(MaxCaptchaTimeout, "x")},
 		{name: "timeout too short", s: captcha(5*time.Second, "x"), wantErr: "captcha.timeout (5s) must be between 10s and 24h0m0s"},
 		{name: "timeout too long", s: captcha(25*time.Hour, "x"), wantErr: "captcha.timeout (25h0m0s) must be between"},
-		{name: "empty message", s: captcha(time.Minute, "  "), wantErr: "captcha.message must not be empty"},
+		{name: "empty message selects the default", s: captcha(time.Minute, "")},
+		{name: "blank message", s: captcha(time.Minute, "  "), wantErr: "captcha.message must not be blank"},
+		{name: "turnstile complete", s: turnstile(TurnstileSettings{SiteKey: "k", Secret: "s",
+			URL: "https://verify.example.com", Listen: ":8081"})},
+		{name: "turnstile without secret", s: turnstile(TurnstileSettings{SiteKey: "k",
+			URL: "https://verify.example.com", Listen: ":8081"}), wantErr: "captcha.turnstile needs a site key, a secret and a listen address"},
+		{name: "turnstile without listen", s: turnstile(TurnstileSettings{SiteKey: "k", Secret: "s",
+			URL: "https://verify.example.com"}), wantErr: "captcha.turnstile needs a site key, a secret and a listen address"},
+		{name: "turnstile with http url", s: turnstile(TurnstileSettings{SiteKey: "k", Secret: "s",
+			URL: "http://verify.example.com", Listen: ":8081"}), wantErr: "must be an https url of a host"},
+		{name: "turnstile with relative url", s: turnstile(TurnstileSettings{SiteKey: "k", Secret: "s",
+			URL: "/verify", Listen: ":8081"}), wantErr: "must be an https url of a host"},
+		{name: "no site key, turnstile off", s: turnstile(TurnstileSettings{URL: "nonsense"})},
+		{name: "turnstile url with a path", s: turnstile(TurnstileSettings{SiteKey: "k", Secret: "s",
+			URL: "https://verify.example.com/captcha", Listen: ":8081"}), wantErr: "without a path"},
+		{name: "turnstile url with an empty query", s: turnstile(TurnstileSettings{SiteKey: "k", Secret: "s",
+			URL: "https://verify.example.com?", Listen: ":8081"}), wantErr: "without a path"},
+		{name: "turnstile url with an empty fragment", s: turnstile(TurnstileSettings{SiteKey: "k", Secret: "s",
+			URL: "https://verify.example.com#", Listen: ":8081"}), wantErr: "without a path"},
+		{name: "turnstile url with a port only", s: turnstile(TurnstileSettings{SiteKey: "k", Secret: "s",
+			URL: "https://:443", Listen: ":8081"}), wantErr: "without a path"},
 		{name: "message at the limit", s: captcha(time.Minute, "{user}"+strings.Repeat("字", 1024-129))},
 		{name: "message over the limit with the mention expanded",
 			s: captcha(time.Minute, "{user}"+strings.Repeat("字", 1024-128)), wantErr: "captcha.message is too long, 1025"},

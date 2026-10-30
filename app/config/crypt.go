@@ -18,12 +18,13 @@ const EncryptPrefix = "ENC:"
 
 // Sensitive field name constants
 const (
-	FieldTelegramToken  = "telegram.token"
-	FieldOpenAIToken    = "openai.token"
-	FieldGeminiToken    = "gemini.token"
-	FieldJevToken       = "jev.token"
-	FieldCASToken       = "cas.token"
-	FieldServerAuthHash = "server.auth_hash"
+	FieldTelegramToken   = "telegram.token"
+	FieldOpenAIToken     = "openai.token"
+	FieldGeminiToken     = "gemini.token"
+	FieldJevToken        = "jev.token"
+	FieldCASToken        = "cas.token"
+	FieldTurnstileSecret = "captcha.turnstile.secret" //nolint:gosec // field name, not a credential
+	FieldServerAuthHash  = "server.auth_hash"
 )
 
 // MinKeyLength defines the minimum acceptable length for an encryption key
@@ -158,12 +159,13 @@ var sensitiveFieldAccessors = map[string]struct {
 	label string
 	get   func(*Settings) *string
 }{
-	FieldTelegramToken:  {"Telegram token", func(s *Settings) *string { return &s.Telegram.Token }},
-	FieldOpenAIToken:    {"OpenAI token", func(s *Settings) *string { return &s.OpenAI.Token }},
-	FieldGeminiToken:    {"Gemini token", func(s *Settings) *string { return &s.Gemini.Token }},
-	FieldJevToken:       {"Jev token", func(s *Settings) *string { return &s.Jev.Token }},
-	FieldCASToken:       {"CAS token", func(s *Settings) *string { return &s.CAS.Token }},
-	FieldServerAuthHash: {"Server auth hash", func(s *Settings) *string { return &s.Server.AuthHash }},
+	FieldTelegramToken:   {"Telegram token", func(s *Settings) *string { return &s.Telegram.Token }},
+	FieldOpenAIToken:     {"OpenAI token", func(s *Settings) *string { return &s.OpenAI.Token }},
+	FieldGeminiToken:     {"Gemini token", func(s *Settings) *string { return &s.Gemini.Token }},
+	FieldJevToken:        {"Jev token", func(s *Settings) *string { return &s.Jev.Token }},
+	FieldCASToken:        {"CAS token", func(s *Settings) *string { return &s.CAS.Token }},
+	FieldTurnstileSecret: {"Turnstile secret", func(s *Settings) *string { return &s.Captcha.Turnstile.Secret }},
+	FieldServerAuthHash:  {"Server auth hash", func(s *Settings) *string { return &s.Server.AuthHash }},
 }
 
 // CopySensitiveFields sets the named sensitive fields of dst to their values in src,

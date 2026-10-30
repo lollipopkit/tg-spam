@@ -23,7 +23,7 @@ const captchaPrefix = "C"
 const (
 	captchaCodeLen = 2
 	captchaChoices = 6 // candidate numbers offered, the code among them: a guess passes 1 in 6
-	captchaWorkers = 4 // concurrent verifications, each makes a few API calls, renders and uploads
+	captchaWorkers = 4 // concurrent verifications, each makes a few API calls and an upload
 
 	// a failed captcha bans for captchaCooldown, doubled on every further failure up to captchaMaxCooldown.
 	// failures older than captchaMaxCooldown are forgotten
@@ -43,29 +43,31 @@ const captchaGrace = time.Minute
 // safe for concurrent use: callbacks come from the update loop, timeouts from timer goroutines and the
 // verification itself from worker goroutines.
 type captcha struct {
-	tbAPI   TbAPI
-	chatID  int64
-	timeout time.Duration
-	message string                            // prompt template with {user} and {timeout} placeholders
-	render  func(code string) ([]byte, error) // draws the challenge image
+	tbAPI     TbAPI
+	chatID    int64
+	timeout   time.Duration
+	message   string                            // prompt template with {user} and {timeout}, empty for the mode default
+	render    func(code string) ([]byte, error) // draws the challenge image
+	turnstile *turnstile                        // set in Turnstile mode, nil for the motion animation
 
 	workers chan struct{}  // limits concurrent verifications
 	running sync.WaitGroup // verifications in progress, waited for by Stop
 
 	mu       sync.Mutex
-	pending  map[int64]*pendingCaptcha // by user ID
-	tests    map[int64]*pendingCaptcha // test challenges in private chats, by user ID
-	failures map[int64]captchaFailure  // by user ID
-	muted    map[int64]time.Time       // members under the captcha's own mute, by user ID, to its expiry
+	pending  map[int64]*pendingCaptcha  // by user ID
+	tests    map[int64]*pendingCaptcha  // test challenges in private chats, by user ID
+	nonces   map[string]*pendingCaptcha // posted Turnstile challenges, by page nonce
+	failures map[int64]captchaFailure   // by user ID
+	muted    map[int64]time.Time        // members under the captcha's own mute, by user ID, to its expiry
 }
 
 type pendingCaptcha struct {
 	user   bot.User
 	chatID int64  // chat the challenge is posted in
 	msgID  int    // captcha message, 0 until posted
-	code   string // the number to enter, set when posted
+	code   string // the number to choose, or the page nonce in Turnstile mode; set when posted
 	chosen string // candidate the member pressed
-	lang   string // member's telegram language, set for tests whose results are told later
+	lang   string // member's telegram language, for the texts the bot shows them
 	timer  *time.Timer
 }
 
@@ -77,15 +79,16 @@ type captchaFailure struct {
 func newCaptcha(tbAPI TbAPI, chatID int64, timeout time.Duration, message string) *captcha {
 	return &captcha{tbAPI: tbAPI, chatID: chatID, timeout: timeout, message: message, render: renderMotionCaptcha,
 		workers: make(chan struct{}, captchaWorkers), pending: make(map[int64]*pendingCaptcha),
-		tests: make(map[int64]*pendingCaptcha), failures: make(map[int64]captchaFailure),
-		muted: make(map[int64]time.Time)}
+		tests: make(map[int64]*pendingCaptcha), nonces: make(map[string]*pendingCaptcha),
+		failures: make(map[int64]captchaFailure),
+		muted:    make(map[int64]time.Time)}
 }
 
 // Start verifies a member who has just joined. it only marks the member pending, so their messages are
 // deleted from now on, and leaves the API calls to a worker: the update loop never waits for them. a
 // captcha already pending for the member is replaced
-func (c *captcha) Start(user bot.User) {
-	p := &pendingCaptcha{user: user, chatID: c.chatID}
+func (c *captcha) Start(user bot.User, lang string) {
+	p := &pendingCaptcha{user: user, chatID: c.chatID, lang: lang}
 	c.register(c.pending, p)
 	c.running.Add(1)
 	go c.verify(p)
@@ -136,8 +139,7 @@ func (c *captcha) verify(p *pendingCaptcha) {
 		return
 	}
 
-	code := newCaptchaCode()
-	sent, err := c.send(c.chatID, user, code, c.prompt(user))
+	sent, code, page, err := c.challenge(c.chatID, p)
 	if err != nil {
 		if c.take(c.pending, user.ID, p) != nil {
 			c.unmute(user)
@@ -146,7 +148,7 @@ func (c *captcha) verify(p *pendingCaptcha) {
 		return
 	}
 
-	if !c.posted(c.pending, p, sent.MessageID, code, c.expire) {
+	if !c.posted(c.pending, p, sent.MessageID, code, page, c.expire) {
 		return
 	}
 	log.Printf("[INFO] captcha sent to %s, timeout %v", user, c.timeout)
@@ -189,6 +191,7 @@ func (c *captcha) HandleCallback(query *tbapi.CallbackQuery) error {
 	}
 	p.chosen = choice
 	delete(pending, userID)
+	c.forgetNonce(p)
 	stopTimer(p)
 	c.mu.Unlock()
 
@@ -202,13 +205,26 @@ func (c *captcha) HandleCallback(query *tbapi.CallbackQuery) error {
 		return c.fail(p.user, "wrong answer", true)
 	}
 	answerCallback(c.tbAPI, query.ID, captchaText(lang, txtVerified))
+	c.solved(p)
+	return nil
+}
+
+// solved lets in a member who passed the join captcha: failures are cleared and the mute lifted
+func (c *captcha) solved(p *pendingCaptcha) {
 	c.mu.Lock()
-	delete(c.failures, userID)
+	delete(c.failures, p.user.ID)
 	c.mu.Unlock()
 	c.unmute(p.user)
 	log.Printf("[INFO] captcha solved by %s", p.user)
-	return nil
 }
+
+// default captcha prompts, used when --captcha.message is empty
+const (
+	defaultMotionMessage = "{user}, choose the number moving in the animation within {timeout}, " +
+		"otherwise you will be removed from the chat. Tap the animation if it does not play."
+	defaultTurnstileMessage = "{user}, press the button below and complete the check within {timeout}, " +
+		"otherwise you will be removed from the chat."
+)
 
 // texts the bot shows members itself, by language; the prompt in the chat is --captcha.message
 const (
@@ -218,9 +234,17 @@ const (
 	txtWrong
 	txtDisabled
 	txtTestPassed
-	txtTestFailed  // chosen, code, first cooldown
-	txtTestTimeout // timeout, code
-	txtTestError   // error
+	txtTestFailed      // chosen, code, first cooldown
+	txtTestTimeout     // timeout, code
+	txtTestTimeoutPage // timeout
+	txtTestError       // error
+	txtVerifyButton
+	txtPageTitle
+	txtPageHint
+	txtPageDone
+	txtPageFailed
+	txtPageExpired
+	txtPageLogin
 )
 
 var captchaTexts = map[string][]string{
@@ -230,23 +254,39 @@ var captchaTexts = map[string][]string{
 		txtVerified:   "verified",
 		txtWrong:      "wrong answer",
 		txtDisabled:   "captcha is disabled",
-		txtTestPassed: "captcha test passed, a member choosing this would be let in",
+		txtTestPassed: "captcha test passed, a member passing it would be let in",
 		txtTestFailed: "captcha test failed: chose %s, the number was %s. a member would be removed for %s, " +
 			"doubling with each further failure (test only, nothing happened to you)",
 		txtTestTimeout: "captcha test timed out after %s, the number was %s. a member would be removed " +
 			"(test only, nothing happened to you)",
-		txtTestError: "captcha test failed: %s",
+		txtTestError:       "captcha test failed: %s",
+		txtVerifyButton:    "Verify",
+		txtPageTitle:       "Verification",
+		txtPageHint:        "Complete the check below to be let into the chat.",
+		txtPageDone:        "Verified. You can go back to Telegram.",
+		txtPageFailed:      "The check did not pass. Please try again.",
+		txtPageExpired:     "This verification has expired or is already done.",
+		txtPageLogin:       "Open this page with the button in Telegram and allow the login, it tells the bot who you are.",
+		txtTestTimeoutPage: "captcha test timed out after %s. a member would be removed (test only, nothing happened to you)",
 	},
 	"zh": { //nolint:gosec // user-facing texts, not credentials
-		txtExpired:     "此验证已失效",
-		txtOtherUser:   "这不是你的验证",
-		txtVerified:    "验证通过",
-		txtWrong:       "答案错误",
-		txtDisabled:    "入群验证未启用",
-		txtTestPassed:  "验证测试通过，成员选择这个会被放行",
-		txtTestFailed:  "验证测试未通过：选择了 %s，正确答案是 %s。成员会被移出 %s，之后每次失败时长翻倍（仅为测试，你不受影响）",
-		txtTestTimeout: "验证测试已超时（%s），正确答案是 %s。成员会被移出（仅为测试，你不受影响）",
-		txtTestError:   "验证测试失败：%s",
+		txtExpired:         "此验证已失效",
+		txtOtherUser:       "这不是你的验证",
+		txtVerified:        "验证通过",
+		txtWrong:           "答案错误",
+		txtDisabled:        "入群验证未启用",
+		txtTestPassed:      "验证测试通过，成员这样操作会被放行",
+		txtTestFailed:      "验证测试未通过：选择了 %s，正确答案是 %s。成员会被移出 %s，之后每次失败时长翻倍（仅为测试，你不受影响）",
+		txtTestTimeout:     "验证测试已超时（%s），正确答案是 %s。成员会被移出（仅为测试，你不受影响）",
+		txtTestError:       "验证测试失败：%s",
+		txtVerifyButton:    "点击验证",
+		txtPageTitle:       "入群验证",
+		txtPageHint:        "完成下方验证后即可在群里发言。",
+		txtPageDone:        "验证通过，可以返回 Telegram 了。",
+		txtPageFailed:      "验证未通过，请重试。",
+		txtPageExpired:     "此验证已失效或已完成。",
+		txtPageLogin:       "请在 Telegram 里点按钮打开此页面，并允许登录，bot 需要据此确认你的身份。",
+		txtTestTimeoutPage: "验证测试已超时（%s）。成员会被移出（仅为测试，你不受影响）",
 	},
 	"ru": { //nolint:gosec // user-facing texts, not credentials
 		txtExpired:    "эта проверка устарела",
@@ -254,12 +294,20 @@ var captchaTexts = map[string][]string{
 		txtVerified:   "проверка пройдена",
 		txtWrong:      "неверный ответ",
 		txtDisabled:   "проверка новых участников отключена",
-		txtTestPassed: "тест пройден, участник с таким ответом был бы допущен",
+		txtTestPassed: "тест пройден, участник с таким результатом был бы допущен",
 		txtTestFailed: "тест не пройден: выбрано %s, верное число %s. участник был бы удалён на %s, " +
 			"при каждой следующей ошибке срок удваивается (это только тест, вас это не затронуло)",
 		txtTestTimeout: "время теста истекло (%s), верное число %s. участник был бы удалён " +
 			"(это только тест, вас это не затронуло)",
-		txtTestError: "тест не удался: %s",
+		txtTestError:       "тест не удался: %s",
+		txtVerifyButton:    "Пройти проверку",
+		txtPageTitle:       "Проверка",
+		txtPageHint:        "Пройдите проверку ниже, чтобы писать в чате.",
+		txtPageDone:        "Проверка пройдена. Можно вернуться в Telegram.",
+		txtPageFailed:      "Проверка не пройдена. Попробуйте ещё раз.",
+		txtPageExpired:     "Эта проверка устарела или уже пройдена.",
+		txtPageLogin:       "Откройте эту страницу кнопкой в Telegram и разрешите вход, так бот узнает, кто вы.",
+		txtTestTimeoutPage: "время теста истекло (%s). участник был бы удалён (это только тест, вас это не затронуло)",
 	},
 }
 
@@ -317,6 +365,7 @@ func (c *captcha) Stop() {
 			delete(m, id)
 		}
 	}
+	clear(c.nonces)
 	c.mu.Unlock()
 	c.running.Wait() // verifications find their captcha gone and delete what they posted
 	for _, p := range posted {
@@ -342,8 +391,7 @@ func (c *captcha) postTest(p *pendingCaptcha) {
 	if !c.isCurrent(c.tests, p) {
 		return // replaced by a newer test, don't render this one
 	}
-	code := newCaptchaCode()
-	sent, err := c.send(p.chatID, p.user, code, c.prompt(p.user))
+	sent, code, page, err := c.challenge(p.chatID, p)
 	if err != nil {
 		log.Printf("[WARN] failed to send captcha test to %s: %v", p.user, err)
 		if c.take(c.tests, p.user.ID, p) != nil {
@@ -351,7 +399,7 @@ func (c *captcha) postTest(p *pendingCaptcha) {
 		}
 		return
 	}
-	if c.posted(c.tests, p, sent.MessageID, code, c.expireTest) {
+	if c.posted(c.tests, p, sent.MessageID, code, page, c.expireTest) {
 		log.Printf("[INFO] captcha test sent to %s", p.user)
 	}
 }
@@ -361,6 +409,10 @@ func (c *captcha) expireTest(p *pendingCaptcha) {
 		return
 	}
 	deleteMessage(c.tbAPI, p.chatID, p.msgID, "captcha")
+	if c.turnstile != nil {
+		c.sendText(p.chatID, captchaText(p.lang, txtTestTimeoutPage, compactDuration(c.timeout)))
+		return
+	}
 	c.sendText(p.chatID, captchaText(p.lang, txtTestTimeout, compactDuration(c.timeout), p.code))
 }
 
@@ -400,6 +452,7 @@ func (c *captcha) register(m map[int64]*pendingCaptcha, p *pendingCaptcha) {
 	if prev != nil {
 		prevMsgID, prevChatID = prev.msgID, prev.chatID
 		stopTimer(prev)
+		c.forgetNonce(prev)
 	}
 	c.mu.Unlock()
 	deleteMessage(c.tbAPI, prevChatID, prevMsgID, "captcha")
@@ -407,13 +460,16 @@ func (c *captcha) register(m map[int64]*pendingCaptcha, p *pendingCaptcha) {
 
 // posted records the sent challenge on p and starts its timeout, if p is still the member's captcha in m.
 // otherwise the challenge was resolved while being sent, its message is deleted and posted returns false
-func (c *captcha) posted(m map[int64]*pendingCaptcha, p *pendingCaptcha, msgID int, code string,
+func (c *captcha) posted(m map[int64]*pendingCaptcha, p *pendingCaptcha, msgID int, code string, page bool,
 	onTimeout func(*pendingCaptcha)) bool {
 	c.mu.Lock()
 	current := m[p.user.ID] == p
 	if current {
 		p.msgID, p.code = msgID, code
 		p.timer = time.AfterFunc(c.timeout, func() { onTimeout(p) })
+		if page {
+			c.nonces[code] = p
+		}
 	}
 	c.mu.Unlock()
 	if !current {
@@ -433,7 +489,34 @@ func (c *captcha) take(m map[int64]*pendingCaptcha, userID int64, want *pendingC
 	}
 	delete(m, userID)
 	stopTimer(p)
+	c.forgetNonce(p)
 	return p
+}
+
+// forgetNonce drops the page of a Turnstile captcha, call with mu held
+func (c *captcha) forgetNonce(p *pendingCaptcha) {
+	if c.turnstile != nil && c.nonces[p.code] == p {
+		delete(c.nonces, p.code)
+	}
+}
+
+// challenge posts the challenge for p in chatID: the animation with candidate buttons, or in Turnstile mode
+// a button opening the challenge page. it returns the sent message and the code, the number or the nonce
+// with page set, so only a page nonce is registered as one
+func (c *captcha) challenge(chatID int64, p *pendingCaptcha) (sent tbapi.Message, code string, page bool, err error) {
+	if c.turnstile != nil {
+		nonce := newNonce()
+		sent, err = c.sendTurnstile(chatID, nonce, c.prompt(p.user), p.lang)
+		if err == nil {
+			return sent, nonce, true, nil
+		}
+		// a login button is refused while the bot's domain is not set, falling back keeps members verified
+		log.Printf("[ERROR] turnstile button for %s failed, is the bot domain set with @BotFather /setdomain? "+
+			"falling back to the animation: %v", p.user, err)
+	}
+	code = newCaptchaCode()
+	sent, err = c.send(chatID, p.user, code, c.motionPrompt(p.user))
+	return sent, code, false, err
 }
 
 // isCurrent reports whether p is still the member's captcha in m
@@ -609,6 +692,28 @@ func (c *captcha) send(chatID int64, user bot.User, code, caption string) (tbapi
 }
 
 func (c *captcha) prompt(user bot.User) string {
+	message := c.message
+	switch {
+	case message != "":
+	case c.turnstile != nil:
+		message = defaultTurnstileMessage
+	default:
+		message = defaultMotionMessage
+	}
+	return c.expandPrompt(user, message)
+}
+
+// motionPrompt is the prompt of the animation. when the turnstile button falls back it is the default one,
+// since a prompt written for turnstile asks to press a button the animation doesn't have
+func (c *captcha) motionPrompt(user bot.User) string {
+	if c.turnstile == nil {
+		return c.prompt(user)
+	}
+	return c.expandPrompt(user, defaultMotionMessage)
+}
+
+// expandPrompt fills the {user} mention and the {timeout} of a prompt template, escaped for HTML
+func (c *captcha) expandPrompt(user bot.User, message string) string {
 	name := user.DisplayName
 	if name == "" {
 		name = user.Username
@@ -618,7 +723,7 @@ func (c *captcha) prompt(user bot.User) string {
 	}
 	mention := fmt.Sprintf(`<a href="tg://user?id=%d">%s</a>`, user.ID, html.EscapeString(name))
 	return strings.NewReplacer("{user}", mention, "{timeout}", compactDuration(c.timeout)).
-		Replace(html.EscapeString(c.message))
+		Replace(html.EscapeString(message))
 }
 
 func (c *captcha) request(cfg tbapi.Chattable) error {

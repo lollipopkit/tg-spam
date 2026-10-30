@@ -265,6 +265,9 @@ func TestSettings_WarnAndCaptchaPersist(t *testing.T) {
 		warnWindowText = "168h0m0s"
 		captchaTimeout = "5m0s"
 		captchaMessage = "{user}, введите число за {timeout}"
+		turnstileKey   = "0x4AAAAAAAe2e"
+		turnstileURL   = "https://verify.example.com"
+		turnstileAddr  = ":9091"
 	)
 	warnURL := fmt.Sprintf("http://localhost:%d", warnPort)
 
@@ -300,6 +303,7 @@ func TestSettings_WarnAndCaptchaPersist(t *testing.T) {
 		"--files.samples="+warnDataPath,
 		"--files.dynamic="+warnDataPath,
 		"--confdb",
+		"--captcha.turnstile.secret=e2e-turnstile-secret", // the form never carries the secret
 		"--dbg",
 	)
 	cmd.Stdout = os.Stdout
@@ -354,6 +358,9 @@ func TestSettings_WarnAndCaptchaPersist(t *testing.T) {
 	require.NoError(t, page.Locator("#captchaEnabled").Check())
 	require.NoError(t, page.Locator("#captchaTimeout").Fill(captchaTimeout))
 	require.NoError(t, page.Locator("#captchaMessage").Fill(captchaMessage))
+	require.NoError(t, page.Locator("#captchaTurnstileSiteKey").Fill(turnstileKey))
+	require.NoError(t, page.Locator("#captchaTurnstileURL").Fill(turnstileURL))
+	require.NoError(t, page.Locator("#captchaTurnstileListen").Fill(turnstileAddr))
 	require.NoError(t, page.Locator("button[type='submit']:has-text('Save Changes')").Click())
 
 	// wait for the save success alert
@@ -383,6 +390,15 @@ func TestSettings_WarnAndCaptchaPersist(t *testing.T) {
 	got, err = page.Locator("#captchaMessage").InputValue()
 	require.NoError(t, err)
 	assert.Equal(t, captchaMessage, got)
+	got, err = page.Locator("#captchaTurnstileSiteKey").InputValue()
+	require.NoError(t, err)
+	assert.Equal(t, turnstileKey, got)
+	got, err = page.Locator("#captchaTurnstileURL").InputValue()
+	require.NoError(t, err)
+	assert.Equal(t, turnstileURL, got)
+	got, err = page.Locator("#captchaTurnstileListen").InputValue()
+	require.NoError(t, err)
+	assert.Equal(t, turnstileAddr, got)
 }
 
 func TestSettings_MaxShortMsgCountPersists(t *testing.T) {

@@ -7,6 +7,7 @@ package config
 import (
 	"fmt"
 	"math"
+	"net/url"
 	"reflect"
 	"strings"
 	"time"
@@ -238,9 +239,18 @@ type WarnSettings struct {
 
 // CaptchaSettings contains new member verification settings
 type CaptchaSettings struct {
-	Enabled bool          `json:"enabled" yaml:"enabled" db:"captcha_enabled"`
-	Timeout time.Duration `json:"timeout" yaml:"timeout" db:"captcha_timeout"`
-	Message string        `json:"message" yaml:"message" db:"captcha_message"`
+	Enabled   bool              `json:"enabled" yaml:"enabled" db:"captcha_enabled"`
+	Timeout   time.Duration     `json:"timeout" yaml:"timeout" db:"captcha_timeout"`
+	Message   string            `json:"message" yaml:"message" db:"captcha_message"`
+	Turnstile TurnstileSettings `json:"turnstile" yaml:"turnstile" db:"captcha_turnstile"`
+}
+
+// TurnstileSettings switch the captcha to Cloudflare Turnstile when SiteKey is set
+type TurnstileSettings struct {
+	SiteKey string `json:"site_key" yaml:"site_key" db:"captcha_turnstile_site_key"`
+	Secret  string `json:"secret" yaml:"secret" db:"captcha_turnstile_secret"`
+	URL     string `json:"url" yaml:"url" db:"captcha_turnstile_url"`
+	Listen  string `json:"listen" yaml:"listen" db:"captcha_turnstile_listen"`
 }
 
 // LuaPluginsSettings contains Lua plugins settings
@@ -354,6 +364,9 @@ func (s *Settings) Validate() error {
 		if err := validateCaptchaMessage(s.Captcha.Message); err != nil {
 			return err
 		}
+		if err := validateTurnstile(s.Captcha.Turnstile); err != nil {
+			return err
+		}
 	}
 	if s.MaxShortMsgCount < 0 {
 		return fmt.Errorf("max-short-msg-count (%d) must be >= 0 (0 disables)", s.MaxShortMsgCount)
@@ -462,17 +475,43 @@ func (s *Settings) IsStartupMessageEnabled() bool {
 	return s.Message.Startup != ""
 }
 
-// validateCaptchaMessage rejects an empty captcha caption and one that can exceed telegram's caption limit
-// once the placeholders are expanded. a caption over the limit fails every send and lets members in unverified
+// validateCaptchaMessage rejects a captcha caption that can exceed telegram's caption limit once the
+// placeholders are expanded. a caption over the limit fails every send and lets members in unverified.
+// empty selects the default prompt of the captcha mode
 func validateCaptchaMessage(msg string) error {
-	if strings.TrimSpace(msg) == "" {
-		return fmt.Errorf("captcha.message must not be empty")
+	if msg != "" && strings.TrimSpace(msg) == "" {
+		return fmt.Errorf("captcha.message must not be blank, leave it empty for the default")
 	}
 	expanded := strings.ReplaceAll(msg, "{user}", strings.Repeat("x", captchaMentionLen))
 	expanded = strings.ReplaceAll(expanded, "{timeout}", "23h59m59s")
 	if n := len(utf16.Encode([]rune(expanded))); n > MaxCaptchaMessageLen {
 		return fmt.Errorf("captcha.message is too long, %d characters with placeholders expanded, max %d",
 			n, MaxCaptchaMessageLen)
+	}
+	return nil
+}
+
+// validateTurnstile checks the Turnstile settings when a site key selects that mode, the same checks the
+// listener makes when it starts, so a config accepted here also starts
+func validateTurnstile(t TurnstileSettings) error {
+	if t.SiteKey == "" {
+		return nil
+	}
+	return ValidateTurnstile(t.SiteKey, t.Secret, t.URL, t.Listen)
+}
+
+// ValidateTurnstile checks the Turnstile settings, shared by Settings.Validate and the listener start: a site
+// key, a secret, a listen address, and an https url of a bare host, no path beyond "/", no query, no
+// fragment, since the pages are served at /v/<nonce> from the root and the host is what siteverify reports
+func ValidateTurnstile(siteKey, secret, publicURL, listen string) error {
+	if siteKey == "" || secret == "" || listen == "" {
+		return fmt.Errorf("captcha.turnstile needs a site key, a secret and a listen address")
+	}
+	u, err := url.Parse(publicURL)
+	if err != nil || u.Scheme != "https" || u.Hostname() == "" || (u.Path != "" && u.Path != "/") ||
+		u.RawQuery != "" || u.ForceQuery || strings.Contains(publicURL, "#") || u.User != nil {
+		return fmt.Errorf("captcha.turnstile.url (%q) must be an https url of a host, without a path, query or fragment",
+			publicURL)
 	}
 	return nil
 }

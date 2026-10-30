@@ -39,7 +39,7 @@ func stubRender(string) ([]byte, error) { return []byte("gif"), nil }
 // startPosted starts a captcha and waits until the challenge is posted
 func startPosted(t *testing.T, c *captcha, user bot.User) {
 	t.Helper()
-	c.Start(user)
+	c.Start(user, "")
 	c.running.Wait()
 }
 
@@ -236,7 +236,7 @@ func TestCaptcha_StartSkipsAndErrors(t *testing.T) {
 		c.workers <- struct{}{}
 		c.workers <- struct{}{}
 		c.workers <- struct{}{}
-		c.Start(bot.User{ID: 42})
+		c.Start(bot.User{ID: 42}, "")
 		assert.True(t, c.IsPending(42))
 		assert.Empty(t, api.RequestCalls())
 		for range captchaWorkers {
@@ -506,7 +506,7 @@ func TestCaptcha_ResolvedWhilePosting(t *testing.T) {
 	rendering, release := make(chan struct{}), make(chan struct{})
 	c.render = func(string) ([]byte, error) { close(rendering); <-release; return []byte("gif"), nil }
 
-	c.Start(bot.User{ID: 42})
+	c.Start(bot.User{ID: 42}, "")
 	<-rendering
 	assert.Equal(t, []string{captchaText("", txtExpired)}, press(t, c, api, 42, 42, 77, "12"), "not posted yet")
 	c.Cancel(42)
@@ -525,7 +525,7 @@ func TestCaptcha_Stop(t *testing.T) {
 	rendering, release := make(chan struct{}), make(chan struct{})
 	c.render = func(string) ([]byte, error) { close(rendering); <-release; return []byte("gif"), nil }
 	api.SendFunc = func(c tbapi.Chattable) (tbapi.Message, error) { return tbapi.Message{MessageID: 78}, nil }
-	c.Start(bot.User{ID: 43})
+	c.Start(bot.User{ID: 43}, "")
 	<-rendering
 
 	stopped := make(chan struct{})
@@ -849,7 +849,7 @@ func TestCaptcha_Test(t *testing.T) {
 	t.Run("right number passes", func(t *testing.T) {
 		c, api, code := start(t, time.Minute)
 		pressDM(t, c, code)
-		assert.Equal(t, []string{"captcha test passed, a member choosing this would be let in"}, sentTexts(api))
+		assert.Equal(t, []string{"captcha test passed, a member passing it would be let in"}, sentTexts(api))
 		assert.Equal(t, []int{77}, deletedIDs(api))
 		assert.Empty(t, requestsOf[tbapi.RestrictChatMemberConfig](api))
 		assert.Empty(t, requestsOf[tbapi.BanChatMemberConfig](api))
@@ -880,7 +880,7 @@ func TestCaptcha_Test(t *testing.T) {
 
 	t.Run("a test press does not solve a join captcha", func(t *testing.T) {
 		c, api, code := start(t, time.Minute)
-		c.Start(bot.User{ID: 42})
+		c.Start(bot.User{ID: 42}, "")
 		c.running.Wait()
 		pressDM(t, c, code)
 		assert.True(t, c.IsPending(42), "join captcha untouched")

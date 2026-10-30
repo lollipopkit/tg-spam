@@ -42,38 +42,39 @@ func (f SpamLoggerFunc) Save(msg *bot.Message, response *bot.Response) {
 // TelegramListener listens to tg update, forward to bots and send back responses
 // Not thread safe
 type TelegramListener struct {
-	TbAPI                   TbAPI         // telegram bot API
-	SpamLogger              SpamLogger    // logger to save spam to files and db
-	Bot                     Bot           // bot to handle messages
-	BotUsername             string        // telegram bot username (without "@" prefix)
-	Group                   string        // can be int64 or public group username (without "@" prefix)
-	AdminGroup              string        // can be int64 or public group username (without "@" prefix)
-	IdleDuration            time.Duration // idle timeout to send "idle" message to bots
-	SuperUsers              SuperUsers    // list of superusers, can ban and report spam, can't be banned
-	TestingIDs              []int64       // list of chat IDs to test the bot
-	StartupMsg              string        // message to send on startup to the primary chat
-	WarnMsg                 string        // message to send on warning
-	NoSpamReply             bool          // do not reply on spam messages in the primary chat
-	SuppressJoinMessage     bool          // delete join message when kick out user
-	DeleteJoinMessages      bool          // delete join messages immediately
-	DeleteLeaveMessages     bool          // delete leave messages immediately
-	TrainingMode            bool          // do not ban users, just report and train spam detector
-	SoftBanMode             bool          // do not ban users, but restrict their actions
-	Locator                 Locator       // message locator to get info about messages
-	ReportConfig            ReportConfig  // user spam reporting configuration
-	DisableAdminSpamForward bool          // disable forwarding spam reports to admin chat support
-	Dry                     bool          // dry run, do not ban or send messages
-	AggressiveCleanup       bool          // delete all messages from user when banned via /spam command
-	AggressiveCleanupLimit  int           // max messages to delete in aggressive cleanup mode
-	WarnThreshold           int           // auto-ban after N warns within window (0=disabled)
-	WarnWindow              time.Duration // sliding window for counting warns
-	Warnings                Warnings      // storage for admin /warn records
-	AdmitDocuments          bool          // admit text-less documents for detector checks and locator-backed counters
-	AdmitContacts           bool          // admit text-less shared contacts, same as AdmitDocuments
-	AdmitAudio              bool          // admit text-less audio files, same as AdmitDocuments
-	CaptchaEnabled          bool          // verify new members of the primary chat with a motion captcha
-	CaptchaTimeout          time.Duration // time to solve the captcha before the member is removed
-	CaptchaMessage          string        // captcha prompt with {user} and {timeout} placeholders
+	TbAPI                   TbAPI           // telegram bot API
+	SpamLogger              SpamLogger      // logger to save spam to files and db
+	Bot                     Bot             // bot to handle messages
+	BotUsername             string          // telegram bot username (without "@" prefix)
+	Group                   string          // can be int64 or public group username (without "@" prefix)
+	AdminGroup              string          // can be int64 or public group username (without "@" prefix)
+	IdleDuration            time.Duration   // idle timeout to send "idle" message to bots
+	SuperUsers              SuperUsers      // list of superusers, can ban and report spam, can't be banned
+	TestingIDs              []int64         // list of chat IDs to test the bot
+	StartupMsg              string          // message to send on startup to the primary chat
+	WarnMsg                 string          // message to send on warning
+	NoSpamReply             bool            // do not reply on spam messages in the primary chat
+	SuppressJoinMessage     bool            // delete join message when kick out user
+	DeleteJoinMessages      bool            // delete join messages immediately
+	DeleteLeaveMessages     bool            // delete leave messages immediately
+	TrainingMode            bool            // do not ban users, just report and train spam detector
+	SoftBanMode             bool            // do not ban users, but restrict their actions
+	Locator                 Locator         // message locator to get info about messages
+	ReportConfig            ReportConfig    // user spam reporting configuration
+	DisableAdminSpamForward bool            // disable forwarding spam reports to admin chat support
+	Dry                     bool            // dry run, do not ban or send messages
+	AggressiveCleanup       bool            // delete all messages from user when banned via /spam command
+	AggressiveCleanupLimit  int             // max messages to delete in aggressive cleanup mode
+	WarnThreshold           int             // auto-ban after N warns within window (0=disabled)
+	WarnWindow              time.Duration   // sliding window for counting warns
+	Warnings                Warnings        // storage for admin /warn records
+	AdmitDocuments          bool            // admit text-less documents for detector checks and locator-backed counters
+	AdmitContacts           bool            // admit text-less shared contacts, same as AdmitDocuments
+	AdmitAudio              bool            // admit text-less audio files, same as AdmitDocuments
+	CaptchaEnabled          bool            // verify new members of the primary chat with a captcha
+	CaptchaTimeout          time.Duration   // time to solve the captcha before the member is removed
+	CaptchaMessage          string          // captcha prompt with {user} and {timeout} placeholders, empty for the default
+	CaptchaTurnstile        TurnstileConfig // Turnstile instead of the motion animation, when its site key is set
 
 	adminHandler    *admin
 	reportsHandler  *userReports
@@ -180,6 +181,8 @@ func (l *TelegramListener) Do(ctx context.Context) error {
 			l.AggressiveCleanupLimit)
 	}
 
+	// the turnstile page server reports here when it stops on an error; nil, blocking, in the other modes
+	var turnstileErr chan error
 	if l.CaptchaEnabled {
 		switch {
 		case l.TrainingMode || l.Dry:
@@ -187,6 +190,21 @@ func (l *TelegramListener) Do(ctx context.Context) error {
 		default:
 			l.captcha = newCaptcha(l.TbAPI, l.chatID, l.CaptchaTimeout, l.CaptchaMessage)
 			defer l.captcha.Stop()
+			if l.CaptchaTurnstile.SiteKey != "" {
+				if err := l.captcha.WithTurnstile(l.CaptchaTurnstile); err != nil {
+					return fmt.Errorf("turnstile captcha: %w", err)
+				}
+				ln, err := l.captcha.ListenTurnstile()
+				if err != nil {
+					return fmt.Errorf("turnstile captcha: %w", err)
+				}
+				turnstileErr = make(chan error, 1)
+				go func() {
+					if err := l.captcha.ServeTurnstile(ctx, ln); err != nil {
+						turnstileErr <- err
+					}
+				}()
+			}
 			log.Printf("[INFO] captcha enabled, timeout %v", l.CaptchaTimeout)
 		}
 	}
@@ -206,6 +224,11 @@ func (l *TelegramListener) Do(ctx context.Context) error {
 		select {
 		case <-ctx.Done():
 			return fmt.Errorf("listener context canceled: %w", ctx.Err())
+
+		// without the page every member would get a dead button and be banned on timeout, stopping lets the
+		// supervisor restart the bot
+		case err := <-turnstileErr:
+			return fmt.Errorf("turnstile captcha page stopped: %w", err)
 
 		case update, ok := <-updates:
 			if !ok {
@@ -677,7 +700,7 @@ func (l *TelegramListener) procJoin(ctx context.Context, msg *tbapi.Message) err
 }
 
 // procCaptchaTest posts a test captcha to a superuser who sends /captcha to the bot in a private chat, so the
-// challenge can be checked in real clients. limited to superusers: every test renders and uploads an animation.
+// challenge can be checked in real clients. superusers only, every test costs an upload, and a render in the animation mode.
 // edits are ignored, editing a message into the command must not start a test. reports whether it handled msg
 func (l *TelegramListener) procCaptchaTest(msg *tbapi.Message) bool {
 	if msg.Chat.Type != "private" || msg.From == nil || msg.EditDate != 0 {
@@ -725,7 +748,7 @@ func (l *TelegramListener) startCaptcha(msg *tbapi.Message, member tbapi.User, u
 	if msg.From != nil && msg.From.ID != member.ID && l.SuperUsers.IsSuper(msg.From.UserName, msg.From.ID) {
 		return
 	}
-	l.captcha.Start(user)
+	l.captcha.Start(user, member.LanguageCode)
 }
 
 // joinBanCause names the plugins that flagged a member on join, sorted for a stable notification text

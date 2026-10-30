@@ -192,9 +192,16 @@ type options struct {
 	} `group:"warn" namespace:"warn" env-namespace:"WARN"`
 
 	Captcha struct {
-		Enabled bool          `long:"enabled" env:"ENABLED" description:"verify new members with a motion captcha"`
+		Enabled bool          `long:"enabled" env:"ENABLED" description:"verify new members with a captcha"`
 		Timeout time.Duration `long:"timeout" env:"TIMEOUT" default:"2m" description:"time to solve the captcha before the member is removed"`
-		Message string        `long:"message" env:"MESSAGE" default:"{user}, choose the number moving in the animation within {timeout}, otherwise you will be removed from the chat. Tap the animation if it does not play." description:"captcha prompt, {user} and {timeout} are replaced"`
+		Message string        `long:"message" env:"MESSAGE" description:"captcha prompt, {user} and {timeout} are replaced, empty for the default of the mode"`
+
+		Turnstile struct {
+			SiteKey string `long:"site-key" env:"SITE_KEY" description:"Cloudflare Turnstile site key, switches the captcha to Turnstile"`
+			Secret  string `long:"secret" env:"SECRET" description:"Cloudflare Turnstile secret"`
+			URL     string `long:"url" env:"URL" description:"public https url the Turnstile page is reachable at"`
+			Listen  string `long:"listen" env:"LISTEN" default:":8081" description:"listen address of the Turnstile page"`
+		} `group:"turnstile" namespace:"turnstile" env-namespace:"TURNSTILE"`
 	} `group:"captcha" namespace:"captcha" env-namespace:"CAPTCHA"`
 
 	Files struct {
@@ -554,7 +561,10 @@ func execute(ctx context.Context, settings *config.Settings, reloadNormalize fun
 		AdmitAudio:              settings.Meta.AudiosOnly,
 		CaptchaEnabled:          settings.Captcha.Enabled,
 		CaptchaTimeout:          settings.Captcha.Timeout,
-		CaptchaMessage:          settings.Captcha.Message,
+		CaptchaMessage:          captchaMessage(settings.Captcha.Message),
+		CaptchaTurnstile: events.TurnstileConfig{SiteKey: settings.Captcha.Turnstile.SiteKey,
+			Secret: settings.Captcha.Turnstile.Secret, PublicURL: settings.Captcha.Turnstile.URL,
+			Listen: settings.Captcha.Turnstile.Listen, BotToken: settings.Telegram.Token},
 	}
 
 	if settings.Delete.JoinMessages {
@@ -743,6 +753,20 @@ func activateServer(ctx context.Context, settings *config.Settings, sf *bot.Spam
 	return nil
 }
 
+// legacyCaptchaMessage was the --captcha.message flag default before an empty message selected the default of
+// the captcha mode; a --confdb row saved then still holds it, and it would ask turnstile members for a number.
+// TODO: remove once stored settings have been re-saved
+const legacyCaptchaMessage = "{user}, choose the number moving in the animation within {timeout}, " +
+	"otherwise you will be removed from the chat. Tap the animation if it does not play."
+
+// captchaMessage maps the stored legacy default to empty, the default of the mode
+func captchaMessage(msg string) string {
+	if msg == legacyCaptchaMessage {
+		return ""
+	}
+	return msg
+}
+
 // collectMaskedSecrets gathers every value setupLog must redact from log output. A credential
 // missing from this list is printed in clear by the %+v settings dump below it.
 func collectMaskedSecrets(appSettings *config.Settings) []string {
@@ -761,6 +785,7 @@ func collectMaskedSecrets(appSettings *config.Settings) []string {
 	add(appSettings.Gemini.Token)
 	add(appSettings.Jev.Token)
 	add(appSettings.CAS.Token)
+	add(appSettings.Captcha.Turnstile.Secret)
 	// the auto-generated password is printed for the operator, so it is not masked
 	if appSettings.Transient.WebAuthPasswd != "auto" {
 		add(appSettings.Transient.WebAuthPasswd)

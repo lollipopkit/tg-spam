@@ -148,6 +148,11 @@ func optToSettings(opts options) *config.Settings {
 			Enabled: opts.Captcha.Enabled,
 			Timeout: opts.Captcha.Timeout,
 			Message: opts.Captcha.Message,
+			Turnstile: config.TurnstileSettings{
+				SiteKey: opts.Captcha.Turnstile.SiteKey,
+				URL:     opts.Captcha.Turnstile.URL,
+				Listen:  opts.Captcha.Turnstile.Listen,
+			},
 		},
 
 		LuaPlugins: config.LuaPluginsSettings{
@@ -222,6 +227,7 @@ func optToSettings(opts options) *config.Settings {
 	settings.Gemini.Token = opts.Gemini.Token
 	settings.Jev.Token = opts.Jev.Token
 	settings.CAS.Token = opts.CAS.Token
+	settings.Captcha.Turnstile.Secret = opts.Captcha.Turnstile.Secret
 	settings.Server.AuthHash = opts.Server.AuthHash
 
 	return settings
@@ -374,6 +380,7 @@ func applyCLIOverrides(settings *config.Settings, opts options, defaults *config
 		{config.FieldGeminiToken, opts.Gemini.Token, &settings.Gemini.Token},
 		{config.FieldJevToken, opts.Jev.Token, &settings.Jev.Token},
 		{config.FieldCASToken, opts.CAS.Token, &settings.CAS.Token},
+		{config.FieldTurnstileSecret, opts.Captcha.Turnstile.Secret, &settings.Captcha.Turnstile.Secret},
 	}
 	for _, c := range cliCredentials {
 		if c.value == "" {

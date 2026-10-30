@@ -491,8 +491,8 @@ Notes:
 When a member joins:
 
 1. The Lua join checks run first; a member they flag is banned as before and gets no captcha. A member who is already restricted (soft-banned, or muted by an admin) gets no captcha either and keeps the restriction
-2. The member is muted and the bot posts the animation with `--captcha.message` as its caption and six candidate numbers as buttons: the answer and five random ones, unrelated to it, so the buttons alone give nothing away. `{user}` becomes a mention of the member, `{timeout}` the time limit
-3. Choosing the right number lifts the mute, so the group's default permissions apply, and deletes the captcha. The first press decides, so a guess has a 1 in 6 chance; the cooldown below keeps repeated guessing slow. Presses by anyone else are ignored. The bot's own short replies (verified, wrong answer, and the test results below) follow the member's Telegram language: Chinese, Russian, or English for any other; the caption is `--captcha.message`
+2. The member is muted and the bot posts the animation with `--captcha.message` (empty for a built-in English prompt) as its caption and six candidate numbers as buttons: the answer and five random ones, unrelated to it, so the buttons alone give nothing away. `{user}` becomes a mention of the member, `{timeout}` the time limit
+3. Choosing the right number lifts the mute, so the group's default permissions apply, and deletes the captcha. The first press decides, so a guess has a 1 in 6 chance; the cooldown below keeps repeated guessing slow. Presses by anyone else are ignored (in Turnstile mode the page checks the Telegram login instead). The bot's own short replies (verified, wrong answer, and the test results below) follow the member's Telegram language: Chinese, Russian, or English for any other; the caption is `--captcha.message`
 4. A wrong number, or no answer within `--captcha.timeout` (default `2m`, allowed `10s` to `24h`), deletes the captcha and bans the member for a cooldown: 5 minutes after the first failure, doubling with each further one up to 24 hours. Telegram lifts the ban when it ends, so a person who failed can join again later, while guessing by rejoining stays slow. Failures older than 24 hours are forgotten, and solving a captcha clears them
 
 Messages that reach the group from a member with an unsolved captcha are deleted. A member who leaves before answering has their captcha removed, and this counts as a failure without a ban, so leaving and rejoining for a fresh challenge runs into the cooldown. Superusers, group administrators, approved users, bots and members added by a superuser skip the captcha. The verification runs in the background, so a burst of joins does not hold up the bot; the timeout starts once the member can see the challenge.
@@ -500,8 +500,17 @@ Messages that reach the group from a member with an unsolved captcha are deleted
 Notes:
 
 - The bot needs the "ban users" and "delete messages" admin rights.
-- To check how the animation looks in your members' clients, send `/captcha` to the bot in a private chat. A superuser (group admins included) gets the same challenge there; nothing happens whatever is chosen, and the bot replies with the result, or the number once the timeout passes. The command is ignored for other users, since every challenge renders and uploads an animation.
-- The caption is sent as HTML with the template text escaped, so it can't carry formatting. It must not be empty and must fit Telegram's 1024-character caption limit with `{user}` counted as the longest possible name. Example in another language: `--captcha.message="{user}，请在 {timeout} 内选择动图中移动的数字，否则会被移出群组。"`
+
+#### Turnstile mode
+
+Setting `--captcha.turnstile.site-key` replaces the animation with [Cloudflare Turnstile](https://developers.cloudflare.com/turnstile/). The joining member gets a Telegram login button that opens a page at `--captcha.turnstile.url`/v/&lt;token&gt;. Telegram adds the presser's identity to the link, signed with the bot token, so a tap by anyone else gets "this verification is for another user". This binds the page to the member's account, not to whoever solves it: a link opened from the member's account and passed on still works, as with any captcha a human can solve for someone. The widget carries the page's token, so a Turnstile pass on one page can't be used on another. The page shows the Turnstile widget, and when it passes, tg-spam checks the token with Cloudflare (siteverify, including that it was issued for the page's host) and lifts the mute. Most people pass without doing anything; Turnstile judges the browser and how it is used, which stops scripted accounts better than any picture. Everything else is the same as above: the mute, the timeout, the cooldown bans, `/captcha` tests in a private chat. If Telegram refuses the login button (the bot's domain is not set), the bot logs an error and posts the animation instead, so members are still verified.
+
+- Set the bot's domain to the page's host with @BotFather `/setdomain`, otherwise Telegram refuses to open the login button.
+- Create a Turnstile widget for the page's hostname in the Cloudflare dashboard and pass its site key and secret (`--captcha.turnstile.secret` / `$CAPTCHA_TURNSTILE_SECRET`, stored encrypted with `--confdb` like the other tokens).
+- The page server listens on `--captcha.turnstile.listen` (default `:8081`) and must be reachable at the https url, through a Cloudflare Tunnel or a reverse proxy. It serves nothing but the pages of pending challenges, each found only by its random single-use token, and is separate from the web UI, which stays private. `--captcha.turnstile.url` is the bare host (`https://verify.example.com`), no path.
+- The page and the button follow the member's Telegram language (Chinese, Russian, English otherwise); the default prompt asks to press the button. Cloudflare sees the visitor's IP and browser, and a member whose network can't reach Cloudflare can't pass.
+- To check how the challenge looks in your members' clients, send `/captcha` to the bot in a private chat. A superuser (group admins included) gets the same challenge there; nothing happens whatever the outcome, and the bot replies with the result, the number in the animation mode, once the challenge is answered or the timeout passes. The command is ignored for other users, since every challenge costs an upload, and in the animation mode a render.
+- The caption is sent as HTML with the template text escaped, so it can't carry formatting. It must fit Telegram's 1024-character caption limit with `{user}` counted as the longest possible name. Example in another language: `--captcha.message="{user}，请在 {timeout} 内选择动图中移动的数字，否则会被移出群组。"`
 - The captcha is driven by join service messages, so it does not run for a member whose join produces no such message. `--delete.join-messages` is fine: the bot receives the message before deleting it.
 - A program written for this particular captcha can recover the digits by comparing consecutive frames. The captcha targets generic automation and general-purpose models; the message spam checks still apply once a member is in.
 - Telegram converts the GIF to an MP4 animation. The noise uses large blocks and bold digits moving at 12.5 frames per second so the motion survives that, but check it in your group's clients before relying on it; the default caption tells members to tap the animation if their client does not autoplay.
@@ -835,9 +844,15 @@ warn:
       --warn.window=                    sliding window for counting warns (default: 720h) [$WARN_WINDOW]
 
 captcha:
-      --captcha.enabled                 verify new members with a motion captcha [$CAPTCHA_ENABLED]
+      --captcha.enabled                 verify new members with a captcha [$CAPTCHA_ENABLED]
       --captcha.timeout=                time to solve the captcha before the member is removed (default: 2m) [$CAPTCHA_TIMEOUT]
-      --captcha.message=                captcha prompt, {user} and {timeout} are replaced (default: {user}, choose the number moving in the animation within {timeout}, otherwise you will be removed from the chat. Tap the animation if it does not play.) [$CAPTCHA_MESSAGE]
+      --captcha.message=                captcha prompt, {user} and {timeout} are replaced, empty for the default of the mode [$CAPTCHA_MESSAGE]
+
+turnstile:
+      --captcha.turnstile.site-key=     Cloudflare Turnstile site key, switches the captcha to Turnstile [$CAPTCHA_TURNSTILE_SITE_KEY]
+      --captcha.turnstile.secret=       Cloudflare Turnstile secret [$CAPTCHA_TURNSTILE_SECRET]
+      --captcha.turnstile.url=          public https url the Turnstile page is reachable at [$CAPTCHA_TURNSTILE_URL]
+      --captcha.turnstile.listen=       listen address of the Turnstile page (default: :8081) [$CAPTCHA_TURNSTILE_LISTEN]
 
 files:
       --files.samples=                  samples data path, defaults to dynamic data path [$FILES_SAMPLES]

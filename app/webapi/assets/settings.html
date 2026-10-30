@@ -807,7 +807,22 @@
                 <div class="col-12 mb-3">
                     <label for="captchaMessage" class="form-label">Captcha Message</label>
                     <input type="text" class="form-control" id="captchaMessage" name="captchaMessage" value="{{.Captcha.Message}}">
-                    <div class="form-text">Prompt text; {user} and {timeout} are replaced</div>
+                    <div class="form-text">Prompt text; {user} and {timeout} are replaced, empty for the default of the mode</div>
+                </div>
+                <div class="col-md-4 mb-3">
+                    <label for="captchaTurnstileSiteKey" class="form-label">Turnstile Site Key</label>
+                    <input type="text" class="form-control" id="captchaTurnstileSiteKey" name="captchaTurnstileSiteKey" value="{{.Captcha.Turnstile.SiteKey}}">
+                    <div class="form-text">Set to use Cloudflare Turnstile instead of the animation; the secret is set by flag or env</div>
+                </div>
+                <div class="col-md-4 mb-3">
+                    <label for="captchaTurnstileURL" class="form-label">Turnstile Page URL</label>
+                    <input type="text" class="form-control" id="captchaTurnstileURL" name="captchaTurnstileURL" value="{{.Captcha.Turnstile.URL}}">
+                    <div class="form-text">Public https url of the page, e.g. https://verify.example.com</div>
+                </div>
+                <div class="col-md-4 mb-3">
+                    <label for="captchaTurnstileListen" class="form-label">Turnstile Listen</label>
+                    <input type="text" class="form-control" id="captchaTurnstileListen" name="captchaTurnstileListen" value="{{.Captcha.Turnstile.Listen}}">
+                    <div class="form-text">Address of the page server, e.g. :8081</div>
                 </div>
             </div>
             {{else}}
@@ -827,7 +842,8 @@
                         <tr><th>Warn Window</th><td>{{.Warn.Window}}</td></tr>
                         <tr><th>Captcha Enabled</th><td>{{.Captcha.Enabled}}</td></tr>
                         <tr><th>Captcha Timeout</th><td>{{.Captcha.Timeout}}</td></tr>
-                        <tr><th>Captcha Message</th><td>{{.Captcha.Message}}</td></tr>
+                        <tr><th>Captcha Message</th><td>{{if .Captcha.Message}}{{.Captcha.Message}}{{else}}default{{end}}</td></tr>
+                        <tr><th>Captcha Turnstile</th><td>{{if .Captcha.Turnstile.SiteKey}}{{.Captcha.Turnstile.URL}} (listen {{.Captcha.Turnstile.Listen}}){{if not .Captcha.Turnstile.Secret}}, no secret{{end}}{{else}}off, motion animation{{end}}</td></tr>
                     </tbody>
                 </table>
             </div>
