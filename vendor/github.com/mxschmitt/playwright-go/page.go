@@ -23,6 +23,7 @@ type pageImpl struct {
 	touchscreen     *touchscreenImpl
 	timeoutSettings *timeoutSettings
 	browserContext  *browserContextImpl
+	framesMu        sync.RWMutex
 	frames          []Frame
 	workers         []Worker
 	mainFrame       Frame
@@ -209,7 +210,7 @@ func (p *pageImpl) Frame(options ...PageFrameOptions) Frame {
 		matcher = newURLMatcher(option.URL, p.browserContext.options.BaseURL)
 	}
 
-	for _, f := range p.frames {
+	for _, f := range p.Frames() {
 		// When a name is specified, match strictly by name and never consult the
 		// URL, matching upstream.
 		if option.Name != nil {
@@ -227,7 +228,9 @@ func (p *pageImpl) Frame(options ...PageFrameOptions) Frame {
 }
 
 func (p *pageImpl) Frames() []Frame {
-	return p.frames
+	p.framesMu.RLock()
+	defer p.framesMu.RUnlock()
+	return slices.Clone(p.frames)
 }
 
 func (p *pageImpl) SetDefaultNavigationTimeout(timeout float64) {
@@ -376,24 +379,12 @@ func (p *pageImpl) Goto(url string, options ...PageGotoOptions) (Response, error
 	return p.mainFrame.Goto(url)
 }
 
-// navigationTimeoutOverride returns the channel overrides that resolve the
-// configured navigation timeout when the caller supplied no per-call timeout.
-// The protocol requires a timeout on the navigation methods, so without this the
-// serializer would inject a hardcoded 30s instead of honoring SetDefaultNavigationTimeout.
-func (p *pageImpl) navigationTimeoutOverride(timeout *float64) map[string]any {
-	overrides := map[string]any{}
-	if timeout == nil {
-		overrides["timeout"] = p.timeoutSettings.NavigationTimeout()
-	}
-	return overrides
-}
-
 func (p *pageImpl) Reload(options ...PageReloadOptions) (Response, error) {
 	var timeout *float64
 	if len(options) == 1 {
 		timeout = options[0].Timeout
 	}
-	channel, err := p.channel.Send("reload", options, p.navigationTimeoutOverride(timeout))
+	channel, err := p.channel.SendWithTimeout("reload", resolveNavigationTimeout(p.timeoutSettings, timeout), options)
 	if err != nil {
 		return nil, err
 	}
@@ -416,7 +407,7 @@ func (p *pageImpl) GoBack(options ...PageGoBackOptions) (Response, error) {
 	if len(options) == 1 {
 		timeout = options[0].Timeout
 	}
-	channel, err := p.channel.Send("goBack", options, p.navigationTimeoutOverride(timeout))
+	channel, err := p.channel.SendWithTimeout("goBack", resolveNavigationTimeout(p.timeoutSettings, timeout), options)
 	if err != nil {
 		return nil, err
 	}
@@ -433,7 +424,7 @@ func (p *pageImpl) GoForward(options ...PageGoForwardOptions) (Response, error) 
 	if len(options) == 1 {
 		timeout = options[0].Timeout
 	}
-	channel, err := p.channel.Send("goForward", options, p.navigationTimeoutOverride(timeout))
+	channel, err := p.channel.SendWithTimeout("goForward", resolveNavigationTimeout(p.timeoutSettings, timeout), options)
 	if err != nil {
 		return nil, err
 	}
@@ -539,7 +530,11 @@ func (p *pageImpl) Screenshot(options ...PageScreenshotOptions) ([]byte, error) 
 			overrides["mask"] = masks
 		}
 	}
-	data, err := p.channel.Send("screenshot", options, overrides)
+	var screenshotTimeout *float64
+	if len(options) == 1 {
+		screenshotTimeout = options[0].Timeout
+	}
+	data, err := p.channel.SendWithTimeout("screenshot", resolveTimeout(p.timeoutSettings, screenshotTimeout), options, overrides)
 	if err != nil {
 		return nil, err
 	}
@@ -613,7 +608,7 @@ func (p *pageImpl) waiterForEvent(event string, options ...PageWaitForEventOptio
 	return waiter.WaitForEvent(p, event, predicate)
 }
 
-func (p *pageImpl) waiterForRequest(url any, options ...PageExpectRequestOptions) *waiter {
+func (p *pageImpl) waiterForRequest(urlOrPredicate any, options ...PageExpectRequestOptions) *waiter {
 	option := PageExpectRequestOptions{}
 	if len(options) == 1 {
 		option = options[0]
@@ -622,10 +617,18 @@ func (p *pageImpl) waiterForRequest(url any, options ...PageExpectRequestOptions
 		option.Timeout = Float(p.timeoutSettings.Timeout())
 	}
 	var matcher *urlMatcher
-	if url != nil {
-		matcher = newURLMatcher(url, p.browserContext.options.BaseURL)
+	var matchRequest func(Request) bool
+	switch v := urlOrPredicate.(type) {
+	case nil:
+	case func(Request) bool:
+		matchRequest = v
+	default:
+		matcher = newURLMatcher(urlOrPredicate, p.browserContext.options.BaseURL)
 	}
 	predicate := func(req *requestImpl) bool {
+		if matchRequest != nil {
+			return matchRequest(req)
+		}
 		if matcher != nil {
 			return matcher.Matches(req.URL())
 		}
@@ -639,7 +642,7 @@ func (p *pageImpl) waiterForRequest(url any, options ...PageExpectRequestOptions
 	return waiter.WaitForEvent(p, "request", predicate)
 }
 
-func (p *pageImpl) waiterForResponse(url any, options ...PageExpectResponseOptions) *waiter {
+func (p *pageImpl) waiterForResponse(urlOrPredicate any, options ...PageExpectResponseOptions) *waiter {
 	option := PageExpectResponseOptions{}
 	if len(options) == 1 {
 		option = options[0]
@@ -648,12 +651,20 @@ func (p *pageImpl) waiterForResponse(url any, options ...PageExpectResponseOptio
 		option.Timeout = Float(p.timeoutSettings.Timeout())
 	}
 	var matcher *urlMatcher
-	if url != nil {
-		matcher = newURLMatcher(url, p.browserContext.options.BaseURL)
+	var matchResponse func(Response) bool
+	switch v := urlOrPredicate.(type) {
+	case nil:
+	case func(Response) bool:
+		matchResponse = v
+	default:
+		matcher = newURLMatcher(urlOrPredicate, p.browserContext.options.BaseURL)
 	}
-	predicate := func(req *responseImpl) bool {
+	predicate := func(res *responseImpl) bool {
+		if matchResponse != nil {
+			return matchResponse(res)
+		}
 		if matcher != nil {
-			return matcher.Matches(req.URL())
+			return matcher.Matches(res.URL())
 		}
 		return true
 	}
@@ -731,16 +742,16 @@ func (p *pageImpl) ExpectPopup(cb func() error, options ...PageExpectPopupOption
 	return ret.(*pageImpl), err
 }
 
-func (p *pageImpl) ExpectResponse(url any, cb func() error, options ...PageExpectResponseOptions) (Response, error) {
-	ret, err := p.waiterForResponse(url, options...).RunAndWait(cb)
+func (p *pageImpl) ExpectResponse(urlOrPredicate any, cb func() error, options ...PageExpectResponseOptions) (Response, error) {
+	ret, err := p.waiterForResponse(urlOrPredicate, options...).RunAndWait(cb)
 	if ret == nil {
 		return nil, err
 	}
 	return ret.(*responseImpl), err
 }
 
-func (p *pageImpl) ExpectRequest(url any, cb func() error, options ...PageExpectRequestOptions) (Request, error) {
-	ret, err := p.waiterForRequest(url, options...).RunAndWait(cb)
+func (p *pageImpl) ExpectRequest(urlOrPredicate any, cb func() error, options ...PageExpectRequestOptions) (Request, error) {
+	ret, err := p.waiterForRequest(urlOrPredicate, options...).RunAndWait(cb)
 	if ret == nil {
 		return nil, err
 	}
@@ -1044,13 +1055,16 @@ func (p *pageImpl) onBinding(binding *bindingCallImpl) {
 
 func (p *pageImpl) onFrameAttached(frame *frameImpl) {
 	frame.page = p
+	p.framesMu.Lock()
 	p.frames = append(p.frames, frame)
+	p.framesMu.Unlock()
 	p.Emit("frameattached", frame)
 	p.browserContext.Emit("frameattached", frame)
 }
 
 func (p *pageImpl) onFrameDetached(frame *frameImpl) {
 	frame.detached = true
+	p.framesMu.Lock()
 	frames := make([]Frame, 0)
 	for i := 0; i < len(p.frames); i++ {
 		if p.frames[i] != frame {
@@ -1060,6 +1074,7 @@ func (p *pageImpl) onFrameDetached(frame *frameImpl) {
 	if len(frames) != len(p.frames) {
 		p.frames = frames
 	}
+	p.framesMu.Unlock()
 	// Remove the frame from its parent's childFrames so ChildFrames() doesn't
 	// keep returning a detached ghost frame (matches upstream).
 	if frame.parentFrame != nil {
@@ -1371,7 +1386,11 @@ func (p *pageImpl) GetByAltText(text any, options ...PageGetByAltTextOptions) Lo
 			exact = true
 		}
 	}
-	return p.Locator(getByAltTextSelector(text, exact))
+	selector, err := getByAltTextSelector(text, exact)
+	if err != nil {
+		return newErrorLocator(p.mainFrame.(*frameImpl), err)
+	}
+	return p.Locator(selector)
 }
 
 func (p *pageImpl) GetByLabel(text any, options ...PageGetByLabelOptions) Locator {
@@ -1381,7 +1400,11 @@ func (p *pageImpl) GetByLabel(text any, options ...PageGetByLabelOptions) Locato
 			exact = true
 		}
 	}
-	return p.Locator(getByLabelSelector(text, exact))
+	selector, err := getByLabelSelector(text, exact)
+	if err != nil {
+		return newErrorLocator(p.mainFrame.(*frameImpl), err)
+	}
+	return p.Locator(selector)
 }
 
 func (p *pageImpl) GetByPlaceholder(text any, options ...PageGetByPlaceholderOptions) Locator {
@@ -1391,18 +1414,34 @@ func (p *pageImpl) GetByPlaceholder(text any, options ...PageGetByPlaceholderOpt
 			exact = true
 		}
 	}
-	return p.Locator(getByPlaceholderSelector(text, exact))
+	selector, err := getByPlaceholderSelector(text, exact)
+	if err != nil {
+		return newErrorLocator(p.mainFrame.(*frameImpl), err)
+	}
+	return p.Locator(selector)
 }
 
 func (p *pageImpl) GetByRole(role AriaRole, options ...PageGetByRoleOptions) Locator {
 	if len(options) == 1 {
-		return p.Locator(getByRoleSelector(role, LocatorGetByRoleOptions(options[0])))
+		selector, err := getByRoleSelector(role, LocatorGetByRoleOptions(options[0]))
+		if err != nil {
+			return newErrorLocator(p.mainFrame.(*frameImpl), err)
+		}
+		return p.Locator(selector)
 	}
-	return p.Locator(getByRoleSelector(role))
+	selector, err := getByRoleSelector(role)
+	if err != nil {
+		return newErrorLocator(p.mainFrame.(*frameImpl), err)
+	}
+	return p.Locator(selector)
 }
 
 func (p *pageImpl) GetByTestId(testId any) Locator {
-	return p.Locator(getByTestIdSelector(getTestIdAttributeName(), testId))
+	selector, err := getByTestIdSelector(getTestIdAttributeName(), testId)
+	if err != nil {
+		return newErrorLocator(p.mainFrame.(*frameImpl), err)
+	}
+	return p.Locator(selector)
 }
 
 func (p *pageImpl) GetByText(text any, options ...PageGetByTextOptions) Locator {
@@ -1412,7 +1451,11 @@ func (p *pageImpl) GetByText(text any, options ...PageGetByTextOptions) Locator 
 			exact = true
 		}
 	}
-	return p.Locator(getByTextSelector(text, exact))
+	selector, err := getByTextSelector(text, exact)
+	if err != nil {
+		return newErrorLocator(p.mainFrame.(*frameImpl), err)
+	}
+	return p.Locator(selector)
 }
 
 func (p *pageImpl) GetByTitle(text any, options ...PageGetByTitleOptions) Locator {
@@ -1422,7 +1465,11 @@ func (p *pageImpl) GetByTitle(text any, options ...PageGetByTitleOptions) Locato
 			exact = true
 		}
 	}
-	return p.Locator(getByTitleSelector(text, exact))
+	selector, err := getByTitleSelector(text, exact)
+	if err != nil {
+		return newErrorLocator(p.mainFrame.(*frameImpl), err)
+	}
+	return p.Locator(selector)
 }
 
 func (p *pageImpl) FrameLocator(selector string) FrameLocator {
@@ -1542,7 +1589,11 @@ func (p *pageImpl) updateWebSocketInterceptionPatterns() error {
 }
 
 func (p *pageImpl) AriaSnapshot(options ...PageAriaSnapshotOptions) (string, error) {
-	result, err := p.mainFrame.(*frameImpl).channel.Send("ariaSnapshot", options)
+	var ariaTimeout *float64
+	if len(options) == 1 {
+		ariaTimeout = options[0].Timeout
+	}
+	result, err := p.mainFrame.(*frameImpl).channel.SendWithTimeout("ariaSnapshot", resolveTimeout(p.timeoutSettings, ariaTimeout), options)
 	if err != nil {
 		return "", err
 	}
