@@ -6,6 +6,7 @@ import (
 	"html"
 	"log"
 	"math/rand/v2"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -16,13 +17,13 @@ import (
 	"github.com/umputun/tg-spam/app/bot"
 )
 
-// captchaPrefix marks callback data of captcha buttons, "C<userID>:<key>" with key a digit or captchaBackspace
+// captchaPrefix marks callback data of captcha buttons, "C<userID>:<choice>" with choice a candidate number
 const captchaPrefix = "C"
 
 const (
-	captchaCodeLen   = 3
-	captchaBackspace = "b"
-	captchaWorkers   = 4 // concurrent verifications, each makes a few API calls, renders and uploads
+	captchaCodeLen = 2
+	captchaChoices = 6 // candidate numbers offered, the code among them: a guess passes 1 in 6
+	captchaWorkers = 4 // concurrent verifications, each makes a few API calls, renders and uploads
 
 	// a failed captcha bans for captchaCooldown, doubled on every further failure up to captchaMaxCooldown.
 	// failures older than captchaMaxCooldown are forgotten
@@ -36,8 +37,8 @@ const (
 const captchaGrace = time.Minute
 
 // captcha verifies new members of the primary chat. a member is muted on join and gets an animation that
-// shows a number only in motion (see renderMotionCaptcha) with a shuffled keypad under it. entering the
-// number lifts the mute. a wrong number, the timeout or leaving with the captcha unsolved is a failure:
+// shows a number only in motion (see renderMotionCaptcha) with candidate numbers under it. choosing the
+// right one lifts the mute. a wrong number, the timeout or leaving with the captcha unsolved is a failure:
 // the member is banned for a cooldown that doubles with each failure, so guessing by rejoining stays slow.
 // safe for concurrent use: callbacks come from the update loop, timeouts from timer goroutines and the
 // verification itself from worker goroutines.
@@ -59,12 +60,13 @@ type captcha struct {
 }
 
 type pendingCaptcha struct {
-	user    bot.User
-	chatID  int64  // chat the challenge is posted in
-	msgID   int    // captcha message, 0 until posted
-	code    string // the number to enter, set when posted
-	entered string // digits pressed so far
-	timer   *time.Timer
+	user   bot.User
+	chatID int64  // chat the challenge is posted in
+	msgID  int    // captcha message, 0 until posted
+	code   string // the number to enter, set when posted
+	chosen string // candidate the member pressed
+	lang   string // member's telegram language, set for tests whose results are told later
+	timer  *time.Timer
 }
 
 type captchaFailure struct {
@@ -150,16 +152,17 @@ func (c *captcha) verify(p *pendingCaptcha) {
 	log.Printf("[INFO] captcha sent to %s, timeout %v", user, c.timeout)
 }
 
-// HandleCallback processes a keypad press. only the member the captcha was sent to can solve it. the
-// number is checked once all its digits are entered, so a wrong digit gives nothing away
+// HandleCallback processes a press on a candidate number. only the member the captcha was sent to can solve
+// it, and the first press decides
 func (c *captcha) HandleCallback(query *tbapi.CallbackQuery) error {
-	userID, key, err := parseCaptchaData(query.Data)
+	lang := callbackLang(query)
+	userID, choice, err := parseCaptchaData(query.Data)
 	if err != nil {
-		answerCallback(c.tbAPI, query.ID, captchaExpired)
+		answerCallback(c.tbAPI, query.ID, captchaText(lang, txtExpired))
 		return err
 	}
 	if query.From == nil || query.From.ID != userID {
-		answerCallback(c.tbAPI, query.ID, "this verification is for another user")
+		answerCallback(c.tbAPI, query.ID, captchaText(lang, txtOtherUser))
 		return nil
 	}
 	// a press in the primary chat solves a join captcha, one in the member's private chat a test
@@ -173,7 +176,7 @@ func (c *captcha) HandleCallback(query *tbapi.CallbackQuery) error {
 		pending, test = c.tests, true
 	}
 	if pending == nil {
-		answerCallback(c.tbAPI, query.ID, captchaExpired)
+		answerCallback(c.tbAPI, query.ID, captchaText(lang, txtExpired))
 		return nil
 	}
 
@@ -181,22 +184,10 @@ func (c *captcha) HandleCallback(query *tbapi.CallbackQuery) error {
 	p, ok := pending[userID]
 	if !ok || p.msgID != query.Message.MessageID {
 		c.mu.Unlock()
-		answerCallback(c.tbAPI, query.ID, captchaExpired)
+		answerCallback(c.tbAPI, query.ID, captchaText(lang, txtExpired))
 		return nil
 	}
-	if key == captchaBackspace {
-		if p.entered != "" {
-			p.entered = p.entered[:len(p.entered)-1]
-		}
-	} else {
-		p.entered += key
-	}
-	if len(p.entered) < len(p.code) {
-		progress := strings.Repeat("● ", len(p.entered)) + strings.Repeat("○ ", len(p.code)-len(p.entered))
-		c.mu.Unlock()
-		answerCallback(c.tbAPI, query.ID, strings.TrimSpace(progress))
-		return nil
-	}
+	p.chosen = choice
 	delete(pending, userID)
 	stopTimer(p)
 	c.mu.Unlock()
@@ -206,11 +197,11 @@ func (c *captcha) HandleCallback(query *tbapi.CallbackQuery) error {
 		c.finishTest(query.ID, p)
 		return nil
 	}
-	if p.entered != p.code {
-		answerCallback(c.tbAPI, query.ID, "wrong answer")
+	if p.chosen != p.code {
+		answerCallback(c.tbAPI, query.ID, captchaText(lang, txtWrong))
 		return c.fail(p.user, "wrong answer", true)
 	}
-	answerCallback(c.tbAPI, query.ID, "verified")
+	answerCallback(c.tbAPI, query.ID, captchaText(lang, txtVerified))
 	c.mu.Lock()
 	delete(c.failures, userID)
 	c.mu.Unlock()
@@ -219,8 +210,79 @@ func (c *captcha) HandleCallback(query *tbapi.CallbackQuery) error {
 	return nil
 }
 
-// captchaExpired answers a press on a captcha that is no longer pending
-const captchaExpired = "this verification has expired"
+// texts the bot shows members itself, by language; the prompt in the chat is --captcha.message
+const (
+	txtExpired = iota
+	txtOtherUser
+	txtVerified
+	txtWrong
+	txtDisabled
+	txtTestPassed
+	txtTestFailed  // chosen, code, first cooldown
+	txtTestTimeout // timeout, code
+	txtTestError   // error
+)
+
+var captchaTexts = map[string][]string{
+	"en": { //nolint:gosec // user-facing texts, not credentials
+		txtExpired:    "this verification has expired",
+		txtOtherUser:  "this verification is for another user",
+		txtVerified:   "verified",
+		txtWrong:      "wrong answer",
+		txtDisabled:   "captcha is disabled",
+		txtTestPassed: "captcha test passed, a member choosing this would be let in",
+		txtTestFailed: "captcha test failed: chose %s, the number was %s. a member would be removed for %s, " +
+			"doubling with each further failure (test only, nothing happened to you)",
+		txtTestTimeout: "captcha test timed out after %s, the number was %s. a member would be removed " +
+			"(test only, nothing happened to you)",
+		txtTestError: "captcha test failed: %s",
+	},
+	"zh": { //nolint:gosec // user-facing texts, not credentials
+		txtExpired:     "此验证已失效",
+		txtOtherUser:   "这不是你的验证",
+		txtVerified:    "验证通过",
+		txtWrong:       "答案错误",
+		txtDisabled:    "入群验证未启用",
+		txtTestPassed:  "验证测试通过，成员选择这个会被放行",
+		txtTestFailed:  "验证测试未通过：选择了 %s，正确答案是 %s。成员会被移出 %s，之后每次失败时长翻倍（仅为测试，你不受影响）",
+		txtTestTimeout: "验证测试已超时（%s），正确答案是 %s。成员会被移出（仅为测试，你不受影响）",
+		txtTestError:   "验证测试失败：%s",
+	},
+	"ru": { //nolint:gosec // user-facing texts, not credentials
+		txtExpired:    "эта проверка устарела",
+		txtOtherUser:  "эта проверка для другого пользователя",
+		txtVerified:   "проверка пройдена",
+		txtWrong:      "неверный ответ",
+		txtDisabled:   "проверка новых участников отключена",
+		txtTestPassed: "тест пройден, участник с таким ответом был бы допущен",
+		txtTestFailed: "тест не пройден: выбрано %s, верное число %s. участник был бы удалён на %s, " +
+			"при каждой следующей ошибке срок удваивается (это только тест, вас это не затронуло)",
+		txtTestTimeout: "время теста истекло (%s), верное число %s. участник был бы удалён " +
+			"(это только тест, вас это не затронуло)",
+		txtTestError: "тест не удался: %s",
+	},
+}
+
+// callbackLang returns the telegram language of whoever pressed a button
+func callbackLang(query *tbapi.CallbackQuery) string {
+	if query.From == nil {
+		return ""
+	}
+	return query.From.LanguageCode
+}
+
+// captchaText returns the text in the member's telegram language ("zh-hans" uses "zh"), english when missing
+func captchaText(lang string, id int, args ...any) string {
+	lang, _, _ = strings.Cut(strings.ToLower(lang), "-")
+	texts, ok := captchaTexts[lang]
+	if !ok {
+		texts = captchaTexts["en"]
+	}
+	if len(args) == 0 {
+		return texts[id]
+	}
+	return fmt.Sprintf(texts[id], args...)
+}
 
 // IsPending reports whether the member has an unsolved captcha
 func (c *captcha) IsPending(userID int64) bool {
@@ -265,8 +327,8 @@ func (c *captcha) Stop() {
 // StartTest posts a test challenge to a member in their private chat with the bot, so the animation can be
 // checked in real clients. the caption is the join captcha's own. nothing happens to the member: no mute, no
 // ban, no failure count; the result is told in the private chat. a test already pending is replaced
-func (c *captcha) StartTest(user bot.User) {
-	p := &pendingCaptcha{user: user, chatID: user.ID}
+func (c *captcha) StartTest(user bot.User, lang string) {
+	p := &pendingCaptcha{user: user, chatID: user.ID, lang: lang}
 	c.register(c.tests, p)
 	c.running.Add(1)
 	go c.postTest(p)
@@ -285,7 +347,7 @@ func (c *captcha) postTest(p *pendingCaptcha) {
 	if err != nil {
 		log.Printf("[WARN] failed to send captcha test to %s: %v", p.user, err)
 		if c.take(c.tests, p.user.ID, p) != nil {
-			c.sendText(p.chatID, "captcha test failed: "+redactBotToken(err.Error()))
+			c.sendText(p.chatID, captchaText(p.lang, txtTestError, redactBotToken(err.Error())))
 		}
 		return
 	}
@@ -299,21 +361,18 @@ func (c *captcha) expireTest(p *pendingCaptcha) {
 		return
 	}
 	deleteMessage(c.tbAPI, p.chatID, p.msgID, "captcha")
-	c.sendText(p.chatID, fmt.Sprintf("captcha test timed out after %s, the number was %s. "+
-		"a member would be removed (test only, nothing happened to you)", compactDuration(c.timeout), p.code))
+	c.sendText(p.chatID, captchaText(p.lang, txtTestTimeout, compactDuration(c.timeout), p.code))
 }
 
 // finishTest tells the member how a completed test went
 func (c *captcha) finishTest(queryID string, p *pendingCaptcha) {
-	if p.entered == p.code {
-		answerCallback(c.tbAPI, queryID, "verified")
-		c.sendText(p.chatID, "captcha test passed, a member entering this would be let in")
+	if p.chosen == p.code {
+		answerCallback(c.tbAPI, queryID, captchaText(p.lang, txtVerified))
+		c.sendText(p.chatID, captchaText(p.lang, txtTestPassed))
 		return
 	}
-	answerCallback(c.tbAPI, queryID, "wrong answer")
-	c.sendText(p.chatID, fmt.Sprintf("captcha test failed: entered %s, the number was %s. a member would be "+
-		"removed for %s, doubling with each further failure (test only, nothing happened to you)",
-		p.entered, p.code, compactDuration(captchaCooldown)))
+	answerCallback(c.tbAPI, queryID, captchaText(p.lang, txtWrong))
+	c.sendText(p.chatID, captchaText(p.lang, txtTestFailed, p.chosen, p.code, compactDuration(captchaCooldown)))
 }
 
 func (c *captcha) sendText(chatID int64, text string) {
@@ -522,25 +581,21 @@ func (c *captcha) memberStatus(userID int64) (string, error) {
 	return member.Status, nil
 }
 
-// send posts the animation with the caption and a keypad of shuffled digits and a backspace
+// send posts the animation with the caption and the candidate numbers, three per row
 func (c *captcha) send(chatID int64, user bot.User, code, caption string) (tbapi.Message, error) {
 	img, err := c.render(code)
 	if err != nil {
 		return tbapi.Message{}, err
 	}
-	button := func(key, label string) tbapi.InlineKeyboardButton {
-		return tbapi.NewInlineKeyboardButtonData(label, fmt.Sprintf("%s%d:%s", captchaPrefix, user.ID, key))
-	}
-	digits := rand.Perm(10) //nolint:gosec // layout, not a secret
-	rows := make([][]tbapi.InlineKeyboardButton, 0, 3)
-	for r := range 3 {
-		row := make([]tbapi.InlineKeyboardButton, 0, 4)
-		for _, d := range digits[r*4 : min(r*4+4, 10)] {
-			row = append(row, button(strconv.Itoa(d), strconv.Itoa(d)))
+	choices := captchaCandidates(code)
+	rows := make([][]tbapi.InlineKeyboardButton, 0, (len(choices)+2)/3)
+	for i, choice := range choices {
+		if i%3 == 0 {
+			rows = append(rows, make([]tbapi.InlineKeyboardButton, 0, 3))
 		}
-		rows = append(rows, row)
+		rows[len(rows)-1] = append(rows[len(rows)-1],
+			tbapi.NewInlineKeyboardButtonData(choice, fmt.Sprintf("%s%d:%s", captchaPrefix, user.ID, choice)))
 	}
-	rows[2] = append(rows[2], button(captchaBackspace, "⌫"))
 
 	anim := tbapi.NewAnimation(chatID, tbapi.FileBytes{Name: "captcha.gif", Bytes: img})
 	anim.Caption = caption
@@ -585,10 +640,25 @@ func parseCaptchaData(data string) (userID int64, key string, err error) {
 	if userID, err = strconv.ParseInt(idStr, 10, 64); err != nil {
 		return 0, "", fmt.Errorf("invalid user ID in captcha callback data %q: %w", data, err)
 	}
-	if key != captchaBackspace && (len(key) != 1 || key[0] < '0' || key[0] > '9') {
-		return 0, "", fmt.Errorf("invalid key in captcha callback data %q", data)
+	if len(key) != captchaCodeLen || strings.Trim(key, "0123456789") != "" {
+		return 0, "", fmt.Errorf("invalid choice in captcha callback data %q", data)
 	}
 	return userID, key, nil
+}
+
+// captchaCandidates returns captchaChoices distinct numbers in random order, the code among them. the
+// others are random and independent of the code: decoys derived from it (swapped digits, a digit off by one)
+// would make the code the one candidate closest to all the others, readable from the buttons alone
+func captchaCandidates(code string) []string {
+	res := make([]string, 0, captchaChoices)
+	res = append(res, code)
+	for len(res) < captchaChoices {
+		if c := newCaptchaCode(); !slices.Contains(res, c) {
+			res = append(res, c)
+		}
+	}
+	rand.Shuffle(len(res), func(i, j int) { res[i], res[j] = res[j], res[i] }) //nolint:gosec // layout
+	return res
 }
 
 // compactDuration formats a duration without zero tails, 2m instead of 2m0s and 1h instead of 1h0m0s

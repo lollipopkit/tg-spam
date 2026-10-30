@@ -692,7 +692,7 @@ func (l *TelegramListener) procCaptchaTest(msg *tbapi.Message) bool {
 		return true
 	}
 	if l.captcha == nil {
-		if _, err := l.TbAPI.Send(tbapi.NewMessage(msg.Chat.ID, "captcha is disabled")); err != nil {
+		if _, err := l.TbAPI.Send(tbapi.NewMessage(msg.Chat.ID, captchaText(msg.From.LanguageCode, txtDisabled))); err != nil {
 			log.Printf("[WARN] failed to answer captcha test request: %v", err)
 		}
 		return true
@@ -700,15 +700,15 @@ func (l *TelegramListener) procCaptchaTest(msg *tbapi.Message) bool {
 	user := bot.User{ID: msg.From.ID, Username: msg.From.UserName, FirstName: strings.TrimSpace(msg.From.FirstName),
 		LastName: strings.TrimSpace(msg.From.LastName)}
 	user.DisplayName = strings.TrimSpace(user.FirstName + " " + user.LastName)
-	l.captcha.StartTest(user)
+	l.captcha.StartTest(user, msg.From.LanguageCode)
 	return true
 }
 
-// procCaptchaCallback passes a captcha keypad press to the captcha. with the captcha disabled, a press on a
+// procCaptchaCallback passes a press on a captcha button to the captcha. with the captcha disabled, a press on a
 // message left from an earlier run is still answered, otherwise the client spins until it times out
 func (l *TelegramListener) procCaptchaCallback(query *tbapi.CallbackQuery) {
 	if l.captcha == nil {
-		answerCallback(l.TbAPI, query.ID, captchaExpired)
+		answerCallback(l.TbAPI, query.ID, captchaText(callbackLang(query), txtExpired))
 		return
 	}
 	if err := l.captcha.HandleCallback(query); err != nil {

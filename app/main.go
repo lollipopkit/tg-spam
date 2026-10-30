@@ -194,7 +194,7 @@ type options struct {
 	Captcha struct {
 		Enabled bool          `long:"enabled" env:"ENABLED" description:"verify new members with a motion captcha"`
 		Timeout time.Duration `long:"timeout" env:"TIMEOUT" default:"2m" description:"time to solve the captcha before the member is removed"`
-		Message string        `long:"message" env:"MESSAGE" default:"{user}, enter the number moving in the animation within {timeout}, otherwise you will be removed from the chat. Tap the animation if it does not play." description:"captcha prompt, {user} and {timeout} are replaced"`
+		Message string        `long:"message" env:"MESSAGE" default:"{user}, choose the number moving in the animation within {timeout}, otherwise you will be removed from the chat. Tap the animation if it does not play." description:"captcha prompt, {user} and {timeout} are replaced"`
 	} `group:"captcha" namespace:"captcha" env-namespace:"CAPTCHA"`
 
 	Files struct {

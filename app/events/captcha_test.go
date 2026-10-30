@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"image/gif"
+	"slices"
 	"testing"
 	"time"
 
@@ -42,7 +43,7 @@ func startPosted(t *testing.T, c *captcha, user bot.User) {
 	c.running.Wait()
 }
 
-// captchaKeys returns the posted keypad buttons
+// captchaKeys returns the posted candidate buttons
 func captchaKeys(t *testing.T, api *mocks.TbAPIMock) []tbapi.InlineKeyboardButton {
 	t.Helper()
 	require.NotEmpty(t, api.SendCalls())
@@ -80,14 +81,6 @@ func press(t *testing.T, c *captcha, api *mocks.TbAPIMock, fromID, userID int64,
 	res := make([]string, 0, len(answers))
 	for _, a := range answers {
 		res = append(res, a.Text)
-	}
-	return res
-}
-
-func digitsOf(code string) []string {
-	res := make([]string, 0, len(code))
-	for _, ch := range code {
-		res = append(res, string(ch))
 	}
 	return res
 }
@@ -183,22 +176,21 @@ func TestCaptcha_Start(t *testing.T) {
 	require.NoError(t, err)
 
 	code := pendingCode(t, c, 42)
-	assert.Regexp(t, `^\d{3}$`, code)
+	assert.Regexp(t, `^\d{2}$`, code)
 	assert.NotContains(t, anim.Caption, code)
 
+	markup := anim.ReplyMarkup.(tbapi.InlineKeyboardMarkup)
+	require.Len(t, markup.InlineKeyboard, 2, "two rows of three")
 	keys := captchaKeys(t, api)
-	require.Len(t, keys, 11)
+	require.Len(t, keys, captchaChoices)
 	labels := make([]string, 0, len(keys))
 	for _, k := range keys {
 		labels = append(labels, k.Text)
-		key := k.Text
-		if key == "⌫" {
-			key = captchaBackspace
-		}
-		assert.Equal(t, "C42:"+key, *k.CallbackData)
+		assert.Regexp(t, `^\d{2}$`, k.Text)
+		assert.Equal(t, "C42:"+k.Text, *k.CallbackData)
 	}
-	assert.ElementsMatch(t, []string{"0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "⌫"}, labels)
-	assert.Equal(t, "⌫", keys[10].Text)
+	assert.Contains(t, labels, code)
+	assert.ElementsMatch(t, slices.Compact(slices.Sorted(slices.Values(labels))), labels, "distinct")
 	assert.True(t, c.IsPending(42))
 	assert.False(t, c.IsPending(43))
 }
@@ -369,8 +361,8 @@ func TestCaptcha_HandleCallback(t *testing.T) {
 	t.Run("right number lifts the mute and clears failures", func(t *testing.T) {
 		c, api, code := start(t)
 		c.failures[42] = captchaFailure{count: 2, last: time.Now().Add(-time.Hour)}
-		answers := press(t, c, api, 42, 42, 77, digitsOf(code)...)
-		assert.Equal(t, []string{"● ○ ○", "● ● ○", "verified"}, answers)
+		answers := press(t, c, api, 42, 42, 77, code)
+		assert.Equal(t, []string{"verified"}, answers)
 		assert.False(t, c.IsPending(42))
 		assertLifted(t, api, 42)
 		assert.Equal(t, []int{77}, deletedIDs(api))
@@ -378,18 +370,20 @@ func TestCaptcha_HandleCallback(t *testing.T) {
 		assert.Zero(t, failuresOf(c, 42))
 	})
 
-	t.Run("backspace corrects a digit", func(t *testing.T) {
+	t.Run("answers follow the member's telegram language", func(t *testing.T) {
 		c, api, code := start(t)
-		keys := append([]string{wrongCode(code)[:1], captchaBackspace, captchaBackspace}, digitsOf(code)...)
-		answers := press(t, c, api, 42, 42, 77, keys...)
-		assert.Equal(t, []string{"● ○ ○", "○ ○ ○", "○ ○ ○", "● ○ ○", "● ● ○", "verified"}, answers)
-		assert.Empty(t, requestsOf[tbapi.BanChatMemberConfig](api))
+		q := captchaQuery(42, 77, "C42:"+code)
+		q.From.LanguageCode = "zh-hans"
+		require.NoError(t, c.HandleCallback(q))
+		answers := requestsOf[tbapi.CallbackConfig](api)
+		require.Len(t, answers, 1)
+		assert.Equal(t, "验证通过", answers[0].Text)
 	})
 
-	t.Run("wrong number bans for the cooldown after the last digit", func(t *testing.T) {
+	t.Run("wrong number bans for the cooldown, the first press decides", func(t *testing.T) {
 		c, api, code := start(t)
-		answers := press(t, c, api, 42, 42, 77, digitsOf(wrongCode(code))...)
-		assert.Equal(t, []string{"● ○ ○", "● ● ○", "wrong answer"}, answers)
+		answers := press(t, c, api, 42, 42, 77, wrongCode(code), code)
+		assert.Equal(t, []string{"wrong answer", "this verification has expired"}, answers)
 		assert.False(t, c.IsPending(42))
 		assertBannedFor(t, api, 42, captchaCooldown)
 		assert.Equal(t, []int{77}, deletedIDs(api))
@@ -400,45 +394,44 @@ func TestCaptcha_HandleCallback(t *testing.T) {
 	t.Run("repeated failure doubles the cooldown", func(t *testing.T) {
 		c, api, code := start(t)
 		c.failures[42] = captchaFailure{count: 2, last: time.Now().Add(-time.Hour)}
-		press(t, c, api, 42, 42, 77, digitsOf(wrongCode(code))...)
+		press(t, c, api, 42, 42, 77, wrongCode(code))
 		assertBannedFor(t, api, 42, 4*captchaCooldown)
 	})
 
-	t.Run("keys pressed by another user are ignored", func(t *testing.T) {
+	t.Run("a press by another user is ignored", func(t *testing.T) {
 		c, api, code := start(t)
-		answers := press(t, c, api, 99, 42, 77, digitsOf(code)...)
-		assert.Equal(t, []string{"this verification is for another user", "this verification is for another user",
-			"this verification is for another user"}, answers)
+		answers := press(t, c, api, 99, 42, 77, wrongCode(code))
+		assert.Equal(t, []string{"this verification is for another user"}, answers)
 		assert.True(t, c.IsPending(42))
-		assert.Len(t, api.RequestCalls(), 3, "only the callback answers")
-		assert.Equal(t, []string{"● ○ ○"}, press(t, c, api, 42, 42, 77, code[:1]), "no digits entered by others")
+		assert.Len(t, api.RequestCalls(), 1, "only the callback answer")
+		assert.Equal(t, []string{"verified"}, press(t, c, api, 42, 42, 77, code), "the member still decides")
 	})
 
 	t.Run("keys of a replaced captcha message have expired", func(t *testing.T) {
 		c, api, code := start(t)
-		assert.Equal(t, []string{captchaExpired}, press(t, c, api, 42, 42, 76, code[:1]))
+		assert.Equal(t, []string{captchaText("", txtExpired)}, press(t, c, api, 42, 42, 76, code))
 		assert.True(t, c.IsPending(42))
 	})
 
 	t.Run("callback from another chat is answered and ignored", func(t *testing.T) {
 		c, api, code := start(t)
-		q := captchaQuery(42, 77, "C42:"+code[:1])
+		q := captchaQuery(42, 77, "C42:"+code)
 		q.Message.Chat.ID = 555
 		require.NoError(t, c.HandleCallback(q))
 		assert.True(t, c.IsPending(42))
 		answers := requestsOf[tbapi.CallbackConfig](api)
 		require.Len(t, answers, 1)
-		assert.Equal(t, captchaExpired, answers[0].Text)
+		assert.Equal(t, captchaText("", txtExpired), answers[0].Text)
 		assert.Len(t, api.RequestCalls(), 1)
 	})
 
 	t.Run("malformed data", func(t *testing.T) {
 		c, api, _ := start(t)
-		for _, data := range []string{"C42", "Cx:1", "C42:y", "C42:12", "C42:"} {
+		for _, data := range []string{"C42", "Cx:12", "C42:y1", "C42:1", "C42:123", "C42:"} {
 			require.Error(t, c.HandleCallback(captchaQuery(42, 77, data)), data)
 		}
 		assert.True(t, c.IsPending(42))
-		assert.Len(t, requestsOf[tbapi.CallbackConfig](api), 5, "every press is answered")
+		assert.Len(t, requestsOf[tbapi.CallbackConfig](api), 6, "every press is answered")
 	})
 }
 
@@ -515,7 +508,7 @@ func TestCaptcha_ResolvedWhilePosting(t *testing.T) {
 
 	c.Start(bot.User{ID: 42})
 	<-rendering
-	assert.Equal(t, []string{captchaExpired}, press(t, c, api, 42, 42, 77, "1"), "not posted yet")
+	assert.Equal(t, []string{captchaText("", txtExpired)}, press(t, c, api, 42, 42, 77, "12"), "not posted yet")
 	c.Cancel(42)
 	assert.Empty(t, deletedIDs(api), "nothing posted to delete yet")
 	close(release)
@@ -576,17 +569,18 @@ func TestCaptcha_FailuresExpire(t *testing.T) {
 }
 
 func TestRenderMotionCaptcha(t *testing.T) {
+	mcStyle := captchaStyle()
 	data, err := renderMotionCaptcha("472")
 	require.NoError(t, err)
 	g, err := gif.DecodeAll(bytes.NewReader(data))
 	require.NoError(t, err)
-	require.Len(t, g.Image, mcFrames)
+	require.Len(t, g.Image, mcStyle.frames)
 	bounds := g.Image[0].Bounds()
-	bw, bh := bounds.Dx()/mcBlock, bounds.Dy()/mcBlock
-	assert.Equal(t, 2*mcMargin+3*5*mcGlyphScale+2*mcGap, bw)
-	assert.Equal(t, 2*mcMargin+7*mcGlyphScale, bh)
+	bw, bh := bounds.Dx()/mcStyle.block, bounds.Dy()/mcStyle.block
+	assert.Equal(t, 2*mcStyle.margin+3*5*mcStyle.scale+2*mcStyle.gap, bw)
+	assert.Equal(t, 2*mcStyle.margin+7*mcStyle.scale, bh)
 
-	at := func(f, x, y int) uint8 { return g.Image[f].ColorIndexAt(x*mcBlock, y*mcBlock) }
+	at := func(f, x, y int) uint8 { return g.Image[f].ColorIndexAt(x*mcStyle.block, y*mcStyle.block) }
 
 	// every frame is noise: about half of the blocks are white, in the digit area and outside it alike
 	for f := range g.Image {
@@ -612,7 +606,7 @@ func TestRenderMotionCaptcha(t *testing.T) {
 	}
 	// the 4th font column of "4" is ink in every row, so its middle is inside the stroke whatever the
 	// jitter; the corner is always background
-	assert.InDelta(t, 1.0, down(mcMargin+3*mcGlyphScale+1, mcMargin+14), 0.001, "stroke moves down in every frame")
+	assert.InDelta(t, 1.0, down(mcStyle.margin+3*mcStyle.scale+1, mcStyle.margin+14), 0.001, "stroke moves down in every frame")
 	assert.Less(t, down(1, 2), 0.8, "background does not move down")
 
 	_, err = renderMotionCaptcha("4a2")
@@ -744,10 +738,8 @@ func TestTelegramListener_DoCaptcha(t *testing.T) {
 	updChan <- tbapi.Update{EditedMessage: &tbapi.Message{Chat: tbapi.Chat{ID: 123}, From: &member, Text: "edit", MessageID: 56}}
 	l.captcha.running.Wait()
 	code := pendingCode(t, l.captcha, 42)
-	updChan <- tbapi.Update{CallbackQuery: captchaQuery(99, 77, "C42:"+code[:1])}
-	for _, d := range digitsOf(code) {
-		updChan <- tbapi.Update{CallbackQuery: captchaQuery(42, 77, "C42:"+d)}
-	}
+	updChan <- tbapi.Update{CallbackQuery: captchaQuery(99, 77, "C42:"+code)}
+	updChan <- tbapi.Update{CallbackQuery: captchaQuery(42, 77, "C42:"+code)}
 	// verified member's message goes through the regular checks
 	updChan <- tbapi.Update{Message: &tbapi.Message{Chat: tbapi.Chat{ID: 123}, From: &member, Text: "hello", MessageID: 57}}
 	close(updChan)
@@ -759,7 +751,7 @@ func TestTelegramListener_DoCaptcha(t *testing.T) {
 	for _, a := range requestsOf[tbapi.CallbackConfig](api) {
 		answers = append(answers, a.Text)
 	}
-	assert.Equal(t, []string{"this verification is for another user", "● ○ ○", "● ● ○", "verified"}, answers)
+	assert.Equal(t, []string{"this verification is for another user", "verified"}, answers)
 	require.Len(t, b.OnMessageCalls(), 1, "only the verified member's message is checked")
 	assert.Equal(t, "hello", b.OnMessageCalls()[0].Msg.Text)
 	assert.Empty(t, requestsOf[tbapi.BanChatMemberConfig](api))
@@ -808,7 +800,7 @@ func TestTelegramListener_DoCaptchaDisabledInDryMode(t *testing.T) {
 	assert.Nil(t, l.captcha)
 	answers := requestsOf[tbapi.CallbackConfig](api)
 	require.Len(t, answers, 1, "a press on a left-over captcha is still answered")
-	assert.Equal(t, captchaExpired, answers[0].Text)
+	assert.Equal(t, captchaText("", txtExpired), answers[0].Text)
 }
 
 func TestCaptcha_Test(t *testing.T) {
@@ -827,7 +819,7 @@ func TestCaptcha_Test(t *testing.T) {
 		c := newCaptcha(api, 123, timeout, testCaptchaMsg)
 		c.render = stubRender
 		t.Cleanup(c.Stop)
-		c.StartTest(bot.User{ID: 42, Username: "admin"})
+		c.StartTest(bot.User{ID: 42, Username: "admin"}, "")
 		c.running.Wait()
 		c.mu.Lock()
 		p, ok := c.tests[42]
@@ -856,8 +848,8 @@ func TestCaptcha_Test(t *testing.T) {
 
 	t.Run("right number passes", func(t *testing.T) {
 		c, api, code := start(t, time.Minute)
-		pressDM(t, c, digitsOf(code)...)
-		assert.Equal(t, []string{"captcha test passed, a member entering this would be let in"}, sentTexts(api))
+		pressDM(t, c, code)
+		assert.Equal(t, []string{"captcha test passed, a member choosing this would be let in"}, sentTexts(api))
 		assert.Equal(t, []int{77}, deletedIDs(api))
 		assert.Empty(t, requestsOf[tbapi.RestrictChatMemberConfig](api))
 		assert.Empty(t, requestsOf[tbapi.BanChatMemberConfig](api))
@@ -867,8 +859,8 @@ func TestCaptcha_Test(t *testing.T) {
 	t.Run("wrong number tells the right one, no ban, no failure", func(t *testing.T) {
 		c, api, code := start(t, time.Minute)
 		wrong := wrongCode(code)
-		pressDM(t, c, digitsOf(wrong)...)
-		assert.Equal(t, []string{fmt.Sprintf("captcha test failed: entered %s, the number was %s. a member would be "+
+		pressDM(t, c, wrong)
+		assert.Equal(t, []string{fmt.Sprintf("captcha test failed: chose %s, the number was %s. a member would be "+
 			"removed for 5m, doubling with each further failure (test only, nothing happened to you)", wrong, code)},
 			sentTexts(api))
 		assert.Empty(t, requestsOf[tbapi.BanChatMemberConfig](api))
@@ -890,7 +882,7 @@ func TestCaptcha_Test(t *testing.T) {
 		c, api, code := start(t, time.Minute)
 		c.Start(bot.User{ID: 42})
 		c.running.Wait()
-		pressDM(t, c, digitsOf(code)...)
+		pressDM(t, c, code)
 		assert.True(t, c.IsPending(42), "join captcha untouched")
 		assert.Len(t, sentTexts(api), 1)
 	})
@@ -898,10 +890,10 @@ func TestCaptcha_Test(t *testing.T) {
 	t.Run("press in a private chat without a test has expired", func(t *testing.T) {
 		api := newCaptchaAPI("member")
 		c := newCaptcha(api, 123, time.Minute, testCaptchaMsg)
-		pressDM(t, c, "1")
+		pressDM(t, c, "12")
 		answers := requestsOf[tbapi.CallbackConfig](api)
 		require.Len(t, answers, 1)
-		assert.Equal(t, captchaExpired, answers[0].Text)
+		assert.Equal(t, captchaText("", txtExpired), answers[0].Text)
 	})
 
 	t.Run("send fails, reported in the private chat", func(t *testing.T) {
@@ -914,7 +906,7 @@ func TestCaptcha_Test(t *testing.T) {
 		}
 		c := newCaptcha(api, 123, time.Minute, testCaptchaMsg)
 		c.render = stubRender
-		c.StartTest(bot.User{ID: 42})
+		c.StartTest(bot.User{ID: 42}, "")
 		c.running.Wait()
 		assert.Equal(t, []string{"captcha test failed: send animation: upload failed"}, sentTexts(api))
 		c.mu.Lock()
@@ -931,8 +923,8 @@ func TestCaptcha_Test(t *testing.T) {
 		for range captchaWorkers {
 			c.workers <- struct{}{} // hold the workers so both tests queue
 		}
-		c.StartTest(bot.User{ID: 42})
-		c.StartTest(bot.User{ID: 42})
+		c.StartTest(bot.User{ID: 42}, "")
+		c.StartTest(bot.User{ID: 42}, "")
 		for range captchaWorkers {
 			<-c.workers
 		}
@@ -948,7 +940,7 @@ func TestCaptcha_Test(t *testing.T) {
 		}
 		rendering, release := make(chan struct{}), make(chan struct{})
 		c.render = func(string) ([]byte, error) { close(rendering); <-release; return []byte("gif"), nil }
-		c.StartTest(bot.User{ID: 43})
+		c.StartTest(bot.User{ID: 43}, "")
 		<-rendering
 		c.mu.Lock()
 		delete(c.tests, 43) // resolved while being sent
@@ -1040,4 +1032,66 @@ func TestTelegramListener_procCaptchaTest(t *testing.T) {
 		require.Len(t, api.SendCalls(), 1)
 		assert.Equal(t, "captcha is disabled", api.SendCalls()[0].C.(tbapi.MessageConfig).Text)
 	})
+}
+
+func TestCaptchaCandidates(t *testing.T) {
+	for _, code := range []string{"47", "00", "99", "10", "55"} {
+		for range 50 {
+			got := captchaCandidates(code)
+			require.Len(t, got, captchaChoices, code)
+			assert.Contains(t, got, code)
+			assert.Len(t, slices.Compact(slices.Sorted(slices.Values(got))), captchaChoices, "distinct: %v", got)
+			for _, c := range got {
+				assert.Regexp(t, `^\d{2}$`, c)
+			}
+		}
+	}
+	// decoys are independent of the code: over many draws every other number shows up, not only near misses
+	seen := map[string]bool{}
+	for range 2000 {
+		for _, c := range captchaCandidates("47") {
+			seen[c] = true
+		}
+	}
+	assert.Len(t, seen, 100, "decoys cover every 2-digit number")
+}
+
+func TestCaptchaText(t *testing.T) {
+	assert.Equal(t, "verified", captchaText("", txtVerified))
+	assert.Equal(t, "verified", captchaText("de", txtVerified), "missing language falls back to english")
+	assert.Equal(t, "验证通过", captchaText("zh", txtVerified))
+	assert.Equal(t, "验证通过", captchaText("zh-Hant", txtVerified))
+	assert.Equal(t, "验证测试失败：boom", captchaText("zh-hans", txtTestError, "boom"))
+	assert.Equal(t, "проверка пройдена", captchaText("ru", txtVerified))
+	assert.Equal(t, "тест не удался: boom", captchaText("ru-RU", txtTestError, "boom"))
+	for lang, texts := range captchaTexts {
+		assert.Len(t, texts, len(captchaTexts["en"]), lang)
+		for i, txt := range texts {
+			assert.NotEmpty(t, txt, "%s text %d", lang, i)
+		}
+	}
+}
+
+func TestCaptcha_TestChinese(t *testing.T) {
+	api := newCaptchaAPI("member")
+	c := newCaptcha(api, 123, time.Minute, testCaptchaMsg)
+	c.render = stubRender
+	defer c.Stop()
+	c.StartTest(bot.User{ID: 42}, "zh-hans")
+	c.running.Wait()
+	c.mu.Lock()
+	code := c.tests[42].code
+	c.mu.Unlock()
+	q := captchaQuery(42, 77, "C42:"+wrongCode(code))
+	q.Message.Chat.ID = 42
+	require.NoError(t, c.HandleCallback(q))
+	var texts []string
+	for _, call := range api.SendCalls() {
+		if m, ok := call.C.(tbapi.MessageConfig); ok {
+			texts = append(texts, m.Text)
+		}
+	}
+	assert.Equal(t, []string{fmt.Sprintf("验证测试未通过：选择了 %s，正确答案是 %s。成员会被移出 5m，之后每次失败时长翻倍（仅为测试，你不受影响）",
+		wrongCode(code), code)}, texts)
+	assert.Equal(t, "答案错误", requestsOf[tbapi.CallbackConfig](api)[0].Text)
 }
