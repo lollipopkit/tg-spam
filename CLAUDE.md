@@ -172,6 +172,10 @@
 - No dedicated `--meta.document-text-len` knob. Threshold is `settings.MinMsgLen`, like `videos` and `audio`
 - Not in `zeroAwarePaths`: a plain opt-in bool, default off, same as `Meta.Forward` and `Meta.ExternalReply`
 
+### Contact Handling
+- `ContactCheck` (`--meta.contact-only`) flags any message with `Meta.HasContact`. It used to flag only `HasContact && Msg == ""`, which a contact sent as a reply defeated: `bot.OnMessage` appends the replied-to text to `Msg`. A contact has no caption, so a contact never has authored text and "contact without text" is every contact. It is a blunt rule for not-yet-approved members; with `--paranoid` it hits established members too (README says so)
+- The card's content (name, phone, vCard) is deliberately NOT folded into `message.Text`, unlike checklist and poll. Folding was tried and rejected in review: the phone, email and address of the sender or a third party would reach the locator, logs, spam log, admin chat, spam samples and LLM providers; ungated contacts would feed the duplicate detector (which bans approved members), `--max-short-msg-count` and the unvetoable prohibited-langs check (a contact's name is written by whoever saved it); and vCard 2.1 from Android needs quoted-printable/base64 decoding. Contacts stay behind the `AdmitContacts` intake gate, admitted only with `--meta.contact-only` on
+
 ### Prohibited Languages Detection
 - `--prohibited-langs` (Settings.ProhibitedLangs, comma-separated) blocks messages written in an admin-configured set of Unicode scripts; solves English-only or single-script chats getting spam in another script (Chinese observed). Disabled by default (empty list)
 - The check is an internal method `(d *Detector) isProhibitedLang(msg string)` (`lib/tgspam/detector.go:1186`) called inline in `Detector.Check` right after the short-msg-flood block and before the stop-words block (`detector.go:282-288`), gated by `len(d.ProhibitedScripts) > 0 && d.ProhibitedLangsMin > 0` so both an empty script list and a zero min (treated as disabled) do no work

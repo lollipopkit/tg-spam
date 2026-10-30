@@ -206,7 +206,7 @@ This option is disabled by default. If `--meta.audio-only` set or `env:META_AUDI
 
 **Contact only check**
 
-This option is disabled by default. If `--meta.contact-only` set or `env:META_CONTACT_ONLY` is `true`, the bot will check the message for the presence of shared contacts (vCards). If the message contains a shared contact but no text, it will be marked as spam.
+This option is disabled by default. If `--meta.contact-only` set or `env:META_CONTACT_ONLY` is `true`, any message with a shared contact (vCard) is marked as spam. A contact can't carry a caption, so the card is all the message there is. Like the other checks it applies to members who are not approved yet (see `--first-messages-count`); with `--paranoid` it applies to everyone, so an established member sharing a contact would be banned too. The card's own content (name, phone, vCard) is not checked: it is personal data that would otherwise reach the logs, the admin chat and LLM providers. With the option off, a shared contact is not checked at all.
 
 **Forward check**
 
@@ -747,7 +747,7 @@ meta:
       --meta.video-only                 enable video only check [$META_VIDEO_ONLY]
       --meta.document-only              enable document only check [$META_DOCUMENT_ONLY]
       --meta.audio-only                 enable audio only check [$META_AUDIO_ONLY]
-      --meta.contact-only               enable contact only check [$META_CONTACT_ONLY]
+      --meta.contact-only               flag any shared contact as spam [$META_CONTACT_ONLY]
       --meta.forward                    enable forward check [$META_FORWARD]
       --meta.keyboard                   enable keyboard check [$META_KEYBOARD]
       --meta.username-symbols=          prohibited symbols in username, disabled by default [$META_USERNAME_SYMBOLS]

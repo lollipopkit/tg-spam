@@ -566,17 +566,23 @@ func TestContactCheck(t *testing.T) {
 		{
 			name:     "no contact and text",
 			req:      spamcheck.Request{Msg: "This is a message with text.", Meta: spamcheck.MetaData{HasContact: false}},
-			expected: spamcheck.Response{Name: "contact", Spam: false, Details: "no contact without text"},
+			expected: spamcheck.Response{Name: "contact", Spam: false, Details: "no shared contact"},
 		},
 		{
-			name:     "contact with text",
-			req:      spamcheck.Request{Msg: "This is a message with text and a contact.", Meta: spamcheck.MetaData{HasContact: true}},
-			expected: spamcheck.Response{Name: "contact", Spam: false, Details: "no contact without text"},
+			name:     "contact with text in the request",
+			req:      spamcheck.Request{Msg: "some text", Meta: spamcheck.MetaData{HasContact: true}},
+			expected: spamcheck.Response{Name: "contact", Spam: true, Details: "shared contact"},
+		},
+		{
+			name: "contact sent as a reply to a message with text",
+			req: spamcheck.Request{Msg: "\nparent text", Quote: "parent text",
+				Meta: spamcheck.MetaData{HasContact: true}},
+			expected: spamcheck.Response{Name: "contact", Spam: true, Details: "shared contact"},
 		},
 		{
 			name:     "contact without text",
 			req:      spamcheck.Request{Msg: "", Meta: spamcheck.MetaData{HasContact: true}},
-			expected: spamcheck.Response{Name: "contact", Spam: true, Details: "contact without text"},
+			expected: spamcheck.Response{Name: "contact", Spam: true, Details: "shared contact"},
 		},
 	}
 
