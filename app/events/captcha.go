@@ -477,9 +477,18 @@ func (c *captcha) muteForeverOrBan(user bot.User, reason string) {
 	}
 	d := max(c.cooldownLeft(user.ID), captchaCooldown)
 	if berr := c.ban(user, d); berr != nil {
-		// nothing else is sent: a timed mute here would replace a permanent mute the member may carry already.
-		// after a timeout the join mute ends a minute later, an admin has to act
-		log.Printf("[ERROR] failed to mute %s for good, %s: %v, and to ban: %v", user, reason, err, berr)
+		// under the join mute (timeout) a timed mute only extends it. without one (unknown status on a rejoin)
+		// the member may carry a permanent mute that a timed one would replace, so nothing more is sent
+		if !c.isMutedByCaptcha(user.ID) {
+			log.Printf("[ERROR] failed to mute %s for good, %s: %v, and to ban: %v", user, reason, err, berr)
+			return
+		}
+		if merr := c.mute(user, d); merr != nil {
+			log.Printf("[ERROR] failed to mute %s for good, %s: %v, to ban: %v, and to mute: %v", user, reason, err, berr, merr)
+			return
+		}
+		log.Printf("[WARN] failed to mute %s for good, %s, and to ban, muted for %v: %v; %v", user, reason,
+			d.Round(time.Second), err, berr)
 		return
 	}
 	log.Printf("[WARN] failed to mute %s for good, %s, banned for %v instead: %v", user, reason, d.Round(time.Second), err)

@@ -1284,8 +1284,7 @@ func TestCaptcha_TimeoutMute(t *testing.T) {
 		assert.Len(t, api.SendCalls(), 1, "no fresh challenge")
 	})
 
-	t.Run("refused permanent mute and ban send nothing more", func(t *testing.T) {
-		api := newCaptchaAPI("member")
+	refuseForeverAndBan := func(api *mocks.TbAPIMock) {
 		base := api.RequestFunc
 		api.RequestFunc = func(cfg tbapi.Chattable) (*tbapi.APIResponse, error) {
 			switch r := cfg.(type) {
@@ -1298,6 +1297,21 @@ func TestCaptcha_TimeoutMute(t *testing.T) {
 			}
 			return base(cfg)
 		}
+	}
+	t.Run("refused permanent mute and ban after a timeout extend the join mute", func(t *testing.T) {
+		api := newCaptchaAPI("member")
+		refuseForeverAndBan(api)
+		c := newMuteCaptcha(api, 50*time.Millisecond)
+		timedOut(t, c)
+		require.Eventually(t, func() bool { return len(requestsOf[tbapi.BanChatMemberConfig](api)) == 1 },
+			time.Second, 10*time.Millisecond)
+		require.Eventually(t, func() bool {
+			return lastRestrict(api).UntilDate > time.Now().Add(captchaCooldown-5*time.Second).Unix()
+		}, time.Second, 10*time.Millisecond, "muted for the cooldown, not left free when the join mute ends")
+	})
+	t.Run("refused permanent mute and ban without a join mute send nothing more", func(t *testing.T) {
+		api := newCaptchaAPI("member")
+		refuseForeverAndBan(api)
 		c := newMuteCaptcha(api, time.Minute)
 		require.NoError(t, c.fail(bot.User{ID: 42}, "timeout", false))
 		c.muteForeverOrBan(bot.User{ID: 42}, "status unknown after a permanent mute")
@@ -1354,4 +1368,22 @@ func TestCaptcha_BanDropsJoinMuteRecord(t *testing.T) {
 	press(t, c, api, 42, 42, 77, wrongCode(pendingCode(t, c, 42)))
 	assertBannedFor(t, api, 42, captchaCooldown)
 	assert.False(t, c.isMutedByCaptcha(42), "a restriction set after the ban must not read as the captcha's own")
+}
+
+func TestCaptcha_BanKeepsNewerJoinMuteRecord(t *testing.T) {
+	api := newCaptchaAPI("member")
+	c := newCaptcha(api, 123, time.Minute, testCaptchaMsg)
+	defer c.Stop()
+	require.NoError(t, c.mute(bot.User{ID: 42}, time.Minute))
+	base := api.RequestFunc
+	api.RequestFunc = func(cfg tbapi.Chattable) (*tbapi.APIResponse, error) {
+		if _, ok := cfg.(tbapi.BanChatMemberConfig); ok {
+			c.mu.Lock()
+			c.muted[42] = time.Now().Add(time.Hour) // a rejoin's join mute recorded while the ban is in flight
+			c.mu.Unlock()
+		}
+		return base(cfg)
+	}
+	require.NoError(t, c.ban(bot.User{ID: 42}, captchaCooldown))
+	assert.True(t, c.isMutedByCaptcha(42), "the newer record stays")
 }
