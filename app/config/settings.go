@@ -316,8 +316,9 @@ type OIDCSettings struct {
 	Allow        []string
 }
 
-// CaptchaOIDCSettings make the Turnstile captcha ask members to sign in at an OpenID Connect issuer, when Issuer
-// is set. Any account of the issuer passes. Flags or env only, like OIDCSettings
+// CaptchaOIDCSettings make the captcha pages ask members to sign in at an OpenID Connect issuer, when Issuer is
+// set, after Turnstile when its site key is set. Any account of the issuer passes. Flags or env only, like
+// OIDCSettings
 type CaptchaOIDCSettings struct {
 	Issuer       string
 	ClientID     string
@@ -417,7 +418,7 @@ func (s *Settings) Validate() error {
 			return fmt.Errorf("captcha.timeout-action (%q) must be %q or %q", s.Captcha.TimeoutAction,
 				CaptchaTimeoutBan, CaptchaTimeoutMute)
 		}
-		if err := validateTurnstile(s.Captcha.Turnstile, s.Transient.CaptchaOIDC.Issuer != ""); err != nil {
+		if err := validateTurnstile(s.Captcha.Turnstile, s.Transient.CaptchaOIDC.Issuer); err != nil {
 			return err
 		}
 	}
@@ -553,14 +554,17 @@ func validateCaptchaMessage(msg string) error {
 	return nil
 }
 
-// validateTurnstile checks the page settings when a site key or the captcha sign-in (signIn) asks for pages,
-// the same checks the listener makes when it starts, so a config accepted here also starts
-func validateTurnstile(t TurnstileSettings, signIn bool) error {
-	if t.SiteKey == "" && !signIn {
+// validateTurnstile checks the page settings when a site key or the captcha sign-in issuer asks for pages, the
+// same checks the listener makes when it starts, so a config accepted here also starts
+func validateTurnstile(t TurnstileSettings, issuer string) error {
+	if !CaptchaPages(t.SiteKey, issuer) {
 		return nil
 	}
-	return ValidateTurnstile(t.SiteKey, t.Secret, t.URL, t.Listen, signIn)
+	return ValidateTurnstile(t.SiteKey, t.Secret, t.URL, t.Listen, issuer != "")
 }
+
+// CaptchaPages reports whether the captcha uses challenge pages: a Turnstile site key, a sign-in issuer, or both
+func CaptchaPages(siteKey, issuer string) bool { return siteKey != "" || issuer != "" }
 
 // ValidateTurnstile checks the challenge page settings, shared by Settings.Validate and the listener start: a
 // site key with its secret, or the captcha sign-in (signIn) without one, a listen address, and an https url
@@ -574,7 +578,7 @@ func ValidateTurnstile(siteKey, secret, publicURL, listen string, signIn bool) e
 		return fmt.Errorf("captcha.turnstile needs a secret with the site key")
 	}
 	if listen == "" {
-		return fmt.Errorf("captcha.turnstile needs a listen address for the pages")
+		return fmt.Errorf("captcha pages need a listen address, captcha.turnstile.listen")
 	}
 	if !isBareHTTPSURL(publicURL) {
 		return fmt.Errorf("captcha.turnstile.url (%q) must be an https url of a host, without a path, query or fragment",

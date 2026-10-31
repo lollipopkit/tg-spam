@@ -622,7 +622,7 @@ func (c *captcha) challenge(chatID int64, p *pendingCaptcha) (sent tbapi.Message
 	return sent, code, false, err
 }
 
-// signInRequired reports whether members must sign in at an OIDC issuer after Turnstile
+// signInRequired reports whether members must sign in at an OIDC issuer on the challenge pages
 func (c *captcha) signInRequired() bool { return c.turnstile != nil && c.turnstile.idp != nil }
 
 // isCurrent reports whether p is still the member's captcha in m
@@ -866,7 +866,7 @@ func (c *captcha) prompt(p *pendingCaptcha) string {
 	message := c.message
 	switch {
 	case message != "":
-	case c.turnstile != nil && !c.turnstile.widget:
+	case c.turnstile != nil && !c.turnstile.widget():
 		message = captchaText(p.lang, txtPromptSignIn)
 	case c.turnstile != nil:
 		message = captchaText(p.lang, txtPromptTurnstile)

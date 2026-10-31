@@ -648,6 +648,8 @@ func TestCaptcha_TurnstileOIDC(t *testing.T) {
 
 		page := doPage(c, http.MethodGet, nonce, "", nil, member42())
 		require.Equal(t, http.StatusFound, page.Code, page.Body.String())
+		assert.Equal(t, "no-store", page.Header().Get("Cache-Control"), "the location holds the sign-in state")
+		assert.Equal(t, "no-referrer", page.Header().Get("Referrer-Policy"))
 		q := idp.Authorize(t, page.Header().Get("Location"))
 		assert.True(t, strings.HasPrefix(q.Get("state"), nonce+"."))
 		again := doPage(c, http.MethodGet, nonce, "", nil, member42())
@@ -665,6 +667,19 @@ func TestCaptcha_TurnstileOIDC(t *testing.T) {
 		assertLifted(t, api, 42)
 	})
 
+	t.Run("sign-in only with the issuer down offers a retry", func(t *testing.T) {
+		c, _, idp, nonce := newSignInOnlyCaptcha(t)
+		idp.Srv.Close()
+		page := doPage(c, http.MethodGet, nonce, "", nil, member42())
+		assert.Equal(t, http.StatusBadGateway, page.Code)
+		m := signInLink.FindStringSubmatch(page.Body.String())
+		require.Len(t, m, 2, page.Body.String())
+		retry := html.UnescapeString(m[1])
+		assert.True(t, strings.HasPrefix(retry, "/v/"+nonce+"?"), retry)
+		assert.Contains(t, retry, "hash=", "back to the page with its telegram login")
+		assert.True(t, c.IsPending(42))
+	})
+
 	t.Run("callback route exists only with a sign-in", func(t *testing.T) {
 		c, _, _ := newTurnstileCaptcha(t, time.Minute, "verify.example.com")
 		assert.Equal(t, http.StatusNotFound, doCallback(c, "code=x&state=y").Code)
@@ -675,6 +690,7 @@ func TestCaptcha_TurnstileOIDC(t *testing.T) {
 		cfg := TurnstileConfig{SiteKey: "k", Secret: "s", PublicURL: "https://v.example.com", Listen: ":8081",
 			BotToken: testBotToken, OIDC: config.CaptchaOIDCSettings{Issuer: "https://auth.example.com", ClientID: "c"}}
 		require.ErrorContains(t, c.WithTurnstile(cfg), "client secret")
+		assert.Nil(t, c.turnstile, "a failed setup leaves the captcha untouched")
 		require.ErrorContains(t, c.WithTurnstile(TurnstileConfig{SiteKey: "k", Secret: "s",
 			PublicURL: "https://v.example.com", Listen: ":8081", BotToken: testBotToken,
 			OIDC: config.CaptchaOIDCSettings{ClientID: "c", ClientSecret: "s"}}), "without captcha.oidc.issuer")

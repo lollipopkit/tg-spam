@@ -827,7 +827,7 @@
                 <div class="col-md-4 mb-3">
                     <label for="captchaTurnstileSiteKey" class="form-label">Turnstile Site Key</label>
                     <input type="text" class="form-control" id="captchaTurnstileSiteKey" name="captchaTurnstileSiteKey" value="{{.Captcha.Turnstile.SiteKey}}">
-                    <div class="form-text">Set to use Cloudflare Turnstile instead of the animation; the secret is set by flag or env</div>
+                    <div class="form-text">Set to use Cloudflare Turnstile; empty means the animation, or the sign-in alone when --captcha.oidc is set; the secret is set by flag or env</div>
                 </div>
                 <div class="col-md-4 mb-3">
                     <label for="captchaTurnstileURL" class="form-label">Turnstile Page URL</label>

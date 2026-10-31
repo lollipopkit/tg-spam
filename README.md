@@ -506,7 +506,7 @@ Notes:
 
 #### Turnstile mode
 
-Setting `--captcha.turnstile.site-key` replaces the animation with [Cloudflare Turnstile](https://developers.cloudflare.com/turnstile/). The joining member gets a Telegram login button that opens a page at `--captcha.turnstile.url`/v/&lt;token&gt;. Telegram adds the presser's identity to the link, signed with the bot token, so a tap by anyone else gets "this verification is for another user". This binds the page to the member's account, not to whoever solves it: a link opened from the member's account and passed on still works, as with any captcha a human can solve for someone. The widget carries the page's token, so a Turnstile pass on one page can't be used on another. The page shows the Turnstile widget, and when it passes, tg-spam checks the token with Cloudflare (siteverify, including that it was issued for the page's host) and lifts the mute. Most people pass without doing anything; Turnstile judges the browser and how it is used, which stops scripted accounts better than any picture. Everything else is the same as above: the mute, the timeout, the cooldown bans, `/captcha` tests in a private chat. If Telegram refuses the login button (the bot's domain is not set), the bot logs an error once and posts the animation, with its own default prompt, until a restart, so members are still verified.
+Setting `--captcha.turnstile.site-key` replaces the animation with [Cloudflare Turnstile](https://developers.cloudflare.com/turnstile/). The joining member gets a Telegram login button that opens a page at `--captcha.turnstile.url`/v/&lt;token&gt;. Telegram adds the presser's identity to the link, signed with the bot token, so a tap by anyone else gets "this verification is for another user". This binds the page to the member's account, not to whoever solves it: a link opened from the member's account and passed on still works, as with any captcha a human can solve for someone. The widget carries the page's token, so a Turnstile pass on one page can't be used on another. The page shows the Turnstile widget, and when it passes, tg-spam checks the token with Cloudflare (siteverify, including that it was issued for the page's host) and lifts the mute. Most people pass without doing anything; Turnstile judges the browser and how it is used, which stops scripted accounts better than any picture. Everything else is the same as above: the mute, the timeout, the cooldown bans, `/captcha` tests in a private chat. If Telegram refuses the login button (the bot's domain is not set), the bot logs an error once and posts the animation, with its own default prompt, until a restart, so members are still verified. With `--captcha.oidc.issuer` set there is no such fallback, see below.
 
 - Set the bot's domain to the page's host with @BotFather `/setdomain`, otherwise Telegram refuses to open the login button.
 - Create a Turnstile widget for the page's hostname in the Cloudflare dashboard and pass its site key and secret (`--captcha.turnstile.secret` / `$CAPTCHA_TURNSTILE_SECRET`, stored encrypted with `--confdb` like the other tokens).
@@ -857,11 +857,11 @@ captcha:
 turnstile:
       --captcha.turnstile.site-key=     Cloudflare Turnstile site key, switches the captcha to Turnstile [$CAPTCHA_TURNSTILE_SITE_KEY]
       --captcha.turnstile.secret=       Cloudflare Turnstile secret [$CAPTCHA_TURNSTILE_SECRET]
-      --captcha.turnstile.url=          public https url the Turnstile page is reachable at [$CAPTCHA_TURNSTILE_URL]
-      --captcha.turnstile.listen=       listen address of the Turnstile page (default: 127.0.0.1:8081) [$CAPTCHA_TURNSTILE_LISTEN]
+      --captcha.turnstile.url=          public https url of the captcha pages (Turnstile, sign-in) [$CAPTCHA_TURNSTILE_URL]
+      --captcha.turnstile.listen=       listen address of the captcha pages (default: 127.0.0.1:8081) [$CAPTCHA_TURNSTILE_LISTEN]
 
 oidc:
-      --captcha.oidc.issuer=            OIDC issuer url, members sign in there after Turnstile [$CAPTCHA_OIDC_ISSUER]
+      --captcha.oidc.issuer=            OIDC issuer url, members sign in there on the captcha pages [$CAPTCHA_OIDC_ISSUER]
       --captcha.oidc.client-id=         OIDC client id [$CAPTCHA_OIDC_CLIENT_ID]
       --captcha.oidc.client-secret=     OIDC client secret [$CAPTCHA_OIDC_CLIENT_SECRET]
 
