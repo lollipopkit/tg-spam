@@ -1255,23 +1255,6 @@ func TestCaptcha_TimeoutMute(t *testing.T) {
 		assert.True(t, c.IsPending(42))
 	})
 
-	t.Run("leaving before the challenge is posted is no failure and mutes nobody", func(t *testing.T) {
-		api := newCaptchaAPI("member")
-		c := newMuteCaptcha(api, time.Minute)
-		base := api.RequestFunc
-		api.RequestFunc = func(cfg tbapi.Chattable) (*tbapi.APIResponse, error) {
-			if _, ok := cfg.(tbapi.GetChatMemberConfig); ok {
-				c.Cancel(42)
-			}
-			return base(cfg)
-		}
-		c.Start(bot.User{ID: 42}, "")
-		c.running.Wait()
-		assert.Zero(t, failuresOf(c, 42), "the member never saw a challenge")
-		assert.Empty(t, requestsOf[tbapi.RestrictChatMemberConfig](api))
-		assert.Empty(t, api.SendCalls())
-	})
-
 	t.Run("refused ban after a wrong answer mutes for good", func(t *testing.T) {
 		api := newCaptchaAPI("member")
 		base := api.RequestFunc
@@ -1301,6 +1284,26 @@ func TestCaptcha_TimeoutMute(t *testing.T) {
 		assert.Len(t, api.SendCalls(), 1, "no fresh challenge")
 	})
 
+	t.Run("refused permanent mute and ban fall back to a mute for the cooldown", func(t *testing.T) {
+		api := newCaptchaAPI("member")
+		base := api.RequestFunc
+		api.RequestFunc = func(cfg tbapi.Chattable) (*tbapi.APIResponse, error) {
+			switch r := cfg.(type) {
+			case tbapi.RestrictChatMemberConfig:
+				if r.UntilDate == 0 {
+					return nil, errors.New("too many requests")
+				}
+			case tbapi.BanChatMemberConfig:
+				return nil, errors.New("too many requests")
+			}
+			return base(cfg)
+		}
+		c := newMuteCaptcha(api, time.Minute)
+		require.NoError(t, c.fail(bot.User{ID: 42}, "timeout", false))
+		c.muteForeverOrBan(bot.User{ID: 42}, "captcha timeout")
+		assert.InDelta(t, time.Now().Add(captchaCooldown).Unix(), lastRestrict(api).UntilDate, 2)
+	})
+
 	t.Run("a wrong answer still bans", func(t *testing.T) {
 		api := newCaptchaAPI("member")
 		c := newMuteCaptcha(api, time.Minute)
@@ -1311,20 +1314,36 @@ func TestCaptcha_TimeoutMute(t *testing.T) {
 }
 
 func TestCaptcha_CancelBeforePostedIsNoFailure(t *testing.T) {
+	for _, mute := range []bool{false, true} {
+		api := newCaptchaAPI("member")
+		c := newCaptcha(api, 123, time.Minute, testCaptchaMsg)
+		c.render = stubRender
+		c.timeoutMute = mute
+		base := api.RequestFunc
+		api.RequestFunc = func(cfg tbapi.Chattable) (*tbapi.APIResponse, error) {
+			if _, ok := cfg.(tbapi.GetChatMemberConfig); ok {
+				c.Cancel(42) // leaves while the status is read, before any challenge
+			}
+			return base(cfg)
+		}
+		c.Start(bot.User{ID: 42}, "")
+		c.running.Wait()
+		assert.Zero(t, failuresOf(c, 42), "no cooldown for a member who never saw a challenge, mute mode %v", mute)
+		assert.Empty(t, api.SendCalls())
+		assert.Empty(t, requestsOf[tbapi.RestrictChatMemberConfig](api))
+		assert.Empty(t, requestsOf[tbapi.BanChatMemberConfig](api))
+		c.Stop()
+	}
+}
+
+func TestCaptcha_BanDropsJoinMuteRecord(t *testing.T) {
 	api := newCaptchaAPI("member")
 	c := newCaptcha(api, 123, time.Minute, testCaptchaMsg)
 	c.render = stubRender
 	defer c.Stop()
-	base := api.RequestFunc
-	api.RequestFunc = func(cfg tbapi.Chattable) (*tbapi.APIResponse, error) {
-		if _, ok := cfg.(tbapi.GetChatMemberConfig); ok {
-			c.Cancel(42) // leaves while the status is read, before any challenge
-		}
-		return base(cfg)
-	}
-	c.Start(bot.User{ID: 42}, "")
-	c.running.Wait()
-	assert.Zero(t, failuresOf(c, 42), "no cooldown for a member who never saw a challenge")
-	assert.Empty(t, api.SendCalls())
-	assert.Empty(t, requestsOf[tbapi.BanChatMemberConfig](api))
+	startPosted(t, c, bot.User{ID: 42})
+	require.True(t, c.isMutedByCaptcha(42))
+	press(t, c, api, 42, 42, 77, wrongCode(pendingCode(t, c, 42)))
+	assertBannedFor(t, api, 42, captchaCooldown)
+	assert.False(t, c.isMutedByCaptcha(42), "a restriction set after the ban must not read as the captcha's own")
 }
