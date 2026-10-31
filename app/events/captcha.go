@@ -472,22 +472,16 @@ func (c *captcha) expire(p *pendingCaptcha) {
 func (c *captcha) muteForeverOrBan(user bot.User, reason string) {
 	err := c.muteForever(user)
 	if err == nil {
-		c.mu.Lock()
-		f := c.failures[user.ID] // normally the failure just recorded, created if it was pruned meanwhile
-		if f.count == 0 {
-			f.count, f.last = 1, time.Now()
-		}
-		f.forever = true
-		c.failures[user.ID] = f
-		c.mu.Unlock()
 		log.Printf("[INFO] %s muted for good, %s", user, reason)
 		return
 	}
-	if rerr := c.remove(user, max(c.cooldownLeft(user.ID), captchaCooldown), reason); rerr != nil {
-		log.Printf("[WARN] failed to mute %s for good, %s: %v; %v", user, reason, err, rerr)
+	d := max(c.cooldownLeft(user.ID), captchaCooldown)
+	if berr := banUserOrChannel(banRequest{tbAPI: c.tbAPI, userID: user.ID, chatID: c.chatID, duration: d,
+		userName: user.String()}); berr != nil {
+		log.Printf("[WARN] failed to mute %s for good, %s: %v, and to ban: %v", user, reason, err, berr)
 		return
 	}
-	log.Printf("[WARN] failed to mute %s for good, %s, banned for the cooldown instead: %v", user, reason, err)
+	log.Printf("[WARN] failed to mute %s for good, %s, banned for %v instead: %v", user, reason, d, err)
 }
 
 // mutedForGood reports whether the member's last, not forgotten failure muted them for good
@@ -663,19 +657,21 @@ func cooldownFor(failures int) time.Duration {
 // remove bans the member until the cooldown ends, telegram lifts the ban by itself then. if the ban fails
 // the member is muted for the cooldown instead, a failed captcha must not leave them free to post
 func (c *captcha) remove(user bot.User, d time.Duration, reason string) error {
-	// the join mute is replaced by the ban or the cooldown mute below, which must not read as the captcha's own
-	c.mu.Lock()
-	delete(c.muted, user.ID)
-	c.mu.Unlock()
 	err := banUserOrChannel(banRequest{tbAPI: c.tbAPI, userID: user.ID, chatID: c.chatID, duration: d,
 		userName: user.String()})
 	if err == nil {
 		log.Printf("[INFO] %s removed for %v, captcha %s", user, d.Round(time.Second), reason)
 		return nil
 	}
-	// not recorded as the captcha's own mute: on a rejoin it is kept like anybody's restriction, so leaving
-	// and rejoining can't trade it for the short join mute and a fresh challenge
-	if merr := c.restrict(user, time.Now().Add(max(d, time.Minute)).Unix()); merr != nil {
+	if c.timeoutMute {
+		// a timed mute would end with the member in the chat, unverified, and the mute mode has no rejoin
+		// cooldown to catch them; muted for good they read as restricted on a rejoin
+		if merr := c.muteForever(user); merr != nil {
+			return fmt.Errorf("failed to remove %s after captcha %s: %w, and to mute for good: %w", user, reason, err, merr)
+		}
+		return fmt.Errorf("failed to remove %s after captcha %s, muted for good instead: %w", user, reason, err)
+	}
+	if merr := c.mute(user, d); merr != nil {
 		return fmt.Errorf("failed to remove %s after captcha %s: %w, and to mute: %w", user, reason, err, merr)
 	}
 	return fmt.Errorf("failed to remove %s after captcha %s, muted for %v instead: %w", user, reason, d, err)
@@ -701,14 +697,20 @@ func (c *captcha) mute(user bot.User, d time.Duration) error {
 }
 
 // muteForever takes every permission from the member with no end. unlike mute it drops the member from muted,
-// so the restriction is never taken for the captcha's own and lifted by a later captcha; an admin lifts it
+// so the restriction is never taken for the captcha's own and lifted by a later captcha; an admin lifts it.
+// the member's failure record gets forever, read by verify when the status is unknown
 func (c *captcha) muteForever(user bot.User) error {
 	if err := c.restrict(user, 0); err != nil { // 0 is forever for telegram
 		return err
 	}
 	c.mu.Lock()
+	defer c.mu.Unlock()
 	delete(c.muted, user.ID)
-	c.mu.Unlock()
+	// marks the failure that led here; a record missing now was cleared by a solve, which leaves nothing to mark
+	if f, ok := c.failures[user.ID]; ok {
+		f.forever = true
+		c.failures[user.ID] = f
+	}
 	return nil
 }
 

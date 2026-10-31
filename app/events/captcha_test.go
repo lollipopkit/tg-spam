@@ -1272,7 +1272,7 @@ func TestCaptcha_TimeoutMute(t *testing.T) {
 		assert.Empty(t, api.SendCalls())
 	})
 
-	t.Run("cooldown mute from a refused ban survives a rejoin", func(t *testing.T) {
+	t.Run("refused ban after a wrong answer mutes for good", func(t *testing.T) {
 		api := newCaptchaAPI("member")
 		base := api.RequestFunc
 		api.RequestFunc = func(cfg tbapi.Chattable) (*tbapi.APIResponse, error) {
@@ -1285,8 +1285,9 @@ func TestCaptcha_TimeoutMute(t *testing.T) {
 		startPosted(t, c, bot.User{ID: 42})
 		data := fmt.Sprintf("C42:%s", wrongCode(pendingCode(t, c, 42)))
 		require.Error(t, c.HandleCallback(captchaQuery(42, 77, data)), "the refused ban is reported")
-		assert.InDelta(t, time.Now().Add(captchaCooldown).Unix(), lastRestrict(api).UntilDate, 2)
-		assert.False(t, c.isMutedByCaptcha(42), "not recorded as the join mute")
+		assert.Zero(t, lastRestrict(api).UntilDate, "a timed mute would end with the member unverified")
+		assert.True(t, c.mutedForGood(42))
+		assert.False(t, c.isMutedByCaptcha(42))
 
 		api.RequestFunc = func(cfg tbapi.Chattable) (*tbapi.APIResponse, error) {
 			if _, ok := cfg.(tbapi.GetChatMemberConfig); ok {
@@ -1296,15 +1297,8 @@ func TestCaptcha_TimeoutMute(t *testing.T) {
 		}
 		restricts := len(requestsOf[tbapi.RestrictChatMemberConfig](api))
 		startPosted(t, c, bot.User{ID: 42})
-		assert.Len(t, requestsOf[tbapi.RestrictChatMemberConfig](api), restricts, "the cooldown mute is kept")
+		assert.Len(t, requestsOf[tbapi.RestrictChatMemberConfig](api), restricts, "the permanent mute is kept")
 		assert.Len(t, api.SendCalls(), 1, "no fresh challenge")
-	})
-
-	t.Run("permanent mute is remembered even if its failure was pruned", func(t *testing.T) {
-		api := newCaptchaAPI("member")
-		c := newMuteCaptcha(api, time.Minute)
-		c.muteForeverOrBan(bot.User{ID: 42}, "captcha timeout")
-		assert.True(t, c.mutedForGood(42))
 	})
 
 	t.Run("a wrong answer still bans", func(t *testing.T) {
@@ -1316,13 +1310,21 @@ func TestCaptcha_TimeoutMute(t *testing.T) {
 	})
 }
 
-func TestCaptcha_CancelCountsOnlyPosted(t *testing.T) {
+func TestCaptcha_CancelBeforePostedIsNoFailure(t *testing.T) {
 	api := newCaptchaAPI("member")
 	c := newCaptcha(api, 123, time.Minute, testCaptchaMsg)
 	c.render = stubRender
 	defer c.Stop()
-	startPosted(t, c, bot.User{ID: 42})
-	c.Cancel(42)
-	assert.Equal(t, 1, failuresOf(c, 42), "leaving a posted challenge is a failure")
-	assert.Equal(t, []int{77}, deletedIDs(api))
+	base := api.RequestFunc
+	api.RequestFunc = func(cfg tbapi.Chattable) (*tbapi.APIResponse, error) {
+		if _, ok := cfg.(tbapi.GetChatMemberConfig); ok {
+			c.Cancel(42) // leaves while the status is read, before any challenge
+		}
+		return base(cfg)
+	}
+	c.Start(bot.User{ID: 42}, "")
+	c.running.Wait()
+	assert.Zero(t, failuresOf(c, 42), "no cooldown for a member who never saw a challenge")
+	assert.Empty(t, api.SendCalls())
+	assert.Empty(t, requestsOf[tbapi.BanChatMemberConfig](api))
 }
