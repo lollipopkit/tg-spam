@@ -1783,6 +1783,21 @@ func TestUpdateSettingsFromForm_CaptchaTimeoutAction(t *testing.T) {
 	assert.Equal(t, config.CaptchaTimeoutMute, s.Captcha.TimeoutAction, "preserved when the form omits it")
 }
 
+func TestUpdateSettingsFromForm_CaptchaOnly(t *testing.T) {
+	parse := func(form url.Values, s *config.Settings) {
+		req := httptest.NewRequest("PUT", "/config", strings.NewReader(form.Encode()))
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		require.NoError(t, req.ParseForm())
+		updateSettingsFromForm(s, req)
+	}
+	s := &config.Settings{}
+	parse(url.Values{"captchaEnabled": {"on"}, "captchaOnly": {"on"}}, s)
+	assert.True(t, s.Captcha.Only)
+
+	parse(url.Values{"captchaEnabled": {"on"}}, s)
+	assert.False(t, s.Captcha.Only, "an unchecked checkbox is absent from the form")
+}
+
 func TestUpdateSettingsFromForm_Warn_AbsentPreserves(t *testing.T) {
 	// warnThreshold (val != "" gate) and warnWindow (r.Form key gate) absent from form
 	// must preserve existing values so unrelated saves don't wipe state

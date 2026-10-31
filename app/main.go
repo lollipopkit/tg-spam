@@ -197,6 +197,7 @@ type options struct {
 		Message string        `long:"message" env:"MESSAGE" description:"captcha prompt, {user} and {timeout} are replaced, empty for the default of the mode"`
 		// TimeoutAction choices mirror config.CaptchaTimeoutBan / CaptchaTimeoutMute
 		TimeoutAction string `long:"timeout-action" env:"TIMEOUT_ACTION" choice:"ban" choice:"mute" default:"ban" description:"on timeout ban for the cooldown or mute for good, keeping the member in the chat"`
+		Only          bool   `long:"only" env:"ONLY" description:"captcha only, turn off the message, join and reaction spam checks"`
 
 		Turnstile struct {
 			SiteKey string `long:"site-key" env:"SITE_KEY" description:"Cloudflare Turnstile site key, switches the captcha to Turnstile"`
@@ -573,6 +574,7 @@ func execute(ctx context.Context, settings *config.Settings, reloadNormalize fun
 		CaptchaTimeout:          settings.Captcha.Timeout,
 		CaptchaMessage:          captchaMessage(settings.Captcha.Message),
 		CaptchaTimeoutMute:      settings.Captcha.TimeoutAction == config.CaptchaTimeoutMute,
+		CaptchaOnly:             settings.Captcha.Only,
 		CaptchaTurnstile: events.TurnstileConfig{SiteKey: settings.Captcha.Turnstile.SiteKey,
 			Secret: settings.Captcha.Turnstile.Secret, PublicURL: settings.Captcha.Turnstile.URL,
 			Listen: settings.Captcha.Turnstile.Listen, BotToken: settings.Telegram.Token},
@@ -813,6 +815,12 @@ func collectMaskedSecrets(appSettings *config.Settings) []string {
 // makeDetector creates spam detector with all checkers and updaters
 // it loads samples and dynamic files
 func makeDetector(settings *config.Settings) *tgspam.Detector {
+	if settings.Captcha.Only {
+		// the listener runs no checks, so no checker is built: an unused LLM, CAS or Lua setup can't fail startup.
+		// the detector still holds samples and approved users for superuser commands and the captcha
+		log.Printf("[INFO] captcha only, spam checkers not built")
+		return tgspam.NewDetector(tgspam.Config{MaxAllowedEmoji: -1, HTTPClient: &http.Client{Timeout: settings.CAS.Timeout}})
+	}
 	if settings.IsCASEnabled() && settings.CAS.Token == "" {
 		log.Printf("[WARN] CAS check disabled: CAS API requires a token, set --cas.token or CAS_TOKEN to your Combot API key")
 	}

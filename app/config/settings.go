@@ -247,6 +247,8 @@ type CaptchaSettings struct {
 	// TimeoutAction is CaptchaTimeoutBan (ban for the cooldown) or CaptchaTimeoutMute (mute for good, the member
 	// stays in the chat); empty means ban
 	TimeoutAction string `json:"timeout_action" yaml:"timeout_action" db:"captcha_timeout_action"`
+	// Only turns off the message, join and reaction spam checks, leaving the captcha as the only protection
+	Only bool `json:"only" yaml:"only" db:"captcha_only"`
 }
 
 // captcha timeout actions
@@ -383,6 +385,13 @@ func (s *Settings) Validate() error {
 	if s.Warn.Threshold > 0 && s.Warn.Window > storage.WarningsRetention {
 		return fmt.Errorf("warn.window (%v) exceeds storage retention (%v); older rows are pruned and would not be counted",
 			s.Warn.Window, storage.WarningsRetention)
+	}
+	if s.Captcha.Only && !s.Captcha.Enabled {
+		return fmt.Errorf("captcha.only needs captcha.enabled")
+	}
+	if s.Captcha.Only && (s.Training || s.Dry) {
+		// the captcha is off in these modes, captcha.only would leave the group with no protection at all
+		return fmt.Errorf("captcha.only can't be used with training or dry mode")
 	}
 	if s.Captcha.Enabled && (s.Captcha.Timeout < MinCaptchaTimeout || s.Captcha.Timeout > MaxCaptchaTimeout) {
 		return fmt.Errorf("captcha.timeout (%v) must be between %v and %v", s.Captcha.Timeout, MinCaptchaTimeout, MaxCaptchaTimeout)

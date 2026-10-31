@@ -574,9 +574,10 @@ func updateSettingsFromForm(settings *config.Settings, r *http.Request) {
 		}
 	}
 
-	// captcha. captchaEnabled is a rendered checkbox, so its absence means unchecked; the timeout and the
-	// message are gated on form key presence like warnWindow, so unrelated saves preserve them
+	// captcha. captchaEnabled and captchaOnly are rendered checkboxes, so their absence means unchecked; the
+	// timeout and the message are gated on form key presence like warnWindow, so unrelated saves preserve them
 	settings.Captcha.Enabled = r.FormValue("captchaEnabled") == "on"
+	settings.Captcha.Only = r.FormValue("captchaOnly") == "on"
 	if _, ok := r.Form["captchaTimeout"]; ok {
 		if d, err := time.ParseDuration(r.FormValue("captchaTimeout")); err == nil {
 			settings.Captcha.Timeout = d

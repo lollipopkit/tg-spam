@@ -104,6 +104,49 @@ func TestTelegramListener_Do(t *testing.T) {
 
 }
 
+func TestTelegramListener_DoCaptchaOnly(t *testing.T) {
+	mockAPI := &mocks.TbAPIMock{
+		GetChatFunc: func(config tbapi.ChatInfoConfig) (tbapi.ChatFullInfo, error) {
+			return tbapi.ChatFullInfo{Chat: tbapi.Chat{ID: 123}}, nil
+		},
+		SendFunc: func(c tbapi.Chattable) (tbapi.Message, error) { return tbapi.Message{}, nil },
+		GetChatAdministratorsFunc: func(config tbapi.ChatAdministratorsConfig) ([]tbapi.ChatMember, error) {
+			return []tbapi.ChatMember{}, nil
+		},
+	}
+	botMock := &mocks.BotMock{OnMessageFunc: func(msg bot.Message, checkOnly bool) bot.Response {
+		return bot.Response{Send: true, Text: "bot's answer", BanInterval: time.Hour}
+	}}
+	locator, teardown := prepTestLocator(t)
+	defer teardown()
+
+	l := TelegramListener{
+		SpamLogger:     &mocks.SpamLoggerMock{SaveFunc: func(msg *bot.Message, response *bot.Response) {}},
+		TbAPI:          mockAPI,
+		Bot:            botMock,
+		Group:          "gr",
+		Locator:        locator,
+		CaptchaEnabled: true,
+		CaptchaTimeout: time.Minute,
+		CaptchaOnly:    true,
+	}
+
+	updChan := make(chan tbapi.Update, 1)
+	updChan <- tbapi.Update{Message: &tbapi.Message{Chat: tbapi.Chat{ID: 123}, Text: "text 123", MessageID: 7,
+		From: &tbapi.User{ID: 42, UserName: "user"}, Date: time.Now().Unix()}}
+	close(updChan)
+	mockAPI.GetUpdatesChanFunc = func(config tbapi.UpdateConfig) tbapi.UpdatesChannel { return updChan }
+
+	err := l.Do(context.Background())
+	require.EqualError(t, err, "telegram update chan closed")
+	assert.Empty(t, botMock.OnMessageCalls(), "no spam check in captcha only mode")
+	assert.Empty(t, mockAPI.SendCalls())
+	assert.Empty(t, mockAPI.RequestCalls(), "nothing deleted or banned")
+	info, found := locator.Message(context.Background(), "text 123")
+	require.True(t, found, "messages are still stored for superuser commands")
+	assert.Equal(t, int64(42), info.UserID)
+}
+
 func TestTelegramListener_DoNilFrom(t *testing.T) {
 	mockLogger := &mocks.SpamLoggerMock{SaveFunc: func(msg *bot.Message, response *bot.Response) {}}
 	mockAPI := &mocks.TbAPIMock{
@@ -5513,6 +5556,20 @@ func TestProcReaction(t *testing.T) {
 		assert.Equal(t, "[reaction spam]", spamLoggerMock.SaveCalls()[0].Msg.Text)
 	})
 
+	t.Run("captcha only skips the reaction check", func(t *testing.T) {
+		mockAPI := makeAPI(t)
+		botMock := &mocks.BotMock{OnReactionFunc: func(userID int64, userName string) bot.Response {
+			return bot.Response{BanInterval: bot.PermanentBanDuration, User: bot.User{ID: 42}}
+		}}
+		l := TelegramListener{TbAPI: mockAPI, Bot: botMock, CaptchaOnly: true}
+		l.chatID = 123
+		err := l.procReaction(context.Background(), &tbapi.MessageReactionUpdated{Chat: tbapi.Chat{ID: 123},
+			User: &tbapi.User{ID: 42}, NewReaction: []tbapi.ReactionType{{Type: "emoji", Emoji: "👍"}}})
+		require.NoError(t, err)
+		assert.Empty(t, botMock.OnReactionCalls())
+		assert.Empty(t, mockAPI.RequestCalls(), "no ban")
+	})
+
 	t.Run("admin notification includes change-ban and info buttons", func(t *testing.T) {
 		mockAPI := makeAPI(t)
 		locatorMock := &mocks.LocatorMock{
@@ -5974,6 +6031,14 @@ func TestProcJoin(t *testing.T) {
 		assert.Equal(t, bot.User{ID: 2, DisplayName: "Anna", FirstName: "Anna"}, e.bot.OnJoinCalls()[1].User)
 		assert.Empty(t, e.api.RequestCalls(), "no ban for clean members")
 		assert.Empty(t, e.api.SendCalls(), "no notification for clean members")
+	})
+
+	t.Run("captcha only skips the join check", func(t *testing.T) {
+		e := setup(t, spamFor(1), func(l *TelegramListener) { l.CaptchaOnly = true })
+		require.NoError(t, e.l.procJoin(context.Background(), joinMsg(123, tbapi.User{ID: 1})))
+		assert.Empty(t, e.bot.OnJoinCalls())
+		assert.Empty(t, e.api.RequestCalls(), "no ban")
+		assert.Empty(t, e.logger.SaveCalls())
 	})
 
 	t.Run("join in another chat is not checked", func(t *testing.T) {

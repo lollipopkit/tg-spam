@@ -150,6 +150,7 @@ func optToSettings(opts options) *config.Settings {
 			Timeout:       opts.Captcha.Timeout,
 			Message:       opts.Captcha.Message,
 			TimeoutAction: opts.Captcha.TimeoutAction,
+			Only:          opts.Captcha.Only,
 			Turnstile: config.TurnstileSettings{
 				SiteKey: opts.Captcha.Turnstile.SiteKey,
 				URL:     opts.Captcha.Turnstile.URL,
