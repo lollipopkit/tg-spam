@@ -202,12 +202,12 @@ type options struct {
 		Turnstile struct {
 			SiteKey string `long:"site-key" env:"SITE_KEY" description:"Cloudflare Turnstile site key, switches the captcha to Turnstile"`
 			Secret  string `long:"secret" env:"SECRET" description:"Cloudflare Turnstile secret"`
-			URL     string `long:"url" env:"URL" description:"public https url the Turnstile page is reachable at"`
-			Listen  string `long:"listen" env:"LISTEN" default:"127.0.0.1:8081" description:"listen address of the Turnstile page"`
+			URL     string `long:"url" env:"URL" description:"public https url of the captcha pages (Turnstile, sign-in)"`
+			Listen  string `long:"listen" env:"LISTEN" default:"127.0.0.1:8081" description:"listen address of the captcha pages"`
 		} `group:"turnstile" namespace:"turnstile" env-namespace:"TURNSTILE"`
 
 		OIDC struct {
-			Issuer       string `long:"issuer" env:"ISSUER" description:"OIDC issuer url, members sign in there after Turnstile"`
+			Issuer       string `long:"issuer" env:"ISSUER" description:"OIDC issuer url, members sign in there on the captcha pages"`
 			ClientID     string `long:"client-id" env:"CLIENT_ID" description:"OIDC client id"`
 			ClientSecret string `long:"client-secret" env:"CLIENT_SECRET" description:"OIDC client secret"`
 		} `group:"oidc" namespace:"oidc" env-namespace:"OIDC"`

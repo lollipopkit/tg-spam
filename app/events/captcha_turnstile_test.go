@@ -519,6 +519,23 @@ func followSignIn(t *testing.T, rec *httptest.ResponseRecorder, idp *openidtest.
 	return idp.Authorize(t, html.UnescapeString(m[1]))
 }
 
+// newSignInOnlyCaptcha asks for the sign-in without Turnstile, with a posted captcha of member 42
+func newSignInOnlyCaptcha(t *testing.T) (c *captcha, api *mocks.TbAPIMock, idp *openidtest.Issuer, nonce string) {
+	t.Helper()
+	idp = openidtest.New(t, "tg-bot")
+	api = newCaptchaAPI("member")
+	c = newCaptcha(api, 123, time.Minute, "")
+	cfg := TurnstileConfig{PublicURL: "https://verify.example.com", Listen: ":0", BotToken: testBotToken,
+		OIDC: config.CaptchaOIDCSettings{Issuer: idp.Srv.URL, ClientID: "tg-bot", ClientSecret: "oidc-secret"}}
+	require.True(t, cfg.Pages())
+	require.NoError(t, c.WithTurnstile(cfg))
+	c.turnstile.idp.HTTP = idp.Srv.Client()
+	t.Cleanup(c.Stop)
+	c.Start(bot.User{ID: 42, DisplayName: "New"}, "zh-hans")
+	c.running.Wait()
+	return c, api, idp, postedNonce(t, c)
+}
+
 func doCallback(c *captcha, query string) *httptest.ResponseRecorder {
 	rec := httptest.NewRecorder()
 	c.turnstileRoutes().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, turnstileCallbackPath+"?"+query, http.NoBody))
@@ -623,6 +640,46 @@ func TestCaptcha_TurnstileOIDC(t *testing.T) {
 		assert.True(t, c.IsPending(42))
 	})
 
+	t.Run("sign-in only sends the member straight to the issuer", func(t *testing.T) {
+		c, api, idp, nonce := newSignInOnlyCaptcha(t)
+		msg, ok := api.SendCalls()[0].C.(tbapi.MessageConfig)
+		require.True(t, ok, "the login button is posted")
+		assert.Contains(t, msg.Text, "登录账号", "the sign-in prompt in the member's language")
+
+		page := doPage(c, http.MethodGet, nonce, "", nil, member42())
+		require.Equal(t, http.StatusFound, page.Code, page.Body.String())
+		assert.Equal(t, "no-store", page.Header().Get("Cache-Control"), "the location holds the sign-in state")
+		assert.Equal(t, "no-referrer", page.Header().Get("Referrer-Policy"))
+		q := idp.Authorize(t, page.Header().Get("Location"))
+		assert.True(t, strings.HasPrefix(q.Get("state"), nonce+"."))
+		again := doPage(c, http.MethodGet, nonce, "", nil, member42())
+		require.Equal(t, http.StatusFound, again.Code)
+		assert.Equal(t, page.Header().Get("Location"), again.Header().Get("Location"), "a reload keeps the sign-in")
+
+		assert.Equal(t, http.StatusForbidden, doPage(c, http.MethodGet, nonce, "", nil,
+			loginQuery(43, time.Now(), testBotToken)).Code, "only the member's own telegram login")
+		assert.Equal(t, http.StatusMethodNotAllowed, doPage(c, http.MethodPost, nonce, "good", nil, member42()).Code,
+			"no turnstile form")
+
+		rec := doCallback(c, "code="+openidtest.GoodCode+"&state="+url.QueryEscape(q.Get("state")))
+		assert.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+		assert.False(t, c.IsPending(42))
+		assertLifted(t, api, 42)
+	})
+
+	t.Run("sign-in only with the issuer down offers a retry", func(t *testing.T) {
+		c, _, idp, nonce := newSignInOnlyCaptcha(t)
+		idp.Srv.Close()
+		page := doPage(c, http.MethodGet, nonce, "", nil, member42())
+		assert.Equal(t, http.StatusBadGateway, page.Code)
+		m := signInLink.FindStringSubmatch(page.Body.String())
+		require.Len(t, m, 2, page.Body.String())
+		retry := html.UnescapeString(m[1])
+		assert.True(t, strings.HasPrefix(retry, "/v/"+nonce+"?"), retry)
+		assert.Contains(t, retry, "hash=", "back to the page with its telegram login")
+		assert.True(t, c.IsPending(42))
+	})
+
 	t.Run("callback route exists only with a sign-in", func(t *testing.T) {
 		c, _, _ := newTurnstileCaptcha(t, time.Minute, "verify.example.com")
 		assert.Equal(t, http.StatusNotFound, doCallback(c, "code=x&state=y").Code)
@@ -633,9 +690,13 @@ func TestCaptcha_TurnstileOIDC(t *testing.T) {
 		cfg := TurnstileConfig{SiteKey: "k", Secret: "s", PublicURL: "https://v.example.com", Listen: ":8081",
 			BotToken: testBotToken, OIDC: config.CaptchaOIDCSettings{Issuer: "https://auth.example.com", ClientID: "c"}}
 		require.ErrorContains(t, c.WithTurnstile(cfg), "client secret")
+		assert.Nil(t, c.turnstile, "a failed setup leaves the captcha untouched")
 		require.ErrorContains(t, c.WithTurnstile(TurnstileConfig{SiteKey: "k", Secret: "s",
 			PublicURL: "https://v.example.com", Listen: ":8081", BotToken: testBotToken,
 			OIDC: config.CaptchaOIDCSettings{ClientID: "c", ClientSecret: "s"}}), "without captcha.oidc.issuer")
+		require.ErrorContains(t, c.WithTurnstile(TurnstileConfig{PublicURL: "https://v.example.com", Listen: ":8081",
+			BotToken: testBotToken}), "needs a site key, or captcha.oidc")
+		assert.False(t, TurnstileConfig{}.Pages())
 		cfg.OIDC.ClientSecret = "s"
 		require.NoError(t, c.WithTurnstile(cfg))
 		assert.Empty(t, c.turnstile.cfg.OIDC.ClientSecret, "kept by the oidc client only")

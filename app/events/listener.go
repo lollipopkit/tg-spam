@@ -76,7 +76,7 @@ type TelegramListener struct {
 	CaptchaTimeoutMute      bool            // on timeout mute the member for good instead of banning for the cooldown
 	CaptchaOnly             bool            // skip the message, join and reaction spam checks, the captcha is the only protection
 	CaptchaMessage          string          // captcha prompt with {user} and {timeout} placeholders, empty for the default
-	CaptchaTurnstile        TurnstileConfig // Turnstile instead of the motion animation, when its site key is set
+	CaptchaTurnstile        TurnstileConfig // challenge pages instead of the animation, when Pages() reports any
 
 	adminHandler    *admin
 	reportsHandler  *userReports
@@ -196,7 +196,7 @@ func (l *TelegramListener) Do(ctx context.Context) error {
 			l.captcha = newCaptcha(l.TbAPI, l.chatID, l.CaptchaTimeout, l.CaptchaMessage)
 			l.captcha.timeoutMute = l.CaptchaTimeoutMute
 			defer l.captcha.Stop()
-			if l.CaptchaTurnstile.SiteKey != "" {
+			if l.CaptchaTurnstile.Pages() {
 				if err := l.captcha.WithTurnstile(l.CaptchaTurnstile); err != nil {
 					return fmt.Errorf("turnstile captcha: %w", err)
 				}
