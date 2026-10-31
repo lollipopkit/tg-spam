@@ -1834,9 +1834,9 @@ func TestOIDCSettingsFromOptions(t *testing.T) {
 	opts.Server.OIDC.ClientID = "tg-spam"
 	opts.Server.OIDC.ClientSecret = "oidc-cs-7f3a"
 	opts.Server.OIDC.URL = "https://tg.example.com"
-	opts.Server.OIDC.Allow = []string{"role:admin"}
+	opts.Server.OIDC.Allow = []string{"role:admin", " ", " email:a@example.com "}
 	want := config.OIDCSettings{Issuer: "https://auth.example.com", ClientID: "tg-spam", ClientSecret: "oidc-cs-7f3a",
-		URL: "https://tg.example.com", Allow: []string{"role:admin"}}
+		URL: "https://tg.example.com", Allow: []string{"role:admin", "email:a@example.com"}}
 	assert.Equal(t, want, optToSettings(opts).Transient.OIDC)
 
 	blob, err := json.Marshal(optToSettings(opts))

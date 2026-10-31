@@ -3,9 +3,7 @@ package webapi
 import (
 	"cmp"
 	"context"
-	"crypto/hmac"
 	"crypto/rand"
-	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/base64"
 	"encoding/json"
@@ -22,6 +20,7 @@ import (
 
 	"github.com/coreos/go-oidc/v3/oidc"
 	"golang.org/x/oauth2"
+	"lukechampine.com/blake3"
 
 	"github.com/umputun/tg-spam/app/config"
 )
@@ -36,6 +35,7 @@ const (
 	oidcLoginPath     = "/auth/login"
 	oidcCallbackPath  = "/auth/callback"
 	oidcLogoutPath    = "/logout"
+	oidcLoggedOutPath = "/auth/logged-out"
 	oidcRetryAfter    = 5 * time.Second // a failed discovery is not retried sooner
 	// oidcWriteTimeout covers the provider round trips of a login (discovery, code exchange, jwks), longer
 	// than the server's write timeout
@@ -75,7 +75,6 @@ type oidcProvider struct {
 type oidcSession struct {
 	ID      string `json:"i"`
 	Sub     string `json:"s"`
-	Name    string `json:"n"`
 	Expires int64  `json:"e"`
 }
 
@@ -159,7 +158,9 @@ func (a *oidcAuth) discover(ctx context.Context) (*oidcProvider, error) {
 	if p, err, ok := a.known(); ok { // fetched or failed while this request waited
 		return p, err
 	}
-	p, err := a.fetchProvider(ctx)
+	// detached from the request: a client that goes away must not fail, and cache the failure of, the fetch
+	// other requests wait on. a.client carries the timeout
+	p, err := a.fetchProvider(context.WithoutCancel(ctx))
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if err != nil {
@@ -217,6 +218,9 @@ func (a *oidcAuth) fetchProvider(ctx context.Context) (*oidcProvider, error) {
 // page load, or refused with 401 otherwise. It is not installed on the login routes, see Server.Run.
 func (a *oidcAuth) middleware(h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if a.redirectToPublicHost(w, r) {
+			return
+		}
 		if _, ok := a.session(r); ok {
 			h.ServeHTTP(w, r)
 			return
@@ -243,6 +247,9 @@ func (a *oidcAuth) middleware(h http.Handler) http.Handler {
 // named after the state, so logins started in several tabs don't overwrite each other. Abandoned logins
 // would pile up such cookies until the request headers grow too big, so only the newest few are kept.
 func (a *oidcAuth) loginHandler(w http.ResponseWriter, r *http.Request) {
+	if a.redirectToPublicHost(w, r) {
+		return
+	}
 	extendWriteDeadline(w)
 	p, err := a.discover(r.Context())
 	if err != nil {
@@ -318,25 +325,24 @@ func (a *oidcAuth) callbackHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "login failed", http.StatusForbidden)
 		return
 	}
+	if claims.Sub == "" {
+		http.Error(w, "login failed: no subject", http.StatusForbidden)
+		return
+	}
 	if !a.allowed(claims) {
 		log.Printf("[WARN] oidc login refused for sub=%s email=%s", claims.Sub, claims.Email)
 		http.Error(w, "account not allowed", http.StatusForbidden)
 		return
 	}
 
-	name := cmp.Or(claims.Username, claims.Email, claims.Sub)
-	if claims.Sub == "" {
-		http.Error(w, "login failed: no subject", http.StatusForbidden)
-		return
-	}
-	value, err := a.sign(purposeSession, oidcSession{ID: rand.Text(), Sub: claims.Sub, Name: name,
+	value, err := a.sign(purposeSession, oidcSession{ID: rand.Text(), Sub: claims.Sub,
 		Expires: time.Now().Add(oidcSessionTTL).Unix()})
 	if err != nil {
 		http.Error(w, "can't create session", http.StatusInternalServerError)
 		return
 	}
 	setCookie(w, oidcSessionCookie, value, "/", oidcSessionTTL)
-	log.Printf("[INFO] oidc login: %s (sub=%s)", name, claims.Sub)
+	log.Printf("[INFO] oidc login: %s (sub=%s)", cmp.Or(claims.Username, claims.Email, claims.Sub), claims.Sub)
 	http.Redirect(w, r, st.Return, http.StatusFound)
 }
 
@@ -349,9 +355,11 @@ func (a *oidcAuth) logoutHandler(w http.ResponseWriter, r *http.Request) {
 		a.revoke(s)
 	}
 	setCookie(w, oidcSessionCookie, "", "/", 0)
-	target := "/"
+	// without the provider's logout the next request would sign straight back in, so a provider without
+	// one gets a local page that does not trigger a login
+	target := oidcLoggedOutPath
 	if p, err := a.discover(r.Context()); err == nil && p.endSession != "" {
-		target = p.endSession
+		target = p.endSession + sep(p.endSession) + url.Values{"client_id": {a.cfg.ClientID}}.Encode()
 	}
 	if r.Header.Get("HX-Request") == "true" {
 		w.Header().Set("HX-Redirect", target)
@@ -359,6 +367,34 @@ func (a *oidcAuth) logoutHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	http.Redirect(w, r, target, http.StatusSeeOther)
+}
+
+// logoutPageHandler answers GET /logout, left in bookmarks and pages cached from before logout was a POST,
+// with a page that posts it; logging out on a GET would let any site sign the admin out
+func (a *oidcAuth) logoutPageHandler(w http.ResponseWriter, _ *http.Request) {
+	writeOIDCPage(w, "Sign out of tg-spam?", `<form method="post" action="`+oidcLogoutPath+`"><button>Sign out</button></form>`)
+}
+
+// loggedOutHandler is where logout ends when the provider has no logout endpoint
+func (a *oidcAuth) loggedOutHandler(w http.ResponseWriter, _ *http.Request) {
+	writeOIDCPage(w, "Signed out of tg-spam.", `<a href="/">Sign in again</a>`)
+}
+
+// redirectToPublicHost sends a request for another host (a tailnet address, another proxy name) to the
+// public url: the login cookies are host-bound and the provider calls back on the public url only
+func (a *oidcAuth) redirectToPublicHost(w http.ResponseWriter, r *http.Request) bool {
+	public, err := url.Parse(a.cfg.URL)
+	if err != nil || strings.EqualFold(r.Host, public.Host) {
+		return false
+	}
+	target := strings.TrimSuffix(a.cfg.URL, "/") + r.URL.RequestURI()
+	if r.Method == http.MethodGet {
+		// the host comes from the configured public url; the request part can only add a path to it
+		http.Redirect(w, r, target, http.StatusFound) //nolint:gosec // not an open redirect, see above
+		return true
+	}
+	http.Error(w, "use "+public.Host, http.StatusMisdirectedRequest)
+	return true
 }
 
 // allowed matches the id token claims against the allow list; email entries need a verified email
@@ -444,7 +480,7 @@ func (a *oidcAuth) dropOldStates(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// sign encodes v as base64url(json) "." base64url(hmac-sha256 over purpose and payload)
+// sign encodes v as base64url(json) "." base64url(mac over purpose and payload)
 func (a *oidcAuth) sign(purpose string, v any) (string, error) {
 	payload, err := json.Marshal(v)
 	if err != nil {
@@ -461,7 +497,7 @@ func (a *oidcAuth) verify(purpose, value string, v any) bool {
 		return false
 	}
 	got, err := base64.RawURLEncoding.DecodeString(sig)
-	if err != nil || !hmac.Equal(got, a.mac(purpose, p)) {
+	if err != nil || subtle.ConstantTimeCompare(got, a.mac(purpose, p)) != 1 {
 		return false
 	}
 	payload, err := base64.RawURLEncoding.DecodeString(p)
@@ -471,11 +507,12 @@ func (a *oidcAuth) verify(purpose, value string, v any) bool {
 	return json.Unmarshal(payload, v) == nil
 }
 
+// mac is a keyed blake3 hash of purpose, a zero byte and payload
 func (a *oidcAuth) mac(purpose, payload string) []byte {
-	m := hmac.New(sha256.New, a.key)
-	m.Write([]byte(purpose))
-	m.Write([]byte{0})
-	m.Write([]byte(payload))
+	m := blake3.New(32, a.key)
+	_, _ = m.Write([]byte(purpose))
+	_, _ = m.Write([]byte{0})
+	_, _ = m.Write([]byte(payload))
 	return m.Sum(nil)
 }
 
@@ -515,4 +552,20 @@ func localPath(p string) string {
 		clean += "?" + u.RawQuery
 	}
 	return clean
+}
+
+// sep returns the separator for appending a query to u
+func sep(u string) string {
+	if strings.Contains(u, "?") {
+		return "&"
+	}
+	return "?"
+}
+
+// writeOIDCPage writes a minimal html page; title and body are fixed strings, never user input
+func writeOIDCPage(w http.ResponseWriter, title, body string) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Content-Security-Policy", "default-src 'none'; form-action 'self'; frame-ancestors 'none'")
+	w.Header().Set("Cache-Control", "no-store")
+	_, _ = fmt.Fprintf(w, "<!doctype html><title>tg-spam</title><p>%s</p>%s\n", title, body)
 }

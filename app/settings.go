@@ -7,6 +7,7 @@ import (
 	"reflect"
 	"slices"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/umputun/tg-spam/app/config"
@@ -644,6 +645,17 @@ func oidcSettings(opts options) config.OIDCSettings {
 		ClientID:     opts.Server.OIDC.ClientID,
 		ClientSecret: opts.Server.OIDC.ClientSecret,
 		URL:          opts.Server.OIDC.URL,
-		Allow:        opts.Server.OIDC.Allow,
+		Allow:        oidcAllow(opts.Server.OIDC.Allow),
 	}
+}
+
+// oidcAllow trims the allow list entries and drops empty ones, as "a, b" is a natural way to write the env var
+func oidcAllow(entries []string) []string {
+	var res []string
+	for _, e := range entries {
+		if e = strings.TrimSpace(e); e != "" {
+			res = append(res, e)
+		}
+	}
+	return res
 }

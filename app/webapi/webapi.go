@@ -179,6 +179,8 @@ func (s *Server) Run(ctx context.Context) error {
 			login.HandleFunc("GET "+oidcLoginPath, auth.loginHandler)
 			login.HandleFunc("GET "+oidcCallbackPath, auth.callbackHandler)
 			login.HandleFunc("POST "+oidcLogoutPath, auth.logoutHandler)
+			login.HandleFunc("GET "+oidcLogoutPath, auth.logoutPageHandler)
+			login.HandleFunc("GET "+oidcLoggedOutPath, auth.loggedOutHandler)
 		})
 		protected = router.Group()
 		protected.Use(auth.middleware)
@@ -189,8 +191,10 @@ func (s *Server) Run(ctx context.Context) error {
 		// AppSettings hash is empty so a DB that lost the hash can't silently unlock the API.
 		log.Printf("[INFO] basic auth enabled for webapi server (user: %s)", s.activeAuthUser())
 		router.Use(s.basicAuthMiddleware)
+		router.Route(s.basicLogoutRoutes)
 	default:
 		log.Printf("[WARN] basic auth disabled, access to webapi is not protected")
+		router.Route(s.basicLogoutRoutes)
 	}
 
 	s.routes(protected) // setup routes
@@ -342,18 +346,6 @@ func (s *Server) routes(router *routegroup.Bundle) *routegroup.Bundle {
 			})
 		}
 
-		if s.oidc == nil { // the oidc logout is registered by Run, outside the guarded group
-			// handle logout - force Basic Auth re-authentication; the navbar posts it
-			basicLogout := func(w http.ResponseWriter, _ *http.Request) {
-				w.Header().Set("WWW-Authenticate", `Basic realm="tg-spam"`)
-				w.WriteHeader(http.StatusUnauthorized)
-				fmt.Fprintln(w, "Logged out successfully")
-			}
-			webUI.HandleFunc("POST /logout", basicLogout)
-			// TODO: remove GET once bookmarks and old pages linking GET /logout are gone; the navbar posts
-			webUI.HandleFunc("GET /logout", basicLogout)
-		}
-
 		// serve only specific static files at root level
 		staticFiles := newStaticFS(templateFS,
 			staticFileMapping{urlPath: "styles.css", filesysPath: "assets/styles.css"},
@@ -364,6 +356,18 @@ func (s *Server) routes(router *routegroup.Bundle) *routegroup.Bundle {
 	})
 
 	return router
+}
+
+// basicLogoutRoutes registers the logout of basic auth: it forces the browser to re-authenticate
+func (s *Server) basicLogoutRoutes(r *routegroup.Bundle) {
+	logout := func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("WWW-Authenticate", `Basic realm="tg-spam"`)
+		w.WriteHeader(http.StatusUnauthorized)
+		fmt.Fprintln(w, "Logged out successfully")
+	}
+	r.HandleFunc("POST /logout", logout) // the navbar posts it
+	// TODO: remove GET once bookmarks and pages cached from before the navbar posted logout are gone
+	r.HandleFunc("GET /logout", logout)
 }
 
 // checkMsgHandler handles POST /check request.

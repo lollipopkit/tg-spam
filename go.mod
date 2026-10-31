@@ -9,6 +9,7 @@ require (
 	github.com/fatih/color v1.18.0
 	github.com/forPelevin/gomoji v1.4.1
 	github.com/fsnotify/fsnotify v1.9.0
+	github.com/go-jose/go-jose/v4 v4.1.4
 	github.com/go-pkgz/expirable-cache/v3 v3.1.0
 	github.com/go-pkgz/fileutils v0.4.0
 	github.com/go-pkgz/lgr v0.12.1
@@ -30,6 +31,7 @@ require (
 	google.golang.org/genai v1.52.1
 	gopkg.in/natefinch/lumberjack.v2 v2.2.1
 	gopkg.in/yaml.v3 v3.0.1
+	lukechampine.com/blake3 v1.4.1
 	modernc.org/sqlite v1.42.2
 )
 
@@ -74,7 +76,6 @@ require (
 	github.com/dustin/go-humanize v1.0.1 // indirect
 	github.com/ebitengine/purego v0.10.0 // indirect
 	github.com/felixge/httpsnoop v1.0.4 // indirect
-	github.com/go-jose/go-jose/v4 v4.1.4 // indirect
 	github.com/go-logr/logr v1.4.3 // indirect
 	github.com/go-logr/stdr v1.2.2 // indirect
 	github.com/go-ole/go-ole v1.3.0 // indirect
@@ -89,6 +90,7 @@ require (
 	github.com/hashicorp/errwrap v1.1.0 // indirect
 	github.com/jlaffaye/ftp v0.2.0 // indirect
 	github.com/klauspost/compress v1.18.7 // indirect
+	github.com/klauspost/cpuid/v2 v2.0.9 // indirect
 	github.com/kr/fs v0.1.0 // indirect
 	github.com/lufia/plan9stats v0.0.0-20260330125221-c963978e514e // indirect
 	github.com/magiconair/properties v1.8.10 // indirect

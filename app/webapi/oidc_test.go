@@ -36,6 +36,7 @@ type fakeIssuer struct {
 	challenge string         // code_challenge of the last authorize request
 	nonce     string         // nonce put into the id token, defaults to the one from the authorize request
 	claims    map[string]any // extra id token claims
+	noLogout  bool           // discovery without end_session_endpoint
 }
 
 func newFakeIssuer(t *testing.T) *fakeIssuer {
@@ -45,14 +46,18 @@ func newFakeIssuer(t *testing.T) *fakeIssuer {
 	f := &fakeIssuer{key: key}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /.well-known/openid-configuration", func(w http.ResponseWriter, _ *http.Request) {
-		_ = json.NewEncoder(w).Encode(map[string]any{
+		meta := map[string]any{
 			"issuer":                                f.srv.URL,
 			"authorization_endpoint":                f.srv.URL + "/authorize",
 			"token_endpoint":                        f.srv.URL + "/token",
 			"jwks_uri":                              f.srv.URL + "/jwks",
 			"end_session_endpoint":                  f.srv.URL + "/logout",
 			"id_token_signing_alg_values_supported": []string{"RS256"},
-		})
+		}
+		if f.noLogout {
+			delete(meta, "end_session_endpoint")
+		}
+		_ = json.NewEncoder(w).Encode(meta)
 	})
 	mux.HandleFunc("GET /jwks", func(w http.ResponseWriter, _ *http.Request) {
 		_ = json.NewEncoder(w).Encode(jose.JSONWebKeySet{Keys: []jose.JSONWebKey{
@@ -100,7 +105,7 @@ func (f *fakeIssuer) sign(t *testing.T, claims map[string]any) string {
 func newTestOIDC(t *testing.T, f *fakeIssuer, allow ...string) (*oidcAuth, http.Handler) {
 	t.Helper()
 	a, err := newOIDCAuth(config.OIDCSettings{Issuer: f.srv.URL, ClientID: "tg-spam", ClientSecret: "secret",
-		URL: "https://tg.example.com", Allow: allow})
+		URL: "https://example.com", Allow: allow})
 	require.NoError(t, err)
 	a.client = f.srv.Client()
 	// same layout as Server.Run: login routes outside the guarded handler, everything else inside
@@ -110,6 +115,8 @@ func newTestOIDC(t *testing.T, f *fakeIssuer, allow ...string) (*oidcAuth, http.
 	mux.HandleFunc("GET "+oidcLoginPath, a.loginHandler)
 	mux.HandleFunc("GET "+oidcCallbackPath, a.callbackHandler)
 	mux.HandleFunc("POST "+oidcLogoutPath, a.logoutHandler)
+	mux.HandleFunc("GET "+oidcLogoutPath, a.logoutPageHandler)
+	mux.HandleFunc("GET "+oidcLoggedOutPath, a.loggedOutHandler)
 	mux.Handle("/", a.middleware(guarded))
 	return a, mux
 }
@@ -125,7 +132,7 @@ func login(t *testing.T, f *fakeIssuer, h http.Handler, rd string) (*http.Cookie
 	q := loc.Query()
 	assert.Equal(t, f.srv.URL+"/authorize", loc.Scheme+"://"+loc.Host+loc.Path)
 	assert.Equal(t, "S256", q.Get("code_challenge_method"))
-	assert.Equal(t, "https://tg.example.com/auth/callback", q.Get("redirect_uri"))
+	assert.Equal(t, "https://example.com/auth/callback", q.Get("redirect_uri"))
 	f.mu.Lock()
 	f.challenge, f.nonce = q.Get("code_challenge"), q.Get("nonce")
 	f.mu.Unlock()
@@ -169,7 +176,7 @@ func TestOIDC_Middleware(t *testing.T) {
 		rec := httptest.NewRecorder()
 		req := httptest.NewRequest(http.MethodGet, "/dm-users", http.NoBody)
 		req.Header.Set("HX-Request", "true")
-		req.Header.Set("HX-Current-URL", "https://tg.example.com/list_settings?tab=1")
+		req.Header.Set("HX-Current-URL", "https://example.com/list_settings?tab=1")
 		h.ServeHTTP(rec, req)
 		assert.Equal(t, http.StatusUnauthorized, rec.Code)
 		assert.Equal(t, "/auth/login?rd=%2Flist_settings%3Ftab%3D1", rec.Header().Get("HX-Redirect"))
@@ -181,6 +188,21 @@ func TestOIDC_Middleware(t *testing.T) {
 		h.ServeHTTP(rec, req)
 		assert.Equal(t, http.StatusUnauthorized, rec.Code)
 		assert.Equal(t, "/auth/login", rec.Header().Get("HX-Redirect"))
+	})
+	t.Run("another host is sent to the public url", func(t *testing.T) {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "http://100.64.0.1:8080/manage_users?x=1", http.NoBody)
+		h.ServeHTTP(rec, req)
+		assert.Equal(t, http.StatusFound, rec.Code)
+		assert.Equal(t, "https://example.com/manage_users?x=1", rec.Header().Get("Location"))
+
+		rec = httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "http://100.64.0.1:8080"+oidcLoginPath, http.NoBody))
+		assert.Equal(t, "https://example.com"+oidcLoginPath, rec.Header().Get("Location"), "login too")
+
+		rec = httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "http://100.64.0.1:8080/check", http.NoBody))
+		assert.Equal(t, http.StatusMisdirectedRequest, rec.Code)
 	})
 	t.Run("post is refused", func(t *testing.T) {
 		rec := httptest.NewRecorder()
@@ -386,7 +408,7 @@ func TestOIDC_Logout(t *testing.T) {
 		rec := httptest.NewRecorder()
 		h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/logout", http.NoBody))
 		assert.Equal(t, http.StatusSeeOther, rec.Code)
-		assert.Equal(t, f.srv.URL+"/logout", rec.Header().Get("Location"))
+		assert.Equal(t, f.srv.URL+"/logout?client_id=tg-spam", rec.Header().Get("Location"))
 		checkCleared(rec)
 	})
 	t.Run("logout revokes the session", func(t *testing.T) {
@@ -413,13 +435,33 @@ func TestOIDC_Logout(t *testing.T) {
 		req.Header.Set("HX-Request", "true")
 		h.ServeHTTP(rec, req)
 		assert.Equal(t, http.StatusNoContent, rec.Code)
-		assert.Equal(t, f.srv.URL+"/logout", rec.Header().Get("HX-Redirect"))
+		assert.Equal(t, f.srv.URL+"/logout?client_id=tg-spam", rec.Header().Get("HX-Redirect"))
 		assert.Empty(t, rec.Header().Get("Location"))
 		checkCleared(rec)
 	})
+	t.Run("provider without logout endpoint ends on a local page", func(t *testing.T) {
+		nf := newFakeIssuer(t)
+		nf.noLogout = true
+		_, nh := newTestOIDC(t, nf, "role:admin")
+		rec := httptest.NewRecorder()
+		nh.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/logout", http.NoBody))
+		assert.Equal(t, http.StatusSeeOther, rec.Code)
+		assert.Equal(t, oidcLoggedOutPath, rec.Header().Get("Location"))
+		rec = httptest.NewRecorder()
+		nh.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, oidcLoggedOutPath, http.NoBody))
+		assert.Equal(t, http.StatusOK, rec.Code, "the page must not trigger a login")
+		assert.Contains(t, rec.Body.String(), "Signed out")
+	})
+	t.Run("get shows a page that posts the logout", func(t *testing.T) {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/logout", http.NoBody))
+		assert.Equal(t, http.StatusOK, rec.Code)
+		assert.Contains(t, rec.Body.String(), `<form method="post" action="/logout">`)
+		assert.Empty(t, rec.Result().Cookies(), "a get does not log out")
+	})
 	t.Run("other methods and encoded paths stay behind the login", func(t *testing.T) {
 		for _, req := range []*http.Request{
-			httptest.NewRequest(http.MethodGet, "/logout", http.NoBody),
+			httptest.NewRequest(http.MethodPut, "/logout", http.NoBody),
 			httptest.NewRequest(http.MethodPost, oidcLoginPath, http.NoBody),
 			httptest.NewRequest(http.MethodPost, oidcCallbackPath, http.NoBody),
 			httptest.NewRequest(http.MethodGet, "/auth%2Flogin", http.NoBody),
@@ -475,6 +517,7 @@ func TestServer_RunOIDC(t *testing.T) {
 		SpamFilter: &mocks.SpamFilterMock{}, AuthHash: hash,
 		OIDC: config.OIDCSettings{Issuer: "https://auth.example.invalid", ClientID: "tg-spam", ClientSecret: "s",
 			URL: "https://tg.example.com", Allow: []string{"role:admin"}}})
+	// requests carry the public host, as they do behind the proxy
 	done := make(chan struct{})
 	go func() {
 		assert.NoError(t, srv.Run(ctx))
@@ -484,6 +527,7 @@ func TestServer_RunOIDC(t *testing.T) {
 	do := func(method, target string, basicAuth bool) *http.Response {
 		req, err := http.NewRequest(method, "http://localhost:9881"+target, http.NoBody)
 		require.NoError(t, err)
+		req.Host = "tg.example.com"
 		if basicAuth {
 			req.SetBasicAuth("tg-spam", "test")
 		}
@@ -501,7 +545,7 @@ func TestServer_RunOIDC(t *testing.T) {
 		return resp.StatusCode == http.StatusOK
 	}, 2*time.Second, 50*time.Millisecond, "server did not start")
 
-	for _, target := range []string{"/", "/manage_users", "/styles.css", "/logout", "/settings"} {
+	for _, target := range []string{"/", "/manage_users", "/styles.css", "/settings", "/auth%2Flogin"} {
 		resp := do(http.MethodGet, target, false)
 		assert.Equal(t, http.StatusFound, resp.StatusCode, target)
 		assert.True(t, strings.HasPrefix(resp.Header.Get("Location"), oidcLoginPath+"?rd="), target)
@@ -511,7 +555,8 @@ func TestServer_RunOIDC(t *testing.T) {
 
 	resp := do(http.MethodPost, "/logout", false)
 	assert.Equal(t, http.StatusSeeOther, resp.StatusCode)
-	assert.Equal(t, "/", resp.Header.Get("Location"), "falls back to / without discovery")
+	assert.Equal(t, oidcLoggedOutPath, resp.Header.Get("Location"), "falls back to the local page without discovery")
+	assert.Equal(t, http.StatusOK, do(http.MethodGet, "/logout", false).StatusCode, "logout confirmation page")
 
 	cancel()
 	<-done
