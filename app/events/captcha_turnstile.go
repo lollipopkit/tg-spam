@@ -278,7 +278,7 @@ func (c *captcha) pageCaptcha(w http.ResponseWriter, r *http.Request) (p *pendin
 	}
 	userID, err := c.turnstile.telegramLogin(r.URL.Query())
 	if err != nil {
-		log.Printf("[DEBUG] turnstile page for %s without valid telegram login: %v", p.user, err)
+		log.Printf("[INFO] captcha page for %s opened without valid telegram login: %v", p.user, err)
 		c.renderPage(w, r, http.StatusForbidden, lang, captchaText(lang, txtPageLogin), false)
 		return nil, lang
 	}
