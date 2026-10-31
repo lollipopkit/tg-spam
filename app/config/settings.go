@@ -417,15 +417,15 @@ func (s *Settings) Validate() error {
 			return fmt.Errorf("captcha.timeout-action (%q) must be %q or %q", s.Captcha.TimeoutAction,
 				CaptchaTimeoutBan, CaptchaTimeoutMute)
 		}
-		if err := validateTurnstile(s.Captcha.Turnstile); err != nil {
+		if err := validateTurnstile(s.Captcha.Turnstile, s.Transient.CaptchaOIDC.Issuer != ""); err != nil {
 			return err
 		}
 	}
 	if err := ValidateOIDC(s.Transient.OIDC); err != nil {
 		return err
 	}
-	if s.Transient.CaptchaOIDC.Issuer != "" && (!s.Captcha.Enabled || s.Captcha.Turnstile.SiteKey == "") {
-		return fmt.Errorf("captcha.oidc needs the captcha enabled in turnstile mode, drop --captcha.oidc.* to change that")
+	if s.Transient.CaptchaOIDC.Issuer != "" && !s.Captcha.Enabled {
+		return fmt.Errorf("captcha.oidc needs the captcha enabled, drop --captcha.oidc.* to change that")
 	}
 	if err := ValidateCaptchaOIDC(s.Transient.CaptchaOIDC); err != nil {
 		return err
@@ -553,21 +553,28 @@ func validateCaptchaMessage(msg string) error {
 	return nil
 }
 
-// validateTurnstile checks the Turnstile settings when a site key selects that mode, the same checks the
-// listener makes when it starts, so a config accepted here also starts
-func validateTurnstile(t TurnstileSettings) error {
-	if t.SiteKey == "" {
+// validateTurnstile checks the page settings when a site key or the captcha sign-in (signIn) asks for pages,
+// the same checks the listener makes when it starts, so a config accepted here also starts
+func validateTurnstile(t TurnstileSettings, signIn bool) error {
+	if t.SiteKey == "" && !signIn {
 		return nil
 	}
-	return ValidateTurnstile(t.SiteKey, t.Secret, t.URL, t.Listen)
+	return ValidateTurnstile(t.SiteKey, t.Secret, t.URL, t.Listen, signIn)
 }
 
-// ValidateTurnstile checks the Turnstile settings, shared by Settings.Validate and the listener start: a site
-// key, a secret, a listen address, and an https url of a bare host, no path beyond "/", no query, no
-// fragment, since the pages are served at /v/<nonce> from the root and the host is what siteverify reports
-func ValidateTurnstile(siteKey, secret, publicURL, listen string) error {
-	if siteKey == "" || secret == "" || listen == "" {
-		return fmt.Errorf("captcha.turnstile needs a site key, a secret and a listen address")
+// ValidateTurnstile checks the challenge page settings, shared by Settings.Validate and the listener start: a
+// site key with its secret, or the captcha sign-in (signIn) without one, a listen address, and an https url
+// of a bare host, no path beyond "/", no query, no fragment, since the pages are served at /v/<nonce> from
+// the root and the host is what siteverify reports
+func ValidateTurnstile(siteKey, secret, publicURL, listen string, signIn bool) error {
+	if siteKey == "" && !signIn {
+		return fmt.Errorf("captcha.turnstile needs a site key, or captcha.oidc for sign-in pages")
+	}
+	if siteKey != "" && secret == "" {
+		return fmt.Errorf("captcha.turnstile needs a secret with the site key")
+	}
+	if listen == "" {
+		return fmt.Errorf("captcha.turnstile needs a listen address for the pages")
 	}
 	if !isBareHTTPSURL(publicURL) {
 		return fmt.Errorf("captcha.turnstile.url (%q) must be an https url of a host, without a path, query or fragment",

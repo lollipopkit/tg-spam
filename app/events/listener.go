@@ -196,7 +196,7 @@ func (l *TelegramListener) Do(ctx context.Context) error {
 			l.captcha = newCaptcha(l.TbAPI, l.chatID, l.CaptchaTimeout, l.CaptchaMessage)
 			l.captcha.timeoutMute = l.CaptchaTimeoutMute
 			defer l.captcha.Stop()
-			if l.CaptchaTurnstile.SiteKey != "" {
+			if l.CaptchaTurnstile.Pages() {
 				if err := l.captcha.WithTurnstile(l.CaptchaTurnstile); err != nil {
 					return fmt.Errorf("turnstile captcha: %w", err)
 				}

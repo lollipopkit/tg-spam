@@ -62,12 +62,16 @@ type turnstile struct {
 	loginAge  time.Duration  // max age of telegram login data, the captcha timeout with a grace
 	loginKey  [32]byte       // sha256 of the bot token, the HMAC key of telegram login data
 	refused   atomic.Bool    // telegram refused the login button (bot domain not set), use the animation
-	idp       *openid.Client // sign-in after turnstile, nil when not asked for
+	idp       *openid.Client // sign-in after turnstile, or instead of it without a site key; nil when not asked for
+	widget    bool           // the pages show the Turnstile widget, a site key is set
 }
+
+// Pages reports whether the config asks for challenge pages: Turnstile, an OIDC sign-in, or both
+func (cfg TurnstileConfig) Pages() bool { return cfg.SiteKey != "" || cfg.OIDC.Issuer != "" }
 
 // WithTurnstile switches the captcha to Turnstile. it must be called before the captcha is used
 func (c *captcha) WithTurnstile(cfg TurnstileConfig) error {
-	if err := config.ValidateTurnstile(cfg.SiteKey, cfg.Secret, cfg.PublicURL, cfg.Listen); err != nil {
+	if err := config.ValidateTurnstile(cfg.SiteKey, cfg.Secret, cfg.PublicURL, cfg.Listen, cfg.OIDC.Issuer != ""); err != nil {
 		return fmt.Errorf("turnstile: %w", err)
 	}
 	if cfg.BotToken == "" {
@@ -78,7 +82,8 @@ func (c *captcha) WithTurnstile(cfg TurnstileConfig) error {
 	loginKey := sha256.Sum256([]byte(cfg.BotToken))
 	cfg.BotToken = "" // only the derived key is kept
 	c.turnstile = &turnstile{cfg: cfg, host: strings.ToLower(u.Hostname()), verifyURL: turnstileVerifyURL,
-		client: &http.Client{Timeout: 10 * time.Second}, loginAge: c.timeout + captchaGrace, loginKey: loginKey}
+		client: &http.Client{Timeout: 10 * time.Second}, loginAge: c.timeout + captchaGrace, loginKey: loginKey,
+		widget: cfg.SiteKey != ""}
 	if err := config.ValidateCaptchaOIDC(cfg.OIDC); err != nil {
 		return fmt.Errorf("turnstile: %w", err)
 	}
@@ -237,7 +242,8 @@ func (c *captcha) ServeTurnstile(ctx context.Context, ln net.Listener) error {
 		defer cancel()
 		_ = srv.Shutdown(shutdownCtx)
 	}()
-	log.Printf("[INFO] turnstile captcha page on %s, public %s", ln.Addr(), c.turnstile.cfg.PublicURL)
+	log.Printf("[INFO] captcha pages on %s, public %s, turnstile %v, sign-in %v", ln.Addr(), c.turnstile.cfg.PublicURL,
+		c.turnstile.widget, c.turnstile.idp != nil)
 	if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		return fmt.Errorf("turnstile page server: %w", err)
 	}
@@ -249,7 +255,9 @@ func (c *captcha) turnstileRoutes() http.Handler {
 	router := routegroup.New(http.NewServeMux())
 	router.Use(rest.Recoverer(lgr.Default()), rest.Throttle(100), rest.SizeLimit(16*1024))
 	router.HandleFunc("GET /v/{nonce}", c.turnstilePageHandler)
-	router.HandleFunc("POST /v/{nonce}", c.turnstileVerifyHandler)
+	if c.turnstile.widget {
+		router.HandleFunc("POST /v/{nonce}", c.turnstileVerifyHandler)
+	}
 	if c.turnstile.idp != nil {
 		router.HandleFunc("GET "+turnstileCallbackPath, c.turnstileCallbackHandler)
 	}
@@ -278,9 +286,17 @@ func (c *captcha) pageCaptcha(w http.ResponseWriter, r *http.Request) (p *pendin
 	return p, lang
 }
 
+// turnstilePageHandler shows the Turnstile widget, or without one sends the member straight to the sign-in
 func (c *captcha) turnstilePageHandler(w http.ResponseWriter, r *http.Request) {
 	p, lang := c.pageCaptcha(w, r)
 	if p == nil {
+		return
+	}
+	if !c.turnstile.widget {
+		if authURL, ok := c.signInURL(w, r, p, r.PathValue("nonce"), lang, false); ok {
+			// the target is the issuer's authorization endpoint; the request adds only a query-encoded state
+			http.Redirect(w, r, authURL, http.StatusFound) //nolint:gosec // not an open redirect, see above
+		}
 		return
 	}
 	c.renderPage(w, r, http.StatusOK, lang, captchaText(lang, txtPageHint), true)
@@ -312,19 +328,28 @@ func (c *captcha) finishPage(w http.ResponseWriter, r *http.Request, nonce, lang
 	c.renderPage(w, r, http.StatusOK, lang, captchaText(lang, txtPageDone), false)
 }
 
-// startSignIn shows the link to the issuer for a captcha whose Turnstile passed. The sign-in recorded for the
-// captcha is kept unless fresh is set (after a failed one), so passing Turnstile again, e.g. on a reload,
-// doesn't break a sign-in still open in another browser. The state starts with the page nonce, so the
-// callback finds the captcha, and carries a random part only this member's browser has seen, so the callback
-// can't be completed for a captcha by anyone else
+// startSignIn shows a page with the link to the issuer
 func (c *captcha) startSignIn(w http.ResponseWriter, r *http.Request, p *pendingCaptcha, nonce, lang string,
 	status, text int, fresh bool) {
+	if authURL, ok := c.signInURL(w, r, p, nonce, lang, fresh); ok {
+		c.renderLinkPage(w, r, status, lang, captchaText(lang, text), authURL, captchaText(lang, txtPageSignInButton))
+	}
+}
+
+// signInURL returns the issuer's authorization url for a captcha whose page passed the telegram login (and
+// Turnstile, when on); on failure it renders the error page. The sign-in recorded for the captcha is kept
+// unless fresh is set (after a failed one), so opening the page again, e.g. on a reload, doesn't break a
+// sign-in still open in another browser. The state starts with the page nonce, so the callback finds the
+// captcha, and carries a random part only this member's browser has seen, so the callback can't be completed
+// for a captcha by anyone else
+func (c *captcha) signInURL(w http.ResponseWriter, r *http.Request, p *pendingCaptcha, nonce, lang string,
+	fresh bool) (string, bool) {
 	openid.ExtendWriteDeadline(w)
 	provider, err := c.turnstile.idp.Discover(r.Context())
 	if err != nil {
 		log.Printf("[WARN] captcha sign-in for %s unavailable: %v", p.user, err)
 		c.renderPage(w, r, http.StatusBadGateway, lang, captchaText(lang, txtPageSignInFailed), false)
-		return
+		return "", false
 	}
 	l := openid.NewLogin()
 	l.State = nonce + "." + l.State
@@ -339,10 +364,9 @@ func (c *captcha) startSignIn(w http.ResponseWriter, r *http.Request, p *pending
 	c.mu.Unlock()
 	if !current {
 		c.renderPage(w, r, http.StatusNotFound, lang, captchaText(lang, txtPageExpired), false)
-		return
+		return "", false
 	}
-	c.renderLinkPage(w, r, status, lang, captchaText(lang, text), provider.AuthCodeURL(l),
-		captchaText(lang, txtPageSignInButton))
+	return provider.AuthCodeURL(l), true
 }
 
 // turnstileCallbackHandler finishes the sign-in: the state names the page and must match the sign-in recorded

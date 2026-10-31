@@ -860,7 +860,8 @@
                         <tr><th>Captcha Timeout</th><td>{{.Captcha.Timeout}}</td></tr>
                         <tr><th>Captcha Timeout Action</th><td>{{if eq .Captcha.TimeoutAction "mute"}}mute for good{{else}}ban for the cooldown{{end}}</td></tr>
                         <tr><th>Captcha Message</th><td>{{if .Captcha.Message}}{{.Captcha.Message}}{{else}}default{{end}}</td></tr>
-                        <tr><th>Captcha Turnstile</th><td>{{if .Captcha.Turnstile.SiteKey}}{{.Captcha.Turnstile.URL}} (listen {{.Captcha.Turnstile.Listen}}){{if not .Captcha.Turnstile.Secret}}, no secret{{end}}{{else}}off, motion animation{{end}}</td></tr>
+                        <tr><th>Captcha Turnstile</th><td>{{if .Captcha.Turnstile.SiteKey}}{{.Captcha.Turnstile.URL}} (listen {{.Captcha.Turnstile.Listen}}){{if not .Captcha.Turnstile.Secret}}, no secret{{end}}{{else if .Transient.CaptchaOIDC.Issuer}}off, sign-in only{{else}}off, motion animation{{end}}</td></tr>
+                        <tr><th>Captcha Sign-in</th><td>{{if .Transient.CaptchaOIDC.Issuer}}OIDC {{.Transient.CaptchaOIDC.Issuer}} (client {{.Transient.CaptchaOIDC.ClientID}}, page {{.Captcha.Turnstile.URL}}){{else}}off{{end}}</td></tr>
                         <tr><th>Web Login</th><td>{{if .Transient.OIDC.Issuer}}OIDC {{.Transient.OIDC.Issuer}} (client {{.Transient.OIDC.ClientID}}, allow {{range $i, $a := .Transient.OIDC.Allow}}{{if $i}}, {{end}}{{$a}}{{end}}){{else}}basic auth{{end}}</td></tr>
                     </tbody>
                 </table>

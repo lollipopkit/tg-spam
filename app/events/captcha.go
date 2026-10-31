@@ -269,6 +269,7 @@ const (
 	txtPageSignIn      // the sign-in step after turnstile, when the captcha asks for an account
 	txtPageSignInButton
 	txtPageSignInFailed
+	txtPromptSignIn // default caption of the button when the page only asks for a sign-in
 )
 
 var captchaTexts = map[string][]string{
@@ -299,6 +300,8 @@ var captchaTexts = map[string][]string{
 		txtPageSignIn:       "One more step: sign in to your account, or create one, to be let into the chat.",
 		txtPageSignInButton: "Sign in",
 		txtPageSignInFailed: "Sign-in did not complete. Please try again.",
+		txtPromptSignIn: "{user}, press the button below and sign in to your account, or create one, within {timeout}, " +
+			"otherwise you will be removed from the chat.",
 	},
 	"zh": { //nolint:gosec // user-facing texts, not credentials
 		txtExpired:          "此验证已失效",
@@ -323,6 +326,7 @@ var captchaTexts = map[string][]string{
 		txtPageSignIn:       "还差一步：登录账号（没有账号可以注册）后即可在群里发言。",
 		txtPageSignInButton: "登录",
 		txtPageSignInFailed: "登录未完成，请重试。",
+		txtPromptSignIn:     "{user}，请在 {timeout} 内点击下方按钮登录账号（没有账号可以注册），否则会被移出群组。",
 	},
 	"ru": { //nolint:gosec // user-facing texts, not credentials
 		txtExpired:    "эта проверка устарела",
@@ -351,6 +355,8 @@ var captchaTexts = map[string][]string{
 		txtPageSignIn:       "Остался один шаг: войдите в аккаунт или создайте его, чтобы писать в чате.",
 		txtPageSignInButton: "Войти",
 		txtPageSignInFailed: "Вход не завершён. Попробуйте ещё раз.",
+		txtPromptSignIn: "{user}, нажмите кнопку ниже и войдите в аккаунт или создайте его в течение {timeout}, " +
+			"иначе вы будете удалены из чата.",
 	},
 }
 
@@ -860,6 +866,8 @@ func (c *captcha) prompt(p *pendingCaptcha) string {
 	message := c.message
 	switch {
 	case message != "":
+	case c.turnstile != nil && !c.turnstile.widget:
+		message = captchaText(p.lang, txtPromptSignIn)
 	case c.turnstile != nil:
 		message = captchaText(p.lang, txtPromptTurnstile)
 	default:
