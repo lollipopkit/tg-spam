@@ -799,7 +799,8 @@ func TestTelegramListener_DoCaptchaCanceledOnLeave(t *testing.T) {
 	assert.Equal(t, 55, deleted[0], "join message")
 	assert.Len(t, deleted[1:], len(api.SendCalls()), "a captcha posted before or after the leave is deleted")
 	assert.Empty(t, requestsOf[tbapi.BanChatMemberConfig](api))
-	assert.Equal(t, 1, failuresOf(l.captcha, 42))
+	// leaving counts as a failure only once the challenge was posted, which may happen before or after the leave
+	assert.LessOrEqual(t, failuresOf(l.captcha, 42), len(api.SendCalls()))
 }
 
 func TestTelegramListener_DoCaptchaDisabledInDryMode(t *testing.T) {
@@ -1177,15 +1178,14 @@ func TestCaptcha_TimeoutMute(t *testing.T) {
 		}
 	})
 
-	t.Run("left before answering and rejoined in the cooldown is muted for good", func(t *testing.T) {
+	t.Run("left before answering and rejoined gets a new captcha", func(t *testing.T) {
 		api := newCaptchaAPI("member")
 		c := newMuteCaptcha(api, time.Minute)
 		require.NoError(t, c.fail(bot.User{ID: 42}, "left the chat", false))
 		startPosted(t, c, bot.User{ID: 42})
-		assert.Zero(t, lastRestrict(api).UntilDate, "the cooldown running out must not leave them unverified")
-		assert.Empty(t, requestsOf[tbapi.BanChatMemberConfig](api))
-		assert.Empty(t, api.SendCalls())
-		assert.False(t, c.IsPending(42))
+		assert.Len(t, api.SendCalls(), 1, "never pressed a button, a fresh challenge gives nothing away")
+		assert.NotZero(t, lastRestrict(api).UntilDate, "only the join mute")
+		assert.True(t, c.IsPending(42))
 	})
 
 	t.Run("admins and members who left again are skipped in the cooldown", func(t *testing.T) {
@@ -1210,35 +1210,42 @@ func TestCaptcha_TimeoutMute(t *testing.T) {
 		}
 		return api
 	}
-	t.Run("unknown status of a member who failed recently mutes for good", func(t *testing.T) {
+	t.Run("unknown status of a member muted for good before mutes for good again", func(t *testing.T) {
 		api := statusFails()
 		c := newMuteCaptcha(api, time.Minute)
 		require.NoError(t, c.fail(bot.User{ID: 42}, "timeout", false))
-		c.mu.Lock()
-		f := c.failures[42]
-		f.last = time.Now().Add(-captchaCooldown - time.Second) // past the cooldown, not forgotten
-		c.failures[42] = f
-		c.mu.Unlock()
+		c.muteForeverOrBan(bot.User{ID: 42}, "captcha timeout")
+		require.True(t, c.mutedForGood(42))
 		startPosted(t, c, bot.User{ID: 42})
-		assert.Zero(t, lastRestrict(api).UntilDate, "keeps a permanent mute if there is one, leaves nobody unverified")
+		rs := requestsOf[tbapi.RestrictChatMemberConfig](api)
+		require.Len(t, rs, 2)
+		assert.Zero(t, rs[1].UntilDate, "the join mute must not replace the permanent one")
 		assert.Empty(t, api.SendCalls())
 		assert.False(t, c.IsPending(42))
 	})
-	t.Run("leaving while the status is read mutes nobody", func(t *testing.T) {
+	t.Run("unknown status of a member whose failure muted nobody verifies anyway", func(t *testing.T) {
+		api := statusFails()
+		c := newMuteCaptcha(api, time.Minute)
+		require.NoError(t, c.fail(bot.User{ID: 42}, "left the chat", false))
+		startPosted(t, c, bot.User{ID: 42})
+		assert.Len(t, api.SendCalls(), 1)
+	})
+	t.Run("leaving during a failing status read mutes nobody", func(t *testing.T) {
 		api := newCaptchaAPI("member")
 		c := newMuteCaptcha(api, time.Minute)
+		require.NoError(t, c.fail(bot.User{ID: 42}, "timeout", false))
+		c.muteForeverOrBan(bot.User{ID: 42}, "captcha timeout")
 		base := api.RequestFunc
 		api.RequestFunc = func(cfg tbapi.Chattable) (*tbapi.APIResponse, error) {
 			if _, ok := cfg.(tbapi.GetChatMemberConfig); ok {
-				c.Cancel(42) // the member leaves, which records a failure and starts the cooldown
+				c.Cancel(42)
+				return nil, errors.New("too many requests")
 			}
 			return base(cfg)
 		}
 		c.Start(bot.User{ID: 42}, "")
-		require.Eventually(t, func() bool { return failuresOf(c, 42) == 1 }, time.Second, 10*time.Millisecond)
 		c.running.Wait()
-		assert.Empty(t, requestsOf[tbapi.RestrictChatMemberConfig](api), "never saw a captcha, never muted")
-		assert.Empty(t, api.SendCalls())
+		assert.Len(t, requestsOf[tbapi.RestrictChatMemberConfig](api), 1, "only the earlier permanent mute")
 	})
 	t.Run("unknown status of a new member verifies anyway", func(t *testing.T) {
 		api := statusFails()
@@ -1246,6 +1253,23 @@ func TestCaptcha_TimeoutMute(t *testing.T) {
 		startPosted(t, c, bot.User{ID: 42})
 		assert.Len(t, api.SendCalls(), 1)
 		assert.True(t, c.IsPending(42))
+	})
+
+	t.Run("leaving before the challenge is posted is no failure and mutes nobody", func(t *testing.T) {
+		api := newCaptchaAPI("member")
+		c := newMuteCaptcha(api, time.Minute)
+		base := api.RequestFunc
+		api.RequestFunc = func(cfg tbapi.Chattable) (*tbapi.APIResponse, error) {
+			if _, ok := cfg.(tbapi.GetChatMemberConfig); ok {
+				c.Cancel(42)
+			}
+			return base(cfg)
+		}
+		c.Start(bot.User{ID: 42}, "")
+		c.running.Wait()
+		assert.Zero(t, failuresOf(c, 42), "the member never saw a challenge")
+		assert.Empty(t, requestsOf[tbapi.RestrictChatMemberConfig](api))
+		assert.Empty(t, api.SendCalls())
 	})
 
 	t.Run("a wrong answer still bans", func(t *testing.T) {
