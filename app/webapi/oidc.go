@@ -2,7 +2,6 @@ package webapi
 
 import (
 	"cmp"
-	"context"
 	"crypto/rand"
 	"crypto/subtle"
 	"encoding/base64"
@@ -18,11 +17,10 @@ import (
 	"sync"
 	"time"
 
-	"github.com/coreos/go-oidc/v3/oidc"
-	"golang.org/x/oauth2"
 	"lukechampine.com/blake3"
 
 	"github.com/umputun/tg-spam/app/config"
+	"github.com/umputun/tg-spam/app/openid"
 )
 
 const (
@@ -36,10 +34,6 @@ const (
 	oidcCallbackPath  = "/auth/callback"
 	oidcLogoutPath    = "/logout"
 	oidcLoggedOutPath = "/auth/logged-out"
-	oidcRetryAfter    = 5 * time.Second // a failed discovery is not retried sooner
-	// oidcWriteTimeout covers the provider round trips of a login (discovery, code exchange, jwks), longer
-	// than the server's write timeout
-	oidcWriteTimeout = 45 * time.Second
 )
 
 // cookie purposes, mixed into the signature so a cookie of one kind never verifies as the other
@@ -53,24 +47,13 @@ const (
 // session id until it would expire. The allow list is checked once, at login.
 type oidcAuth struct {
 	cfg        config.OIDCSettings
+	idp        *openid.Client
 	key        []byte
-	client     *http.Client
 	publicBase string // cfg.URL without a trailing slash
 	publicHost string // its host, lower case, without the default port
 
-	fetchMu  sync.Mutex // serializes discovery, so waiters share one fetch instead of each starting one
-	mu       sync.Mutex // guards the fields below
-	provider *oidcProvider
-	failedAt time.Time // last failed discovery, see oidcRetryAfter
-	failErr  error
-	revoked  map[string]int64 // logged out session id -> its expiry
-}
-
-// oidcProvider is what discovery yields
-type oidcProvider struct {
-	oauth      *oauth2.Config
-	verifier   *oidc.IDTokenVerifier
-	endSession string
+	mu      sync.Mutex       // guards revoked
+	revoked map[string]int64 // logged out session id -> its expiry
 }
 
 // oidcSession is the payload of the session cookie
@@ -89,54 +72,6 @@ type oidcState struct {
 	Expires  int64  `json:"e"`
 }
 
-// oidcClaims are the id token claims the allow list is matched against
-type oidcClaims struct {
-	Sub           string     `json:"sub"`
-	Email         string     `json:"email"`
-	EmailVerified flexBool   `json:"email_verified"`
-	Username      string     `json:"preferred_username"`
-	Roles         stringList `json:"roles"`
-	Groups        stringList `json:"groups"`
-}
-
-// flexBool decodes a JSON bool or the strings "true"/"false", as some providers send email_verified
-type flexBool bool
-
-// UnmarshalJSON implements json.Unmarshaler
-func (b *flexBool) UnmarshalJSON(data []byte) error {
-	var v any
-	if err := json.Unmarshal(data, &v); err != nil {
-		return fmt.Errorf("can't decode bool claim: %w", err)
-	}
-	switch t := v.(type) {
-	case bool:
-		*b = flexBool(t)
-	case string:
-		*b = flexBool(strings.EqualFold(t, "true"))
-	default:
-		*b = false
-	}
-	return nil
-}
-
-// stringList decodes a JSON array of strings or a single string, as some providers send a lone role or group
-type stringList []string
-
-// UnmarshalJSON implements json.Unmarshaler
-func (l *stringList) UnmarshalJSON(data []byte) error {
-	var one string
-	if err := json.Unmarshal(data, &one); err == nil {
-		*l = stringList{one}
-		return nil
-	}
-	var many []string
-	if err := json.Unmarshal(data, &many); err != nil {
-		return fmt.Errorf("can't decode list claim: %w", err)
-	}
-	*l = many
-	return nil
-}
-
 func newOIDCAuth(cfg config.OIDCSettings) (*oidcAuth, error) {
 	if err := config.ValidateOIDC(cfg); err != nil {
 		return nil, fmt.Errorf("invalid oidc settings: %w", err)
@@ -149,76 +84,15 @@ func newOIDCAuth(cfg config.OIDCSettings) (*oidcAuth, error) {
 	if err != nil {
 		return nil, fmt.Errorf("invalid oidc url: %w", err)
 	}
-	return &oidcAuth{cfg: cfg, key: key, client: &http.Client{Timeout: 10 * time.Second}, revoked: map[string]int64{},
-		publicBase: strings.TrimSuffix(cfg.URL, "/"), publicHost: canonicalHost(public.Host)}, nil
-}
-
-// discover fetches the provider metadata on first use and keeps it, so the web UI starts even while the
-// issuer is unreachable. One fetch runs at a time and others wait for its result; a failure is returned
-// without a new fetch for oidcRetryAfter, so a down issuer costs one outbound request per interval.
-func (a *oidcAuth) discover(ctx context.Context) (*oidcProvider, error) {
-	if p, err, ok := a.known(); ok {
-		return p, err
-	}
-	a.fetchMu.Lock()
-	defer a.fetchMu.Unlock()
-	if p, err, ok := a.known(); ok { // fetched or failed while this request waited
-		return p, err
-	}
-	// detached from the request: a client that goes away must not fail, and cache the failure of, the fetch
-	// other requests wait on. a.client carries the timeout
-	p, err := a.fetchProvider(context.WithoutCancel(ctx))
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	if err != nil {
-		a.failedAt, a.failErr = time.Now(), err
-		return nil, err
-	}
-	a.provider = p
-	return p, nil
-}
-
-// known returns the discovered provider, or the recent discovery failure, and whether either is set
-func (a *oidcAuth) known() (*oidcProvider, error, bool) { //nolint:revive // the bool says whether to fetch
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	if a.provider != nil {
-		return a.provider, nil, true
-	}
-	if a.failErr != nil && time.Since(a.failedAt) < oidcRetryAfter {
-		return nil, a.failErr, true
-	}
-	return nil, nil, false
-}
-
-// fetchProvider runs the discovery request and builds the client config from it
-func (a *oidcAuth) fetchProvider(ctx context.Context) (*oidcProvider, error) {
-
-	provider, err := oidc.NewProvider(oidc.ClientContext(ctx, a.client), a.cfg.Issuer)
-	if err != nil {
-		return nil, fmt.Errorf("oidc discovery failed: %w", err)
-	}
-	var meta struct {
-		EndSession string `json:"end_session_endpoint"`
-	}
-	if err := provider.Claims(&meta); err != nil {
-		return nil, fmt.Errorf("can't read oidc provider metadata: %w", err)
-	}
-	scopes := []string{oidc.ScopeOpenID, "profile", "email"}
-	if slices.ContainsFunc(a.cfg.Allow, func(s string) bool { return strings.HasPrefix(s, "group:") }) {
+	publicBase := strings.TrimSuffix(cfg.URL, "/")
+	scopes := []string{"profile", "email"}
+	if slices.ContainsFunc(cfg.Allow, func(s string) bool { return strings.HasPrefix(s, "group:") }) {
 		scopes = append(scopes, "groups") // not a standard scope, asked for only when the allow list needs it
 	}
-	return &oidcProvider{
-		endSession: meta.EndSession,
-		verifier:   provider.Verifier(&oidc.Config{ClientID: a.cfg.ClientID}),
-		oauth: &oauth2.Config{
-			ClientID:     a.cfg.ClientID,
-			ClientSecret: a.cfg.ClientSecret,
-			Endpoint:     provider.Endpoint(),
-			RedirectURL:  a.publicBase + oidcCallbackPath,
-			Scopes:       scopes,
-		},
-	}, nil
+	idp := openid.New(openid.Config{Issuer: cfg.Issuer, ClientID: cfg.ClientID, ClientSecret: cfg.ClientSecret,
+		RedirectURL: publicBase + oidcCallbackPath, Scopes: scopes})
+	return &oidcAuth{cfg: cfg, idp: idp, key: key, revoked: map[string]int64{}, publicBase: publicBase,
+		publicHost: canonicalHost(public.Host)}, nil
 }
 
 // middleware passes requests with a valid session; anything else is sent to the login page when it is a
@@ -257,14 +131,15 @@ func (a *oidcAuth) loginHandler(w http.ResponseWriter, r *http.Request) {
 	if a.redirectToPublicHost(w, r) {
 		return
 	}
-	extendWriteDeadline(w)
-	p, err := a.discover(r.Context())
+	openid.ExtendWriteDeadline(w)
+	p, err := a.idp.Discover(r.Context())
 	if err != nil {
 		log.Printf("[WARN] %v", err)
 		http.Error(w, "login provider unavailable", http.StatusBadGateway)
 		return
 	}
-	st := oidcState{State: rand.Text(), Nonce: rand.Text(), Verifier: oauth2.GenerateVerifier(),
+	l := openid.NewLogin()
+	st := oidcState{State: l.State, Nonce: l.Nonce, Verifier: l.Verifier,
 		Return: localPath(r.URL.Query().Get("rd")), Expires: time.Now().Add(oidcStateTTL).Unix()}
 	value, err := a.sign(purposeState, st)
 	if err != nil {
@@ -273,14 +148,13 @@ func (a *oidcAuth) loginHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	a.dropOldStates(w, r)
 	setCookie(w, oidcStatePrefix+st.State, value, oidcStatePath, oidcStateTTL)
-	authURL := p.oauth.AuthCodeURL(st.State, oidc.Nonce(st.Nonce), oauth2.S256ChallengeOption(st.Verifier))
-	http.Redirect(w, r, authURL, http.StatusFound)
+	http.Redirect(w, r, p.AuthCodeURL(l), http.StatusFound)
 }
 
 // callbackHandler finishes the flow: checks state, exchanges the code, verifies the id token and its nonce,
 // matches the account against the allow list and issues the session cookie
 func (a *oidcAuth) callbackHandler(w http.ResponseWriter, r *http.Request) {
-	extendWriteDeadline(w)
+	openid.ExtendWriteDeadline(w)
 	q := r.URL.Query()
 	var st oidcState
 	c, err := r.Cookie(oidcStatePrefix + q.Get("state"))
@@ -299,41 +173,15 @@ func (a *oidcAuth) callbackHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	p, err := a.discover(r.Context())
+	claims, err := a.idp.Exchange(r.Context(), q.Get("code"),
+		openid.Login{State: st.State, Nonce: st.Nonce, Verifier: st.Verifier})
 	if err != nil {
-		log.Printf("[WARN] %v", err)
-		http.Error(w, "login provider unavailable", http.StatusBadGateway)
-		return
-	}
-	ctx := oidc.ClientContext(r.Context(), a.client)
-	token, err := p.oauth.Exchange(ctx, q.Get("code"), oauth2.VerifierOption(st.Verifier))
-	if err != nil {
-		log.Printf("[WARN] oidc code exchange failed: %v", err)
+		log.Printf("[WARN] oidc login failed: %v", err)
+		if errors.Is(err, openid.ErrDiscovery) {
+			http.Error(w, "login provider unavailable", http.StatusBadGateway)
+			return
+		}
 		http.Error(w, "login failed", http.StatusForbidden)
-		return
-	}
-	rawID, ok := token.Extra("id_token").(string)
-	if !ok {
-		http.Error(w, "login failed: no id token", http.StatusForbidden)
-		return
-	}
-	idToken, err := p.verifier.Verify(ctx, rawID)
-	if err == nil && subtle.ConstantTimeCompare([]byte(idToken.Nonce), []byte(st.Nonce)) != 1 {
-		err = errors.New("nonce mismatch")
-	}
-	if err != nil {
-		log.Printf("[WARN] oidc id token rejected: %v", err)
-		http.Error(w, "login failed", http.StatusForbidden)
-		return
-	}
-	var claims oidcClaims
-	if err = idToken.Claims(&claims); err != nil {
-		log.Printf("[WARN] can't decode oidc id token claims: %v", err)
-		http.Error(w, "login failed", http.StatusForbidden)
-		return
-	}
-	if claims.Sub == "" {
-		http.Error(w, "login failed: no subject", http.StatusForbidden)
 		return
 	}
 	if !a.allowed(claims) {
@@ -357,7 +205,7 @@ func (a *oidcAuth) callbackHandler(w http.ResponseWriter, r *http.Request) {
 // to the provider's logout page, which ends the provider session too; otherwise the next request would sign
 // straight back in. The navbar posts it with htmx, which follows HX-Redirect but not a cross-origin 302.
 func (a *oidcAuth) logoutHandler(w http.ResponseWriter, r *http.Request) {
-	extendWriteDeadline(w)
+	openid.ExtendWriteDeadline(w)
 	if s, ok := a.session(r); ok {
 		a.revoke(s)
 	}
@@ -365,8 +213,8 @@ func (a *oidcAuth) logoutHandler(w http.ResponseWriter, r *http.Request) {
 	// without the provider's logout the next request would sign straight back in, so a provider without
 	// one gets a local page that does not trigger a login
 	target := oidcLoggedOutPath
-	if p, err := a.discover(r.Context()); err == nil && p.endSession != "" {
-		if u, perr := url.Parse(p.endSession); perr == nil {
+	if p, err := a.idp.Discover(r.Context()); err == nil && p.EndSession != "" {
+		if u, perr := url.Parse(p.EndSession); perr == nil {
 			q := u.Query()
 			q.Set("client_id", a.cfg.ClientID)
 			u.RawQuery = q.Encode()
@@ -422,7 +270,7 @@ func canonicalHost(h string) string {
 }
 
 // allowed matches the id token claims against the allow list; email entries need a verified email
-func (a *oidcAuth) allowed(c oidcClaims) bool {
+func (a *oidcAuth) allowed(c openid.Claims) bool {
 	for _, entry := range a.cfg.Allow {
 		kind, value, _ := strings.Cut(entry, ":")
 		switch kind {
@@ -549,14 +397,6 @@ func setCookie(w http.ResponseWriter, name, value, cookiePath string, ttl time.D
 	}
 	http.SetCookie(w, &http.Cookie{Name: name, Value: value, Path: cookiePath, MaxAge: maxAge,
 		HttpOnly: true, Secure: true, SameSite: http.SameSiteLaxMode})
-}
-
-// extendWriteDeadline lifts the server's write timeout for a handler that waits on the provider
-func extendWriteDeadline(w http.ResponseWriter) {
-	if err := http.NewResponseController(w).SetWriteDeadline(time.Now().Add(oidcWriteTimeout)); err != nil &&
-		!errors.Is(err, http.ErrNotSupported) {
-		log.Printf("[WARN] can't extend write deadline: %v", err)
-	}
 }
 
 // localPath keeps a post-login return target only when it is a path on this host. It returns the cleaned

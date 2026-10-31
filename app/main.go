@@ -205,6 +205,12 @@ type options struct {
 			URL     string `long:"url" env:"URL" description:"public https url the Turnstile page is reachable at"`
 			Listen  string `long:"listen" env:"LISTEN" default:"127.0.0.1:8081" description:"listen address of the Turnstile page"`
 		} `group:"turnstile" namespace:"turnstile" env-namespace:"TURNSTILE"`
+
+		OIDC struct {
+			Issuer       string `long:"issuer" env:"ISSUER" description:"OIDC issuer url, members sign in there after Turnstile"`
+			ClientID     string `long:"client-id" env:"CLIENT_ID" description:"OIDC client id"`
+			ClientSecret string `long:"client-secret" env:"CLIENT_SECRET" description:"OIDC client secret"`
+		} `group:"oidc" namespace:"oidc" env-namespace:"OIDC"`
 	} `group:"captcha" namespace:"captcha" env-namespace:"CAPTCHA"`
 
 	Files struct {
@@ -344,6 +350,7 @@ func main() {
 		appSettings.Transient.StorageTimeout = opts.StorageTimeout
 		appSettings.Transient.LuaUnrestricted = opts.LuaPlugins.Unrestricted
 		appSettings.Transient.OIDC = oidcSettings(opts)
+		appSettings.Transient.CaptchaOIDC = captchaOIDCSettings(opts)
 
 		// apply explicit CLI overrides for non-transient values
 		applyCLIOverrides(appSettings, opts, defaults)
@@ -577,7 +584,8 @@ func execute(ctx context.Context, settings *config.Settings, reloadNormalize fun
 		CaptchaOnly:             settings.Captcha.Only,
 		CaptchaTurnstile: events.TurnstileConfig{SiteKey: settings.Captcha.Turnstile.SiteKey,
 			Secret: settings.Captcha.Turnstile.Secret, PublicURL: settings.Captcha.Turnstile.URL,
-			Listen: settings.Captcha.Turnstile.Listen, BotToken: settings.Telegram.Token},
+			Listen: settings.Captcha.Turnstile.Listen, BotToken: settings.Telegram.Token,
+			OIDC: settings.Transient.CaptchaOIDC},
 	}
 
 	if settings.Delete.JoinMessages {
@@ -803,6 +811,7 @@ func collectMaskedSecrets(appSettings *config.Settings) []string {
 	add(appSettings.CAS.Token)
 	add(appSettings.Captcha.Turnstile.Secret)
 	add(appSettings.Transient.OIDC.ClientSecret)
+	add(appSettings.Transient.CaptchaOIDC.ClientSecret)
 	// the auto-generated password is printed for the operator, so it is not masked
 	if appSettings.Transient.WebAuthPasswd != "auto" {
 		add(appSettings.Transient.WebAuthPasswd)

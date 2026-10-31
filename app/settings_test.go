@@ -1839,6 +1839,12 @@ func TestOIDCSettingsFromOptions(t *testing.T) {
 		URL: "https://tg.example.com", Allow: []string{"role:admin", "email:a@example.com"}}
 	assert.Equal(t, want, optToSettings(opts).Transient.OIDC)
 
+	opts.Captcha.OIDC.Issuer = "https://auth.example.com"
+	opts.Captcha.OIDC.ClientID = "tg-bot"
+	opts.Captcha.OIDC.ClientSecret = "oidc-cs-7f3a"
+	assert.Equal(t, config.CaptchaOIDCSettings{Issuer: "https://auth.example.com", ClientID: "tg-bot",
+		ClientSecret: "oidc-cs-7f3a"}, optToSettings(opts).Transient.CaptchaOIDC)
+
 	blob, err := json.Marshal(optToSettings(opts))
 	require.NoError(t, err)
 	assert.NotContains(t, string(blob), "auth.example.com", "oidc settings are never stored")

@@ -6,10 +6,12 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"html"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -22,7 +24,9 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/umputun/tg-spam/app/bot"
+	"github.com/umputun/tg-spam/app/config"
 	"github.com/umputun/tg-spam/app/events/mocks"
+	"github.com/umputun/tg-spam/app/openid/openidtest"
 )
 
 // fakeSiteverify mocks cloudflare's siteverify, answering with the given hostname for the token "good"
@@ -469,4 +473,171 @@ func pendingTestCode(t *testing.T, c *captcha, userID int64) string {
 	p, ok := c.tests[userID]
 	require.True(t, ok)
 	return p.code
+}
+
+// newSignInCaptcha is a turnstile captcha that asks for a sign-in at a fake issuer
+func newSignInCaptcha(t *testing.T) (*captcha, *mocks.TbAPIMock, *openidtest.Issuer, *fakeSiteverify) {
+	t.Helper()
+	idp := openidtest.New(t, "tg-bot")
+	api := newCaptchaAPI("member")
+	c := newCaptcha(api, 123, time.Minute, "")
+	require.NoError(t, c.WithTurnstile(TurnstileConfig{SiteKey: "site-key", Secret: "secret",
+		PublicURL: "https://verify.example.com", Listen: ":0", BotToken: testBotToken,
+		OIDC: config.CaptchaOIDCSettings{Issuer: idp.Srv.URL, ClientID: "tg-bot", ClientSecret: "oidc-secret"}}))
+	c.turnstile.idp.HTTP = idp.Srv.Client()
+	fake := newFakeSiteverify(t, "verify.example.com")
+	c.turnstile.verifyURL = fake.srv.URL
+	t.Cleanup(c.Stop)
+	return c, api, idp, fake
+}
+
+// newOIDCCaptcha is newSignInCaptcha with a posted captcha of member 42 whose turnstile tokens pass
+func newOIDCCaptcha(t *testing.T) (c *captcha, api *mocks.TbAPIMock, idp *openidtest.Issuer, nonce string) {
+	t.Helper()
+	c, api, idp, fake := newSignInCaptcha(t)
+	c.Start(bot.User{ID: 42}, "")
+	c.running.Wait()
+	nonce = postedNonce(t, c)
+	fake.solvedOn(nonce)
+	return c, api, idp, nonce
+}
+
+var signInLink = regexp.MustCompile(`<a class="btn" href="([^"]+)"`)
+
+// passTurnstile posts a passing turnstile token and returns the authorization url on the sign-in page
+func passTurnstile(t *testing.T, c *captcha, idp *openidtest.Issuer, nonce string) url.Values {
+	t.Helper()
+	rec := doPage(c, http.MethodPost, nonce, "good", nil, member42())
+	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+	return followSignIn(t, rec, idp)
+}
+
+func followSignIn(t *testing.T, rec *httptest.ResponseRecorder, idp *openidtest.Issuer) url.Values {
+	t.Helper()
+	m := signInLink.FindStringSubmatch(rec.Body.String())
+	require.Len(t, m, 2, rec.Body.String())
+	return idp.Authorize(t, html.UnescapeString(m[1]))
+}
+
+func doCallback(c *captcha, query string) *httptest.ResponseRecorder {
+	rec := httptest.NewRecorder()
+	c.turnstileRoutes().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, turnstileCallbackPath+"?"+query, http.NoBody))
+	return rec
+}
+
+func TestCaptcha_TurnstileOIDC(t *testing.T) {
+	t.Run("sign-in after turnstile lifts the mute", func(t *testing.T) {
+		c, api, idp, nonce := newOIDCCaptcha(t)
+		q := passTurnstile(t, c, idp, nonce)
+		assert.True(t, c.IsPending(42), "turnstile alone does not let the member in")
+		assert.Equal(t, "https://verify.example.com/v/oidc/callback", q.Get("redirect_uri"))
+		assert.Equal(t, "openid", q.Get("scope"), "only the subject is used")
+		assert.Equal(t, "tg-bot", q.Get("client_id"))
+		assert.True(t, strings.HasPrefix(q.Get("state"), nonce+"."), "the state names the page")
+
+		rec := doCallback(c, "code="+openidtest.GoodCode+"&state="+url.QueryEscape(q.Get("state")))
+		assert.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+		assert.Contains(t, rec.Body.String(), "Verified")
+		assert.False(t, c.IsPending(42))
+		assertLifted(t, api, 42)
+
+		again := doCallback(c, "code="+openidtest.GoodCode+"&state="+url.QueryEscape(q.Get("state")))
+		assert.Equal(t, http.StatusNotFound, again.Code, "single use")
+	})
+
+	t.Run("passing turnstile again keeps the open sign-in", func(t *testing.T) {
+		c, _, idp, nonce := newOIDCCaptcha(t)
+		q := passTurnstile(t, c, idp, nonce)
+		challenge, idNonce := idp.Pending()
+		q2 := passTurnstile(t, c, idp, nonce)
+		assert.Equal(t, q.Get("state"), q2.Get("state"))
+		idp.SetPending(challenge, idNonce)
+		rec := doCallback(c, "code="+openidtest.GoodCode+"&state="+url.QueryEscape(q.Get("state")))
+		assert.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+		assert.False(t, c.IsPending(42))
+	})
+
+	t.Run("no animation fallback, an unsent captcha mutes for good", func(t *testing.T) {
+		c, api, _, _ := newSignInCaptcha(t)
+		api.SendFunc = func(tbapi.Chattable) (tbapi.Message, error) {
+			return tbapi.Message{}, errors.New("Bad Request: BOT_DOMAIN_INVALID")
+		}
+		c.Start(bot.User{ID: 42}, "")
+		c.running.Wait()
+		require.Len(t, api.SendCalls(), 1, "only the login button is tried")
+		assert.False(t, c.IsPending(42))
+		restricts := requestsOf[tbapi.RestrictChatMemberConfig](api)
+		require.Len(t, restricts, 2, "join mute, then the permanent one")
+		assert.Zero(t, restricts[1].UntilDate, "muted for good, not let in unverified")
+		assert.Equal(t, &tbapi.ChatPermissions{}, restricts[1].Permissions)
+		assert.False(t, c.turnstile.refused.Load(), "the button is tried again on the next join")
+
+		c.Start(bot.User{ID: 43}, "")
+		c.running.Wait()
+		require.Len(t, api.SendCalls(), 2)
+		_, ok := api.SendCalls()[1].C.(tbapi.MessageConfig)
+		assert.True(t, ok, "still the login button")
+	})
+
+	t.Run("callback needs the state of this sign-in", func(t *testing.T) {
+		c, _, idp, nonce := newOIDCCaptcha(t)
+		assert.Equal(t, http.StatusNotFound, doCallback(c, "code=good-code&state="+nonce+".guess").Code,
+			"no sign-in before turnstile passed")
+		q := passTurnstile(t, c, idp, nonce)
+		for _, state := range []string{nonce + ".guess", nonce, "", "other." + q.Get("state")} {
+			rec := doCallback(c, "code="+openidtest.GoodCode+"&state="+url.QueryEscape(state))
+			assert.Equal(t, http.StatusNotFound, rec.Code, state)
+		}
+		assert.True(t, c.IsPending(42))
+	})
+
+	t.Run("failed sign-in keeps the captcha pending with a new sign-in", func(t *testing.T) {
+		c, api, idp, nonce := newOIDCCaptcha(t)
+		q := passTurnstile(t, c, idp, nonce)
+
+		refused := doCallback(c, "error=access_denied&state="+url.QueryEscape(q.Get("state")))
+		assert.Equal(t, http.StatusForbidden, refused.Code)
+		assert.Contains(t, refused.Body.String(), "Sign-in did not complete")
+		q2 := followSignIn(t, refused, idp)
+		assert.NotEqual(t, q.Get("state"), q2.Get("state"), "a fresh sign-in")
+		assert.Equal(t, http.StatusNotFound, doCallback(c, "code="+openidtest.GoodCode+"&state="+
+			url.QueryEscape(q.Get("state"))).Code, "the old sign-in is gone")
+
+		badCode := doCallback(c, "code=bad&state="+url.QueryEscape(q2.Get("state")))
+		assert.Equal(t, http.StatusForbidden, badCode.Code)
+		q3 := followSignIn(t, badCode, idp)
+		assert.True(t, c.IsPending(42))
+		assert.Empty(t, requestsOf[tbapi.BanChatMemberConfig](api), "only the timeout removes the member")
+
+		idp.SetNonce("replayed")
+		replay := doCallback(c, "code="+openidtest.GoodCode+"&state="+url.QueryEscape(q3.Get("state")))
+		assert.Equal(t, http.StatusForbidden, replay.Code, "an id token for another sign-in is refused")
+		assert.True(t, c.IsPending(42))
+	})
+
+	t.Run("issuer down at the sign-in step", func(t *testing.T) {
+		c, _, idp, nonce := newOIDCCaptcha(t)
+		idp.Srv.Close()
+		rec := doPage(c, http.MethodPost, nonce, "good", nil, member42())
+		assert.Equal(t, http.StatusBadGateway, rec.Code)
+		assert.True(t, c.IsPending(42))
+	})
+
+	t.Run("callback route exists only with a sign-in", func(t *testing.T) {
+		c, _, _ := newTurnstileCaptcha(t, time.Minute, "verify.example.com")
+		assert.Equal(t, http.StatusNotFound, doCallback(c, "code=x&state=y").Code)
+	})
+
+	t.Run("settings are validated", func(t *testing.T) {
+		c := newCaptcha(newCaptchaAPI("member"), 123, time.Minute, "")
+		cfg := TurnstileConfig{SiteKey: "k", Secret: "s", PublicURL: "https://v.example.com", Listen: ":8081",
+			BotToken: testBotToken, OIDC: config.CaptchaOIDCSettings{Issuer: "https://auth.example.com", ClientID: "c"}}
+		require.ErrorContains(t, c.WithTurnstile(cfg), "client secret")
+		require.ErrorContains(t, c.WithTurnstile(TurnstileConfig{SiteKey: "k", Secret: "s",
+			PublicURL: "https://v.example.com", Listen: ":8081", BotToken: testBotToken,
+			OIDC: config.CaptchaOIDCSettings{ClientID: "c", ClientSecret: "s"}}), "without captcha.oidc.issuer")
+		cfg.OIDC.ClientSecret = "s"
+		require.NoError(t, c.WithTurnstile(cfg))
+		assert.Empty(t, c.turnstile.cfg.OIDC.ClientSecret, "kept by the oidc client only")
+	})
 }
