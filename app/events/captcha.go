@@ -32,6 +32,10 @@ const (
 	captchaMaxCooldown = 24 * time.Hour
 )
 
+// captchaMuteSlack keeps the join mute past the timeout by the time the timeout action takes (removing the
+// captcha, the permanent mute or the ban go through the API), so the member is never free in between
+const captchaMuteSlack = 10 * time.Second
+
 // captchaGrace is the slack on the age of telegram login data past the captcha timeout, so a page opened just
 // before the deadline still checks
 const captchaGrace = time.Minute
@@ -74,10 +78,7 @@ type pendingCaptcha struct {
 	page   bool   // posted as a turnstile page rather than the animation
 	lang   string // member's telegram language, for the texts the bot shows them
 	timer  *time.Timer
-	// deadline is when the join mute ends and the timeout action applies, the join plus the timeout; zero for
-	// tests, timed from the post
-	deadline time.Time
-	login    *openid.Login // sign-in started after turnstile passed, when the captcha asks for an account; guarded by mu
+	login  *openid.Login // sign-in started after turnstile passed, when the captcha asks for an account; guarded by mu
 }
 
 type captchaFailure struct {
@@ -107,7 +108,7 @@ func (c *captcha) Start(user bot.User, lang string) {
 // verify runs a pending captcha up to the posted challenge. ban mode: a member in a failure cooldown is banned
 // for the rest of it, before any status read. administrators and members restricted by anyone but the join
 // mute are left alone. an unknown status verifies anyway, except a member muted for good, muted for good
-// again (mute mode). the timeout counts from the join mute, which ends exactly when the timeout action applies
+// again (mute mode). the timeout counts from the join mute, which ends captchaMuteSlack after it
 func (c *captcha) verify(p *pendingCaptcha) {
 	defer c.running.Done()
 	c.workers <- struct{}{}
@@ -151,17 +152,15 @@ func (c *captcha) verify(p *pendingCaptcha) {
 	if !c.isCurrent(c.pending, p) {
 		return
 	}
-	// the join mute lasts exactly the timeout and the timeout action applies when it ends. it expires on its own,
-	// so a member whose captcha was lost (bot restart, failed cleanup) is not muted forever
+	// the timeout counts from the join mute, which lasts the timeout plus captchaMuteSlack, so the timeout action
+	// lands while the member is still muted. it expires on its own, so a member whose captcha was lost (bot
+	// restart, failed cleanup) is not muted for good
 	deadline := time.Now().Add(c.timeout)
-	if merr := c.muteUntil(user, deadline); merr != nil {
+	if merr := c.muteUntil(user, deadline.Add(captchaMuteSlack)); merr != nil {
 		c.take(c.pending, user.ID, p)
 		log.Printf("[WARN] failed to mute %s for captcha, not verified: %v", user, merr)
 		return
 	}
-	c.mu.Lock()
-	p.deadline = deadline
-	c.mu.Unlock()
 
 	sent, code, page, err := c.challenge(c.chatID, p)
 	if err != nil {
@@ -183,7 +182,17 @@ func (c *captcha) verify(p *pendingCaptcha) {
 		return
 	}
 
-	if !c.posted(c.pending, p, sent.MessageID, code, page, c.expire) {
+	// a slow render or upload must not leave the member too little time to answer: the rest of the timeout is
+	// raised to half of it, with the join mute extended to match
+	if minWait := c.timeout / 2; time.Until(deadline) < minWait {
+		extended := time.Now().Add(minWait)
+		if merr := c.muteUntil(user, extended.Add(captchaMuteSlack)); merr != nil {
+			log.Printf("[WARN] failed to extend the captcha mute of %s, the timeout stays: %v", user, merr)
+		} else {
+			deadline = extended
+		}
+	}
+	if !c.posted(c.pending, p, sent.MessageID, code, page, c.expire, deadline) {
 		return
 	}
 	log.Printf("[INFO] captcha sent to %s, timeout %v", user, c.timeout)
@@ -459,7 +468,7 @@ func (c *captcha) postTest(p *pendingCaptcha) {
 		}
 		return
 	}
-	if c.posted(c.tests, p, sent.MessageID, code, page, c.expireTest) {
+	if c.posted(c.tests, p, sent.MessageID, code, page, c.expireTest, time.Now().Add(c.timeout)) {
 		log.Printf("[INFO] captcha test sent to %s", p.user)
 	}
 }
@@ -507,8 +516,8 @@ func (c *captcha) expire(p *pendingCaptcha) {
 }
 
 // muteForeverOrBan mutes the member for good, or bans them for the cooldown if telegram refuses: the join mute
-// ends at the timeout, and a member must not be left free to post unverified. joinMuted says the member is
-// under the captcha's join mute, given by the caller since on the timeout path that mute ends right now
+// ends captchaMuteSlack after the timeout, and a member must not be left free to post unverified. joinMuted
+// says the member is under the captcha's join mute (the timeout path)
 func (c *captcha) muteForeverOrBan(user bot.User, reason string, joinMuted bool) {
 	err := c.muteForever(user)
 	if err == nil {
@@ -557,19 +566,16 @@ func (c *captcha) register(m map[int64]*pendingCaptcha, p *pendingCaptcha) {
 	deleteMessage(c.tbAPI, prevChatID, prevMsgID, "captcha")
 }
 
-// posted records the sent challenge on p and starts its timeout, if p is still the member's captcha in m.
-// otherwise the challenge was resolved while being sent, its message is deleted and posted returns false
+// posted records the sent challenge on p and starts its timeout, firing at deadline, if p is still the member's
+// captcha in m. otherwise the challenge was resolved while being sent, its message is deleted and posted
+// returns false
 func (c *captcha) posted(m map[int64]*pendingCaptcha, p *pendingCaptcha, msgID int, code string, page bool,
-	onTimeout func(*pendingCaptcha)) bool {
+	onTimeout func(*pendingCaptcha), deadline time.Time) bool {
 	c.mu.Lock()
 	current := m[p.user.ID] == p
 	if current {
 		p.msgID, p.code, p.page = msgID, code, page
-		wait := c.timeout
-		if !p.deadline.IsZero() {
-			wait = time.Until(p.deadline)
-		}
-		p.timer = time.AfterFunc(wait, func() { onTimeout(p) })
+		p.timer = time.AfterFunc(time.Until(deadline), func() { onTimeout(p) })
 		if page {
 			c.nonces[code] = p
 		}
@@ -766,9 +772,13 @@ func (c *captcha) mute(user bot.User, d time.Duration) error {
 	return c.muteUntil(user, time.Now().Add(d))
 }
 
-// muteUntil is mute to a point in time, at least a minute away: under 30 seconds is forever for telegram
+// muteUntil is mute to a point in time, rounded up to the second telegram counts in, and at least a minute
+// away: under 30 seconds is forever for telegram
 func (c *captcha) muteUntil(user bot.User, until time.Time) error {
 	until = later(until, time.Now().Add(time.Minute))
+	if until.Truncate(time.Second) != until {
+		until = until.Truncate(time.Second).Add(time.Second)
+	}
 	if err := c.restrict(user, until.Unix()); err != nil {
 		return err
 	}
