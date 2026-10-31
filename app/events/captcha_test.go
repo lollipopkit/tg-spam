@@ -1111,3 +1111,64 @@ func TestCaptcha_TestChinese(t *testing.T) {
 		wrongCode(code), code)}, texts)
 	assert.Equal(t, "答案错误", requestsOf[tbapi.CallbackConfig](api)[0].Text)
 }
+
+func TestCaptcha_TimeoutMute(t *testing.T) {
+	newMuteCaptcha := func(api *mocks.TbAPIMock, timeout time.Duration) *captcha {
+		c := newCaptcha(api, 123, timeout, testCaptchaMsg)
+		c.render = stubRender
+		c.timeoutMute = true
+		t.Cleanup(c.Stop)
+		return c
+	}
+	lastRestrict := func(api *mocks.TbAPIMock) tbapi.RestrictChatMemberConfig {
+		rs := requestsOf[tbapi.RestrictChatMemberConfig](api)
+		require.NotEmpty(t, rs)
+		return rs[len(rs)-1]
+	}
+
+	t.Run("timeout mutes for good and keeps the member", func(t *testing.T) {
+		api := newCaptchaAPI("member")
+		c := newMuteCaptcha(api, 50*time.Millisecond)
+		startPosted(t, c, bot.User{ID: 42})
+		require.Eventually(t, func() bool { return !c.IsPending(42) }, time.Second, 10*time.Millisecond)
+		require.Eventually(t, func() bool { return lastRestrict(api).UntilDate == 0 }, time.Second, 10*time.Millisecond)
+
+		r := lastRestrict(api)
+		assert.Equal(t, int64(42), r.UserID)
+		assert.Equal(t, tbapi.ChatPermissions{}, *r.Permissions, "nothing can be sent")
+		assert.Empty(t, requestsOf[tbapi.BanChatMemberConfig](api), "not removed from the chat")
+		assert.Equal(t, []int{77}, deletedIDs(api))
+		assert.Equal(t, 1, failuresOf(c, 42))
+		assert.True(t, c.isMutedByCaptcha(42))
+	})
+
+	t.Run("rejoin during the cooldown keeps the mute", func(t *testing.T) {
+		api := newCaptchaAPI("restricted")
+		c := newMuteCaptcha(api, time.Minute)
+		require.NoError(t, c.fail(bot.User{ID: 42}, "timeout", false))
+		startPosted(t, c, bot.User{ID: 42})
+		assert.Zero(t, lastRestrict(api).UntilDate)
+		assert.Empty(t, requestsOf[tbapi.BanChatMemberConfig](api))
+		assert.Empty(t, api.SendCalls(), "no challenge during the cooldown")
+		assert.False(t, c.IsPending(42))
+	})
+
+	t.Run("rejoin after the cooldown gets a new captcha and solving it unmutes", func(t *testing.T) {
+		api := newCaptchaAPI("member")
+		c := newMuteCaptcha(api, time.Minute)
+		require.NoError(t, c.mute(bot.User{ID: 42}, 0)) // muted for good by an earlier timeout
+		api.RequestFunc = newCaptchaAPI("restricted").RequestFunc
+		startPosted(t, c, bot.User{ID: 42})
+		require.Len(t, api.SendCalls(), 1, "the captcha's own mute does not skip the challenge")
+		press(t, c, api, 42, 42, 77, pendingCode(t, c, 42))
+		assertLifted(t, api, 42)
+	})
+
+	t.Run("a wrong answer still bans", func(t *testing.T) {
+		api := newCaptchaAPI("member")
+		c := newMuteCaptcha(api, time.Minute)
+		startPosted(t, c, bot.User{ID: 42})
+		press(t, c, api, 42, 42, 77, wrongCode(pendingCode(t, c, 42)))
+		assertBannedFor(t, api, 42, captchaCooldown)
+	})
+}

@@ -804,6 +804,14 @@
                     <input type="text" class="form-control" id="captchaTimeout" name="captchaTimeout" value="{{.Captcha.Timeout}}">
                     <div class="form-text">Time to solve the captcha before the member is removed (10s to 24h)</div>
                 </div>
+                <div class="col-md-6 mb-3">
+                    <label for="captchaTimeoutAction" class="form-label">Captcha Timeout Action</label>
+                    <select class="form-select" id="captchaTimeoutAction" name="captchaTimeoutAction">
+                        <option value="ban" {{if ne .Captcha.TimeoutAction "mute"}}selected{{end}}>ban for the cooldown</option>
+                        <option value="mute" {{if eq .Captcha.TimeoutAction "mute"}}selected{{end}}>mute for good, keep in the chat</option>
+                    </select>
+                    <div class="form-text">What happens to a member who does not answer in time; a wrong answer always bans</div>
+                </div>
                 <div class="col-12 mb-3">
                     <label for="captchaMessage" class="form-label">Captcha Message</label>
                     <input type="text" class="form-control" id="captchaMessage" name="captchaMessage" value="{{.Captcha.Message}}">
@@ -842,6 +850,7 @@
                         <tr><th>Warn Window</th><td>{{.Warn.Window}}</td></tr>
                         <tr><th>Captcha Enabled</th><td>{{.Captcha.Enabled}}</td></tr>
                         <tr><th>Captcha Timeout</th><td>{{.Captcha.Timeout}}</td></tr>
+                        <tr><th>Captcha Timeout Action</th><td>{{if eq .Captcha.TimeoutAction "mute"}}mute for good{{else}}ban for the cooldown{{end}}</td></tr>
                         <tr><th>Captcha Message</th><td>{{if .Captcha.Message}}{{.Captcha.Message}}{{else}}default{{end}}</td></tr>
                         <tr><th>Captcha Turnstile</th><td>{{if .Captcha.Turnstile.SiteKey}}{{.Captcha.Turnstile.URL}} (listen {{.Captcha.Turnstile.Listen}}){{if not .Captcha.Turnstile.Secret}}, no secret{{end}}{{else}}off, motion animation{{end}}</td></tr>
                         <tr><th>Web Login</th><td>{{if .Transient.OIDC.Issuer}}OIDC {{.Transient.OIDC.Issuer}} (client {{.Transient.OIDC.ClientID}}, allow {{range $i, $a := .Transient.OIDC.Allow}}{{if $i}}, {{end}}{{$a}}{{end}}){{else}}basic auth{{end}}</td></tr>

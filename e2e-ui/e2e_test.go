@@ -351,6 +351,9 @@ func TestSettings_WarnAndCaptchaPersist(t *testing.T) {
 	defaultCaptchaTimeout, err := page.Locator("#captchaTimeout").InputValue()
 	require.NoError(t, err)
 	assert.Equal(t, "2m0s", defaultCaptchaTimeout)
+	defaultTimeoutAction, err := page.Locator("#captchaTimeoutAction").InputValue()
+	require.NoError(t, err)
+	assert.Equal(t, "ban", defaultTimeoutAction)
 
 	// change values and save
 	require.NoError(t, page.Locator("#warnThreshold").Fill(warnThreshold))
@@ -358,6 +361,8 @@ func TestSettings_WarnAndCaptchaPersist(t *testing.T) {
 	require.NoError(t, page.Locator("#captchaEnabled").Check())
 	require.NoError(t, page.Locator("#captchaTimeout").Fill(captchaTimeout))
 	require.NoError(t, page.Locator("#captchaMessage").Fill(captchaMessage))
+	_, err = page.Locator("#captchaTimeoutAction").SelectOption(playwright.SelectOptionValues{Values: &[]string{"mute"}})
+	require.NoError(t, err)
 	require.NoError(t, page.Locator("#captchaTurnstileSiteKey").Fill(turnstileKey))
 	require.NoError(t, page.Locator("#captchaTurnstileURL").Fill(turnstileURL))
 	require.NoError(t, page.Locator("#captchaTurnstileListen").Fill(turnstileAddr))
@@ -390,6 +395,9 @@ func TestSettings_WarnAndCaptchaPersist(t *testing.T) {
 	got, err = page.Locator("#captchaMessage").InputValue()
 	require.NoError(t, err)
 	assert.Equal(t, captchaMessage, got)
+	got, err = page.Locator("#captchaTimeoutAction").InputValue()
+	require.NoError(t, err)
+	assert.Equal(t, "mute", got)
 	got, err = page.Locator("#captchaTurnstileSiteKey").InputValue()
 	require.NoError(t, err)
 	assert.Equal(t, turnstileKey, got)

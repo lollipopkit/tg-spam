@@ -585,6 +585,9 @@ func updateSettingsFromForm(settings *config.Settings, r *http.Request) {
 	if _, ok := r.Form["captchaMessage"]; ok {
 		settings.Captcha.Message = r.FormValue("captchaMessage")
 	}
+	if _, ok := r.Form["captchaTimeoutAction"]; ok {
+		settings.Captcha.TimeoutAction = r.FormValue("captchaTimeoutAction")
+	}
 	// turnstile, the secret is a credential and never in the form
 	if _, ok := r.Form["captchaTurnstileSiteKey"]; ok {
 		settings.Captcha.Turnstile.SiteKey = strings.TrimSpace(r.FormValue("captchaTurnstileSiteKey"))

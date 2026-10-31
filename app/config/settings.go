@@ -244,7 +244,16 @@ type CaptchaSettings struct {
 	Timeout   time.Duration     `json:"timeout" yaml:"timeout" db:"captcha_timeout"`
 	Message   string            `json:"message" yaml:"message" db:"captcha_message"`
 	Turnstile TurnstileSettings `json:"turnstile" yaml:"turnstile" db:"captcha_turnstile"`
+	// TimeoutAction is CaptchaTimeoutBan (ban for the cooldown) or CaptchaTimeoutMute (mute for good, the member
+	// stays in the chat); empty means ban
+	TimeoutAction string `json:"timeout_action" yaml:"timeout_action" db:"captcha_timeout_action"`
 }
+
+// captcha timeout actions
+const (
+	CaptchaTimeoutBan  = "ban"
+	CaptchaTimeoutMute = "mute"
+)
 
 // TurnstileSettings switch the captcha to Cloudflare Turnstile when SiteKey is set
 type TurnstileSettings struct {
@@ -381,6 +390,12 @@ func (s *Settings) Validate() error {
 	if s.Captcha.Enabled {
 		if err := validateCaptchaMessage(s.Captcha.Message); err != nil {
 			return err
+		}
+		switch s.Captcha.TimeoutAction {
+		case "", CaptchaTimeoutBan, CaptchaTimeoutMute:
+		default:
+			return fmt.Errorf("captcha.timeout-action (%q) must be %q or %q", s.Captcha.TimeoutAction,
+				CaptchaTimeoutBan, CaptchaTimeoutMute)
 		}
 		if err := validateTurnstile(s.Captcha.Turnstile); err != nil {
 			return err

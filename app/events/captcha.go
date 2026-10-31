@@ -43,12 +43,15 @@ const captchaGrace = time.Minute
 // safe for concurrent use: callbacks come from the update loop, timeouts from timer goroutines and the
 // verification itself from worker goroutines.
 type captcha struct {
-	tbAPI     TbAPI
-	chatID    int64
-	timeout   time.Duration
-	message   string                            // prompt template with {user} and {timeout}, empty for the mode default
-	render    func(code string) ([]byte, error) // draws the challenge image
-	turnstile *turnstile                        // set in Turnstile mode, nil for the motion animation
+	tbAPI   TbAPI
+	chatID  int64
+	timeout time.Duration
+	message string // prompt template with {user} and {timeout}, empty for the mode default
+	// timeoutMute mutes a member who times out for good instead of banning for the cooldown; the member stays in
+	// the chat, a rejoin during the cooldown keeps the mute, and a later rejoin gets a new captcha
+	timeoutMute bool
+	render      func(code string) ([]byte, error) // draws the challenge image
+	turnstile   *turnstile                        // set in Turnstile mode, nil for the motion animation
 
 	workers chan struct{}  // limits concurrent verifications
 	running sync.WaitGroup // verifications in progress, waited for by Stop
@@ -111,6 +114,12 @@ func (c *captcha) verify(p *pendingCaptcha) {
 	}
 	if left := c.cooldownLeft(user.ID); left > 0 {
 		c.take(c.pending, user.ID, p)
+		if c.timeoutMute {
+			if err := c.mute(user, 0); err != nil {
+				log.Printf("[WARN] failed to keep %s muted, rejoined during captcha cooldown: %v", user, err)
+			}
+			return
+		}
 		if err := c.remove(user, left, "rejoined during captcha cooldown"); err != nil {
 			log.Printf("[WARN] %v", err)
 		}
@@ -443,9 +452,20 @@ func (c *captcha) expire(p *pendingCaptcha) {
 		return // solved, replaced or canceled in the meantime
 	}
 	deleteMessage(c.tbAPI, c.chatID, p.msgID, "captcha")
-	if err := c.fail(p.user, "timeout", true); err != nil {
+	if !c.timeoutMute {
+		if err := c.fail(p.user, "timeout", true); err != nil {
+			log.Printf("[WARN] %v", err)
+		}
+		return
+	}
+	if err := c.fail(p.user, "timeout", false); err != nil {
 		log.Printf("[WARN] %v", err)
 	}
+	if err := c.mute(p.user, 0); err != nil {
+		log.Printf("[WARN] failed to mute %s for good after captcha timeout, the join mute expires: %v", p.user, err)
+		return
+	}
+	log.Printf("[INFO] %s muted for good, captcha timeout", p.user)
 }
 
 // register makes p the member's captcha in m (pending or tests), deleting the one it replaces
@@ -609,13 +629,18 @@ func (c *captcha) remove(user bot.User, d time.Duration, reason string) error {
 	return fmt.Errorf("failed to remove %s after captcha %s, muted for %v instead: %w", user, reason, d, err)
 }
 
-// mute takes every permission from the member for d. the mute expires on its own, so a member whose
-// captcha is lost is not muted for good. it is recorded, telling it apart from other restrictions on rejoin
+// mute takes every permission from the member for d. the join mute expires on its own, so a member whose
+// captcha is lost is not muted for good. a d of zero or less mutes for good (timeout in the mute mode). it is
+// recorded, telling it apart from other restrictions on rejoin
 func (c *captcha) mute(user bot.User, d time.Duration) error {
 	until := time.Now().Add(max(d, time.Minute)) // under 30 seconds is forever for telegram
+	untilDate := until.Unix()
+	if d <= 0 {
+		until, untilDate = time.Now().AddDate(100, 0, 0), 0 // 0 is forever for telegram
+	}
 	err := c.request(tbapi.RestrictChatMemberConfig{
 		ChatMemberConfig: tbapi.ChatMemberConfig{ChatConfig: tbapi.ChatConfig{ChatID: c.chatID}, UserID: user.ID},
-		UntilDate:        until.Unix(),
+		UntilDate:        untilDate,
 		Permissions:      &tbapi.ChatPermissions{},
 	})
 	if err != nil {

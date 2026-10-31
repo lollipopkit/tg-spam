@@ -195,6 +195,8 @@ type options struct {
 		Enabled bool          `long:"enabled" env:"ENABLED" description:"verify new members with a captcha"`
 		Timeout time.Duration `long:"timeout" env:"TIMEOUT" default:"2m" description:"time to solve the captcha before the member is removed"`
 		Message string        `long:"message" env:"MESSAGE" description:"captcha prompt, {user} and {timeout} are replaced, empty for the default of the mode"`
+		// TimeoutAction choices mirror config.CaptchaTimeoutBan / CaptchaTimeoutMute
+		TimeoutAction string `long:"timeout-action" env:"TIMEOUT_ACTION" choice:"ban" choice:"mute" default:"ban" description:"on timeout ban for the cooldown or mute for good, keeping the member in the chat"`
 
 		Turnstile struct {
 			SiteKey string `long:"site-key" env:"SITE_KEY" description:"Cloudflare Turnstile site key, switches the captcha to Turnstile"`
@@ -570,6 +572,7 @@ func execute(ctx context.Context, settings *config.Settings, reloadNormalize fun
 		CaptchaEnabled:          settings.Captcha.Enabled,
 		CaptchaTimeout:          settings.Captcha.Timeout,
 		CaptchaMessage:          captchaMessage(settings.Captcha.Message),
+		CaptchaTimeoutMute:      settings.Captcha.TimeoutAction == config.CaptchaTimeoutMute,
 		CaptchaTurnstile: events.TurnstileConfig{SiteKey: settings.Captcha.Turnstile.SiteKey,
 			Secret: settings.Captcha.Turnstile.Secret, PublicURL: settings.Captcha.Turnstile.URL,
 			Listen: settings.Captcha.Turnstile.Listen, BotToken: settings.Telegram.Token},

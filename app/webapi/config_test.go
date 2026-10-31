@@ -1768,6 +1768,21 @@ func TestUpdateSettingsFromForm_Warn_PresentApplied(t *testing.T) {
 	assert.Equal(t, 12*time.Hour, settings.Warn.Window)
 }
 
+func TestUpdateSettingsFromForm_CaptchaTimeoutAction(t *testing.T) {
+	parse := func(form url.Values, s *config.Settings) {
+		req := httptest.NewRequest("PUT", "/config", strings.NewReader(form.Encode()))
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		require.NoError(t, req.ParseForm())
+		updateSettingsFromForm(s, req)
+	}
+	s := &config.Settings{Captcha: config.CaptchaSettings{TimeoutAction: config.CaptchaTimeoutBan}}
+	parse(url.Values{"captchaTimeoutAction": {"mute"}}, s)
+	assert.Equal(t, config.CaptchaTimeoutMute, s.Captcha.TimeoutAction)
+
+	parse(url.Values{"primaryGroup": {"some-group"}}, s)
+	assert.Equal(t, config.CaptchaTimeoutMute, s.Captcha.TimeoutAction, "preserved when the form omits it")
+}
+
 func TestUpdateSettingsFromForm_Warn_AbsentPreserves(t *testing.T) {
 	// warnThreshold (val != "" gate) and warnWindow (r.Form key gate) absent from form
 	// must preserve existing values so unrelated saves don't wipe state
