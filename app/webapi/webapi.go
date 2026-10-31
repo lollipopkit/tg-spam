@@ -163,28 +163,37 @@ func (s *Server) Run(ctx context.Context) error {
 	router.Use(rest.SizeLimit(1024 * 1024)) // 1M max request size
 	router.Use(http.NewCrossOriginProtection().Handler)
 
-	// hash-based authentication for maximum security. The middleware reads the
-	// current hash from AppSettings under the same mutex used by the config
-	// handlers so DB-sourced rotations via POST /config/reload take effect
-	// immediately without restarting the server. Startup AuthHash is used as
-	// a safety fallback if AppSettings hash is empty so a DB that lost the
-	// hash can't silently unlock the API.
-	if s.OIDC.Enabled() {
+	protected := router
+	switch {
+	case s.OIDC.Enabled():
+		// the OIDC login routes are registered outside the guarded group and everything else inside it.
+		// exempting paths inside the middleware instead would miss requests the mux routes elsewhere, e.g.
+		// "/auth%2Flogin" whose decoded path is the login path while the mux sends it to the catch-all page
 		auth, err := newOIDCAuth(s.OIDC)
 		if err != nil {
 			return fmt.Errorf("can't set up oidc login: %w", err)
 		}
 		s.oidc = auth
 		log.Printf("[INFO] oidc login enabled for webapi server (issuer: %s)", s.OIDC.Issuer)
-		router.Use(auth.middleware)
-	} else if s.AuthHash != "" {
+		router.Route(func(login *routegroup.Bundle) {
+			login.HandleFunc("GET "+oidcLoginPath, auth.loginHandler)
+			login.HandleFunc("GET "+oidcCallbackPath, auth.callbackHandler)
+			login.HandleFunc("POST "+oidcLogoutPath, auth.logoutHandler)
+		})
+		protected = router.Group()
+		protected.Use(auth.middleware)
+	case s.AuthHash != "":
+		// hash-based authentication. The middleware reads the current hash from AppSettings under the same
+		// mutex used by the config handlers so DB-sourced rotations via POST /config/reload take effect
+		// immediately without restarting the server. Startup AuthHash is used as a safety fallback if
+		// AppSettings hash is empty so a DB that lost the hash can't silently unlock the API.
 		log.Printf("[INFO] basic auth enabled for webapi server (user: %s)", s.activeAuthUser())
 		router.Use(s.basicAuthMiddleware)
-	} else {
+	default:
 		log.Printf("[WARN] basic auth disabled, access to webapi is not protected")
 	}
 
-	router = s.routes(router) // setup routes
+	s.routes(protected) // setup routes
 
 	srv := &http.Server{Addr: s.ListenAddr, Handler: router, ReadTimeout: 5 * time.Second, WriteTimeout: 5 * time.Second}
 	go func() {
@@ -259,7 +268,7 @@ func (s *Server) activeAuthUser() string {
 }
 
 func (s *Server) routes(router *routegroup.Bundle) *routegroup.Bundle {
-	// auth api routes; auth is applied globally by router.Use in Run, so no per-subrouter auth here
+	// auth api routes; auth is applied by Run, globally for basic auth and on the passed group for oidc
 	router.Route(func(authApi *routegroup.Bundle) {
 		authApi.HandleFunc("POST /check", s.checkMsgHandler)         // check a message for spam
 		authApi.HandleFunc("GET /check/{user_id}", s.checkIDHandler) // check user id for spam
@@ -333,19 +342,16 @@ func (s *Server) routes(router *routegroup.Bundle) *routegroup.Bundle {
 			})
 		}
 
-		if s.oidc != nil {
-			webUI.HandleFunc("GET "+oidcLoginPath, s.oidc.loginHandler)
-			webUI.HandleFunc("GET "+oidcCallbackPath, s.oidc.callbackHandler)
-			webUI.HandleFunc("POST "+oidcLogoutPath, s.oidc.logoutHandler)
-		} else {
+		if s.oidc == nil { // the oidc logout is registered by Run, outside the guarded group
 			// handle logout - force Basic Auth re-authentication; the navbar posts it
 			basicLogout := func(w http.ResponseWriter, _ *http.Request) {
 				w.Header().Set("WWW-Authenticate", `Basic realm="tg-spam"`)
 				w.WriteHeader(http.StatusUnauthorized)
 				fmt.Fprintln(w, "Logged out successfully")
 			}
-			webUI.HandleFunc("GET /logout", basicLogout)
 			webUI.HandleFunc("POST /logout", basicLogout)
+			// TODO: remove GET once bookmarks and old pages linking GET /logout are gone; the navbar posts
+			webUI.HandleFunc("GET /logout", basicLogout)
 		}
 
 		// serve only specific static files at root level
@@ -639,7 +645,6 @@ func (s *Server) getSettingsHandler(w http.ResponseWriter, _ *http.Request) {
 	safe.CAS.Token = ""
 	safe.Captcha.Turnstile.Secret = ""
 	safe.Server.AuthHash = ""
-	safe.Server.OIDC.ClientSecret = ""
 
 	resp := struct {
 		*config.Settings

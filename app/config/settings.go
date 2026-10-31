@@ -288,28 +288,25 @@ type MessageSettings struct {
 
 // ServerSettings contains web server settings
 type ServerSettings struct {
-	Enabled    bool         `json:"enabled" yaml:"enabled" db:"server_enabled"`
-	ListenAddr string       `json:"listen_addr" yaml:"listen_addr" db:"server_listen_addr"`
-	AuthUser   string       `json:"auth_user,omitempty" yaml:"auth_user,omitempty" db:"server_auth_user"`
-	AuthHash   string       `json:"auth_hash" yaml:"auth_hash" db:"server_auth_hash"`
-	OIDC       OIDCSettings `json:"oidc" yaml:"oidc" db:"server_oidc"`
+	Enabled    bool   `json:"enabled" yaml:"enabled" db:"server_enabled"`
+	ListenAddr string `json:"listen_addr" yaml:"listen_addr" db:"server_listen_addr"`
+	AuthUser   string `json:"auth_user,omitempty" yaml:"auth_user,omitempty" db:"server_auth_user"`
+	AuthHash   string `json:"auth_hash" yaml:"auth_hash" db:"server_auth_hash"`
 }
 
-// OIDCSettings switch the web UI from basic auth to an OpenID Connect login when Issuer is set
+// OIDCSettings switch the web UI from basic auth to an OpenID Connect login when Issuer is set. They come
+// from flags or env only and are never stored: a login kept in the database could lock the operator out of
+// the page that edits it, and leaving the flags off is the way back in.
 type OIDCSettings struct {
-	Issuer       string   `json:"issuer" yaml:"issuer" db:"server_oidc_issuer"`
-	ClientID     string   `json:"client_id" yaml:"client_id" db:"server_oidc_client_id"`
-	ClientSecret string   `json:"client_secret" yaml:"client_secret" db:"server_oidc_client_secret"`
-	URL          string   `json:"url" yaml:"url" db:"server_oidc_url"`
-	Allow        []string `json:"allow" yaml:"allow" db:"server_oidc_allow"`
+	Issuer       string
+	ClientID     string
+	ClientSecret string
+	URL          string
+	Allow        []string
 }
 
-// Enabled reports whether the OIDC login is configured
+// Enabled reports whether the OIDC login replaces basic auth
 func (o OIDCSettings) Enabled() bool { return o.Issuer != "" }
-
-// OIDCActive reports whether the OIDC login guards the web UI: configured and not turned off by basic auth
-// passed on the command line
-func (s *Settings) OIDCActive() bool { return s.Server.OIDC.Enabled() && !s.Transient.OIDCOffByCLI }
 
 // TransientSettings contains settings that should never be persisted
 type TransientSettings struct {
@@ -331,9 +328,8 @@ type TransientSettings struct {
 	// temporary auth password (used only to generate hash)
 	WebAuthPasswd string `json:"-" yaml:"-"`
 
-	// OIDCOffByCLI marks a stored OIDC login turned off for this process by --server.auth/-hash on the
-	// command line, so an operator locked out by it can get back in
-	OIDCOffByCLI bool `json:"-" yaml:"-"`
+	// OIDC login of the web UI, replaces basic auth when its issuer is set
+	OIDC OIDCSettings `json:"-" yaml:"-"`
 
 	// authFromCLI marks web auth (hash or password) as held in memory rather
 	// than authoritative in the database. It is set by applyCLIOverrides for
@@ -390,7 +386,7 @@ func (s *Settings) Validate() error {
 			return err
 		}
 	}
-	if err := ValidateOIDC(s.Server.OIDC); err != nil {
+	if err := ValidateOIDC(s.Transient.OIDC); err != nil {
 		return err
 	}
 	if s.MaxShortMsgCount < 0 {

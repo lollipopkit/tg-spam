@@ -186,12 +186,6 @@ func optToSettings(opts options) *config.Settings {
 		Server: config.ServerSettings{
 			Enabled:    opts.Server.Enabled,
 			ListenAddr: opts.Server.ListenAddr,
-			OIDC: config.OIDCSettings{
-				Issuer:   opts.Server.OIDC.Issuer,
-				ClientID: opts.Server.OIDC.ClientID,
-				URL:      opts.Server.OIDC.URL,
-				Allow:    opts.Server.OIDC.Allow,
-			},
 		},
 
 		SimilarityThreshold:    opts.SimilarityThreshold,
@@ -225,6 +219,7 @@ func optToSettings(opts options) *config.Settings {
 		WebAuthPasswd:      opts.Server.AuthPasswd,
 		ConfigDBEncryptKey: opts.ConfigDBEncryptKey,
 		LuaUnrestricted:    opts.LuaPlugins.Unrestricted,
+		OIDC:               oidcSettings(opts),
 	}
 
 	// set credentials in their respective domain structures
@@ -235,7 +230,6 @@ func optToSettings(opts options) *config.Settings {
 	settings.CAS.Token = opts.CAS.Token
 	settings.Captcha.Turnstile.Secret = opts.Captcha.Turnstile.Secret
 	settings.Server.AuthHash = opts.Server.AuthHash
-	settings.Server.OIDC.ClientSecret = opts.Server.OIDC.ClientSecret
 
 	return settings
 }
@@ -388,7 +382,6 @@ func applyCLIOverrides(settings *config.Settings, opts options, defaults *config
 		{config.FieldJevToken, opts.Jev.Token, &settings.Jev.Token},
 		{config.FieldCASToken, opts.CAS.Token, &settings.CAS.Token},
 		{config.FieldTurnstileSecret, opts.Captcha.Turnstile.Secret, &settings.Captcha.Turnstile.Secret},
-		{config.FieldOIDCSecret, opts.Server.OIDC.ClientSecret, &settings.Server.OIDC.ClientSecret},
 	}
 	for _, c := range cliCredentials {
 		if c.value == "" {
@@ -414,18 +407,6 @@ func applyCLIOverrides(settings *config.Settings, opts options, defaults *config
 		markFromCLI(config.FieldServerAuthHash)
 		// clear password since hash takes precedence
 		settings.Transient.WebAuthPasswd = ""
-	}
-
-	// an issuer on the command line replaces the stored OIDC login; basic auth on the command line without one
-	// turns a stored login off for this process
-	if opts.Server.OIDC.Issuer != "" {
-		settings.Server.OIDC.Issuer = opts.Server.OIDC.Issuer
-		settings.Server.OIDC.ClientID = opts.Server.OIDC.ClientID
-		settings.Server.OIDC.URL = opts.Server.OIDC.URL
-		settings.Server.OIDC.Allow = opts.Server.OIDC.Allow
-	} else if settings.Transient.AuthFromCLI && settings.Server.OIDC.Enabled() {
-		log.Print("[WARN] basic auth from the command line turns the stored OIDC login off")
-		settings.Transient.OIDCOffByCLI = true
 	}
 
 	// operational CLI overrides (dry-run, listen addr, file paths) live in a
@@ -491,7 +472,7 @@ func applyOperationalCLIOverrides(settings *config.Settings, opts options, defau
 // would persist an empty hash to the DB.
 func applyAutoAuthFallback(settings *config.Settings) {
 	if settings.Server.Enabled &&
-		!settings.OIDCActive() &&
+		!settings.Transient.OIDC.Enabled() &&
 		settings.Server.AuthHash == "" &&
 		settings.Transient.WebAuthPasswd == "" &&
 		!settings.Transient.AuthFromCLI {
@@ -654,4 +635,15 @@ func saveConfigToDB(ctx context.Context, settings *config.Settings) error {
 
 	log.Printf("[INFO] configuration saved to database successfully")
 	return nil
+}
+
+// oidcSettings builds the web UI OIDC login settings from the command line; they are never stored
+func oidcSettings(opts options) config.OIDCSettings {
+	return config.OIDCSettings{
+		Issuer:       opts.Server.OIDC.Issuer,
+		ClientID:     opts.Server.OIDC.ClientID,
+		ClientSecret: opts.Server.OIDC.ClientSecret,
+		URL:          opts.Server.OIDC.URL,
+		Allow:        opts.Server.OIDC.Allow,
+	}
 }

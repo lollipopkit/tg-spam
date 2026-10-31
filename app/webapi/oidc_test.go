@@ -8,6 +8,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"maps"
 	"net/http"
 	"net/http/httptest"
@@ -102,13 +103,15 @@ func newTestOIDC(t *testing.T, f *fakeIssuer, allow ...string) (*oidcAuth, http.
 		URL: "https://tg.example.com", Allow: allow})
 	require.NoError(t, err)
 	a.client = f.srv.Client()
+	// same layout as Server.Run: login routes outside the guarded handler, everything else inside
+	guarded := http.NewServeMux()
+	guarded.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte("ok")) })
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET "+oidcLoginPath, a.loginHandler)
 	mux.HandleFunc("GET "+oidcCallbackPath, a.callbackHandler)
-	mux.HandleFunc("POST /logout", a.logoutHandler)
-	mux.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte("ok")) })
-	h := a.middleware(mux)
-	return a, h
+	mux.HandleFunc("POST "+oidcLogoutPath, a.logoutHandler)
+	mux.Handle("/", a.middleware(guarded))
+	return a, mux
 }
 
 // login runs the login redirect and returns the state cookie and the authorize request parameters
@@ -259,7 +262,7 @@ func TestOIDC_CallbackRejects(t *testing.T) {
 	})
 	t.Run("expired state cookie", func(t *testing.T) {
 		_, q := login(t, f, h, "/")
-		value, err := a.sign(oidcState{State: q.Get("state"), Expires: time.Now().Add(-time.Second).Unix()})
+		value, err := a.sign(purposeState, oidcState{State: q.Get("state"), Expires: time.Now().Add(-time.Second).Unix()})
 		require.NoError(t, err)
 		rec := callback(h, &http.Cookie{Name: oidcStatePrefix + q.Get("state"), Value: value},
 			"code=good-code&state="+q.Get("state"))
@@ -295,6 +298,33 @@ func TestOIDC_CallbackRejects(t *testing.T) {
 		assert.Equal(t, http.StatusForbidden, rec.Code)
 		assert.Nil(t, sessionCookie(rec))
 	})
+	t.Run("older login cookies are dropped", func(t *testing.T) {
+		cookies := make([]*http.Cookie, 0, 6)
+		for i := range 5 {
+			value, err := a.sign(purposeState, oidcState{State: fmt.Sprintf("s%d", i), Expires: time.Now().Add(time.Duration(i) * time.Second).Unix()})
+			require.NoError(t, err)
+			cookies = append(cookies, &http.Cookie{Name: oidcStatePrefix + fmt.Sprintf("s%d", i), Value: value})
+		}
+		cookies = append(cookies, &http.Cookie{Name: oidcStatePrefix + "forged", Value: "x.y"})
+		req := httptest.NewRequest(http.MethodGet, oidcLoginPath, http.NoBody)
+		for _, c := range cookies {
+			req.AddCookie(c)
+		}
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		require.Equal(t, http.StatusFound, rec.Code)
+		var deleted, set []string
+		for _, c := range rec.Result().Cookies() {
+			if c.MaxAge < 0 {
+				deleted = append(deleted, c.Name)
+			} else {
+				set = append(set, c.Name)
+			}
+		}
+		assert.ElementsMatch(t, []string{oidcStatePrefix + "s0", oidcStatePrefix + "s1", oidcStatePrefix + "s2",
+			oidcStatePrefix + "forged"}, deleted, "keeps s3 and s4, the newest two, next to the new one")
+		assert.Len(t, set, 1)
+	})
 	t.Run("open redirect target is dropped", func(t *testing.T) {
 		state, q := login(t, f, h, "//evil.example.com/x")
 		rec := callback(h, state, "code=good-code&state="+q.Get("state"))
@@ -312,22 +342,31 @@ func TestOIDC_Session(t *testing.T) {
 		h.ServeHTTP(rec, req)
 		return rec.Code
 	}
-	valid, err := a.sign(oidcSession{Sub: "u1", Expires: time.Now().Add(time.Hour).Unix()})
+	valid, err := a.sign(purposeSession, oidcSession{ID: "id1", Sub: "u1", Expires: time.Now().Add(time.Hour).Unix()})
 	require.NoError(t, err)
 	assert.Equal(t, http.StatusOK, do(&http.Cookie{Name: oidcSessionCookie, Value: valid}))
 
-	expired, err := a.sign(oidcSession{Sub: "u1", Expires: time.Now().Add(-time.Second).Unix()})
+	expired, err := a.sign(purposeSession, oidcSession{ID: "id1", Sub: "u1", Expires: time.Now().Add(-time.Second).Unix()})
 	require.NoError(t, err)
 	assert.Equal(t, http.StatusUnauthorized, do(&http.Cookie{Name: oidcSessionCookie, Value: expired}))
 
 	payload, _, _ := strings.Cut(valid, ".")
-	forged := base64.RawURLEncoding.EncodeToString([]byte(`{"s":"u2","e":9999999999}`)) + "." + strings.Split(valid, ".")[1]
+	forged := base64.RawURLEncoding.EncodeToString([]byte(`{"i":"x","s":"u2","e":9999999999}`)) + "." + strings.Split(valid, ".")[1]
 	assert.Equal(t, http.StatusUnauthorized, do(&http.Cookie{Name: oidcSessionCookie, Value: forged}))
 	assert.Equal(t, http.StatusUnauthorized, do(&http.Cookie{Name: oidcSessionCookie, Value: payload}))
 
+	state, err := a.sign(purposeState, oidcState{State: "s", Nonce: "n", Expires: time.Now().Add(time.Hour).Unix()})
+	require.NoError(t, err)
+	assert.Equal(t, http.StatusUnauthorized, do(&http.Cookie{Name: oidcSessionCookie, Value: state}),
+		"a login cookie must not pass as a session")
+
+	noSub, err := a.sign(purposeSession, oidcSession{ID: "id1", Expires: time.Now().Add(time.Hour).Unix()})
+	require.NoError(t, err)
+	assert.Equal(t, http.StatusUnauthorized, do(&http.Cookie{Name: oidcSessionCookie, Value: noSub}))
+
 	other, err := newOIDCAuth(a.cfg) // another process has another key
 	require.NoError(t, err)
-	foreign, err := other.sign(oidcSession{Sub: "u1", Expires: time.Now().Add(time.Hour).Unix()})
+	foreign, err := other.sign(purposeSession, oidcSession{ID: "id1", Sub: "u1", Expires: time.Now().Add(time.Hour).Unix()})
 	require.NoError(t, err)
 	assert.Equal(t, http.StatusUnauthorized, do(&http.Cookie{Name: oidcSessionCookie, Value: foreign}))
 }
@@ -350,6 +389,24 @@ func TestOIDC_Logout(t *testing.T) {
 		assert.Equal(t, f.srv.URL+"/logout", rec.Header().Get("Location"))
 		checkCleared(rec)
 	})
+	t.Run("logout revokes the session", func(t *testing.T) {
+		a, guarded := newTestOIDC(t, f, "role:admin")
+		value, err := a.sign(purposeSession, oidcSession{ID: "id1", Sub: "u1", Expires: time.Now().Add(time.Hour).Unix()})
+		require.NoError(t, err)
+		sess := &http.Cookie{Name: oidcSessionCookie, Value: value}
+		get := func() int {
+			req := httptest.NewRequest(http.MethodGet, "/manage_users", http.NoBody)
+			req.AddCookie(sess)
+			rec := httptest.NewRecorder()
+			guarded.ServeHTTP(rec, req)
+			return rec.Code
+		}
+		require.Equal(t, http.StatusOK, get())
+		req := httptest.NewRequest(http.MethodPost, "/logout", http.NoBody)
+		req.AddCookie(sess)
+		guarded.ServeHTTP(httptest.NewRecorder(), req)
+		assert.Equal(t, http.StatusFound, get(), "a copy of the logged out cookie is refused")
+	})
 	t.Run("htmx post", func(t *testing.T) {
 		rec := httptest.NewRecorder()
 		req := httptest.NewRequest(http.MethodPost, "/logout", http.NoBody)
@@ -360,11 +417,13 @@ func TestOIDC_Logout(t *testing.T) {
 		assert.Empty(t, rec.Header().Get("Location"))
 		checkCleared(rec)
 	})
-	t.Run("other methods stay behind the login", func(t *testing.T) {
+	t.Run("other methods and encoded paths stay behind the login", func(t *testing.T) {
 		for _, req := range []*http.Request{
 			httptest.NewRequest(http.MethodGet, "/logout", http.NoBody),
 			httptest.NewRequest(http.MethodPost, oidcLoginPath, http.NoBody),
 			httptest.NewRequest(http.MethodPost, oidcCallbackPath, http.NoBody),
+			httptest.NewRequest(http.MethodGet, "/auth%2Flogin", http.NoBody),
+			httptest.NewRequest(http.MethodGet, "/auth%2Fcallback", http.NoBody),
 		} {
 			rec := httptest.NewRecorder()
 			h.ServeHTTP(rec, req)
@@ -456,4 +515,41 @@ func TestServer_RunOIDC(t *testing.T) {
 
 	cancel()
 	<-done
+}
+
+func TestOIDC_DiscoveryFailureIsCached(t *testing.T) {
+	var calls int
+	var mu sync.Mutex
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		mu.Lock()
+		calls++
+		mu.Unlock()
+		http.Error(w, "down", http.StatusServiceUnavailable)
+	}))
+	defer srv.Close()
+	a, err := newOIDCAuth(config.OIDCSettings{Issuer: srv.URL, ClientID: "c", ClientSecret: "s",
+		URL: "https://tg.example.com", Allow: []string{"sub:x"}})
+	require.NoError(t, err)
+	a.client = srv.Client()
+
+	var wg sync.WaitGroup
+	for range 10 {
+		wg.Go(func() {
+			_, derr := a.discover(t.Context())
+			assert.Error(t, derr)
+		})
+	}
+	wg.Wait()
+	mu.Lock()
+	assert.Equal(t, 1, calls, "concurrent and repeated discoveries within the retry interval share one fetch")
+	mu.Unlock()
+
+	a.mu.Lock()
+	a.failedAt = time.Now().Add(-oidcRetryAfter)
+	a.mu.Unlock()
+	_, err = a.discover(t.Context())
+	require.Error(t, err)
+	mu.Lock()
+	assert.Equal(t, 2, calls, "retried after the interval")
+	mu.Unlock()
 }

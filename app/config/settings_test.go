@@ -880,7 +880,7 @@ func TestSettings_ValidateOIDC(t *testing.T) {
 	with := func(f func(o *OIDCSettings)) *Settings {
 		o := valid
 		f(&o)
-		return &Settings{Server: ServerSettings{OIDC: o}}
+		return &Settings{Transient: TransientSettings{OIDC: o}}
 	}
 	tests := []struct {
 		name    string
@@ -888,7 +888,7 @@ func TestSettings_ValidateOIDC(t *testing.T) {
 		wantErr string
 	}{
 		{name: "valid", s: with(func(*OIDCSettings) {})},
-		{name: "no issuer, oidc off", s: &Settings{Server: ServerSettings{OIDC: OIDCSettings{URL: "nonsense"}}}},
+		{name: "no issuer, oidc off", s: &Settings{Transient: TransientSettings{OIDC: OIDCSettings{URL: "nonsense"}}}},
 		{name: "no client id", s: with(func(o *OIDCSettings) { o.ClientID = "" }), wantErr: "needs a client id and a client secret"},
 		{name: "no secret", s: with(func(o *OIDCSettings) { o.ClientSecret = "" }), wantErr: "needs a client id and a client secret"},
 		{name: "http issuer", s: with(func(o *OIDCSettings) { o.Issuer = "http://auth.example.com" }),

@@ -340,6 +340,7 @@ func main() {
 		appSettings.Transient.TGDbg = opts.TGDbg
 		appSettings.Transient.StorageTimeout = opts.StorageTimeout
 		appSettings.Transient.LuaUnrestricted = opts.LuaPlugins.Unrestricted
+		appSettings.Transient.OIDC = oidcSettings(opts)
 
 		// apply explicit CLI overrides for non-transient values
 		applyCLIOverrides(appSettings, opts, defaults)
@@ -691,11 +692,8 @@ func activateServer(ctx context.Context, settings *config.Settings, sf *bot.Spam
 	authPasswd := settings.Transient.WebAuthPasswd
 	authHash := settings.Server.AuthHash
 
-	var oidcCfg config.OIDCSettings
-	if settings.OIDCActive() {
-		// the OIDC login replaces basic auth entirely
-		oidcCfg = settings.Server.OIDC
-		log.Printf("[INFO] OIDC login enabled for webapi server (issuer: %s)", settings.Server.OIDC.Issuer)
+	if settings.Transient.OIDC.Enabled() {
+		// the OIDC login replaces basic auth entirely; webapi logs it
 		authHash = ""
 	} else if authHash != "" {
 		log.Printf("[INFO] using provided bcrypt hash for authentication")
@@ -744,7 +742,7 @@ func activateServer(ctx context.Context, settings *config.Settings, sf *bot.Spam
 		DMUsersProvider: dmUsersProvider,
 		AuthUser:        settings.Server.AuthUser, // optional basic auth user (defaults to "tg-spam" when empty)
 		AuthHash:        authHash,                 // use the hash (either from options or generated)
-		OIDC:            oidcCfg,
+		OIDC:            settings.Transient.OIDC,
 		Version:         revision,
 		Dbg:             settings.Transient.Dbg,
 		BotUsername:     botUsername,
@@ -799,7 +797,7 @@ func collectMaskedSecrets(appSettings *config.Settings) []string {
 	add(appSettings.Jev.Token)
 	add(appSettings.CAS.Token)
 	add(appSettings.Captcha.Turnstile.Secret)
-	add(appSettings.Server.OIDC.ClientSecret)
+	add(appSettings.Transient.OIDC.ClientSecret)
 	// the auto-generated password is printed for the operator, so it is not masked
 	if appSettings.Transient.WebAuthPasswd != "auto" {
 		add(appSettings.Transient.WebAuthPasswd)

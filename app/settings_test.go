@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"math"
 	"os"
 	"path/filepath"
@@ -161,51 +162,6 @@ func TestApplyCLIOverrides(t *testing.T) {
 		applyCLIOverrides(&settings, opts, defaults)
 		assert.Equal(t, "cli-cas", settings.CAS.Token)
 		assert.Equal(t, []string{config.FieldCASToken}, settings.Transient.CredentialsFromCLI)
-	})
-
-	t.Run("oidc client secret CLI overrides DB value and is recorded", func(t *testing.T) {
-		settings := config.Settings{Server: config.ServerSettings{OIDC: config.OIDCSettings{ClientSecret: "db-oidc"}}}
-		opts := newDefaultOpts(t)
-		opts.Server.OIDC.ClientSecret = "cli-oidc"
-		applyCLIOverrides(&settings, opts, defaults)
-		assert.Equal(t, "cli-oidc", settings.Server.OIDC.ClientSecret)
-		assert.Equal(t, []string{config.FieldOIDCSecret}, settings.Transient.CredentialsFromCLI)
-	})
-
-	t.Run("oidc issuer on CLI replaces the stored login", func(t *testing.T) {
-		settings := config.Settings{Server: config.ServerSettings{OIDC: config.OIDCSettings{Issuer: "https://db.example.com",
-			ClientID: "db", URL: "https://db-ui.example.com", Allow: []string{"sub:db"}, ClientSecret: "db-secret"}}}
-		opts := newDefaultOpts(t)
-		opts.Server.OIDC.Issuer = "https://cli.example.com"
-		opts.Server.OIDC.ClientID = "cli"
-		opts.Server.OIDC.URL = "https://cli-ui.example.com"
-		opts.Server.OIDC.Allow = []string{"role:admin"}
-		applyCLIOverrides(&settings, opts, defaults)
-		assert.Equal(t, config.OIDCSettings{Issuer: "https://cli.example.com", ClientID: "cli",
-			URL: "https://cli-ui.example.com", Allow: []string{"role:admin"}, ClientSecret: "db-secret"}, settings.Server.OIDC)
-		assert.True(t, settings.OIDCActive())
-	})
-
-	t.Run("no oidc on CLI keeps the stored login", func(t *testing.T) {
-		settings := config.Settings{Server: config.ServerSettings{OIDC: config.OIDCSettings{Issuer: "https://db.example.com"}}}
-		applyCLIOverrides(&settings, newDefaultOpts(t), defaults)
-		assert.Equal(t, "https://db.example.com", settings.Server.OIDC.Issuer)
-		assert.True(t, settings.OIDCActive())
-	})
-
-	t.Run("basic auth on CLI turns a stored oidc login off", func(t *testing.T) {
-		for _, set := range []func(o *options){
-			func(o *options) { o.Server.AuthPasswd = "recover" },
-			func(o *options) { o.Server.AuthHash = "$2a$10$hash" },
-		} {
-			settings := config.Settings{Server: config.ServerSettings{OIDC: config.OIDCSettings{Issuer: "https://db.example.com"}}}
-			opts := newDefaultOpts(t)
-			set(&opts)
-			applyCLIOverrides(&settings, opts, defaults)
-			assert.Equal(t, "https://db.example.com", settings.Server.OIDC.Issuer, "stored login is kept for later")
-			assert.True(t, settings.Transient.OIDCOffByCLI)
-			assert.False(t, settings.OIDCActive())
-		}
 	})
 
 	t.Run("empty cas token CLI keeps DB value", func(t *testing.T) {
@@ -1752,7 +1708,7 @@ func Test_applyAutoAuthFallback_DisabledServerSkipsAutoAuth(t *testing.T) {
 func Test_applyAutoAuthFallback_OIDCSkipsAutoAuth(t *testing.T) {
 	settings := &config.Settings{}
 	settings.Server.Enabled = true
-	settings.Server.OIDC.Issuer = "https://auth.example.com"
+	settings.Transient.OIDC.Issuer = "https://auth.example.com"
 
 	applyAutoAuthFallback(settings)
 
@@ -1869,4 +1825,22 @@ func TestJevNaNThresholdRejectedFromCLIPath(t *testing.T) {
 	err := got.Validate()
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "finite")
+}
+
+func TestOIDCSettingsFromOptions(t *testing.T) {
+	var opts options
+	require.NoError(t, applyStructTagDefaults(reflect.ValueOf(&opts).Elem()))
+	opts.Server.OIDC.Issuer = "https://auth.example.com"
+	opts.Server.OIDC.ClientID = "tg-spam"
+	opts.Server.OIDC.ClientSecret = "oidc-cs-7f3a"
+	opts.Server.OIDC.URL = "https://tg.example.com"
+	opts.Server.OIDC.Allow = []string{"role:admin"}
+	want := config.OIDCSettings{Issuer: "https://auth.example.com", ClientID: "tg-spam", ClientSecret: "oidc-cs-7f3a",
+		URL: "https://tg.example.com", Allow: []string{"role:admin"}}
+	assert.Equal(t, want, optToSettings(opts).Transient.OIDC)
+
+	blob, err := json.Marshal(optToSettings(opts))
+	require.NoError(t, err)
+	assert.NotContains(t, string(blob), "auth.example.com", "oidc settings are never stored")
+	assert.NotContains(t, string(blob), "oidc-cs-7f3a")
 }

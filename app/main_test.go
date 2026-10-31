@@ -1534,7 +1534,7 @@ func TestCollectMaskedSecrets(t *testing.T) {
 		s.Jev.Token = "jev-secret"
 		s.CAS.Token = "cas-secret"
 		s.Server.AuthHash = "hash-secret"
-		s.Server.OIDC.ClientSecret = "oidc-secret"
+		s.Transient.OIDC.ClientSecret = "oidc-secret"
 
 		masked := collectMaskedSecrets(s)
 		assert.Contains(t, masked, "oidc-secret")
