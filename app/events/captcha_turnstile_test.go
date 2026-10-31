@@ -310,11 +310,11 @@ func TestCaptcha_TurnstileJoin(t *testing.T) {
 			query string
 			text  string
 		}{
-			"no login":          {"", "allow the login"},
+			"no login":          {"", "press the button in the chat again"},
 			"another user":      {loginQuery(43, time.Now(), testBotToken), "this verification is for another user"},
-			"stale login":       {loginQuery(42, time.Now().Add(-time.Hour), testBotToken), "allow the login"},
-			"other bot's token": {loginQuery(42, time.Now(), "999:other"), "allow the login"},
-			"tampered":          {tampered, "allow the login"},
+			"stale login":       {loginQuery(42, time.Now().Add(-time.Hour), testBotToken), "press the button in the chat again"},
+			"other bot's token": {loginQuery(42, time.Now(), "999:other"), "press the button in the chat again"},
+			"tampered":          {tampered, "press the button in the chat again"},
 		} {
 			for _, method := range []string{http.MethodGet, http.MethodPost} {
 				rec := doPage(c, method, nonce, "good", nil, tc.query)
