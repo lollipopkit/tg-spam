@@ -316,6 +316,14 @@ type OIDCSettings struct {
 	Allow        []string
 }
 
+// CaptchaOIDCSettings make the Turnstile captcha ask members to sign in at an OpenID Connect issuer, when Issuer
+// is set. Any account of the issuer passes. Flags or env only, like OIDCSettings
+type CaptchaOIDCSettings struct {
+	Issuer       string
+	ClientID     string
+	ClientSecret string
+}
+
 // Enabled reports whether the OIDC login replaces basic auth
 func (o OIDCSettings) Enabled() bool { return o.Issuer != "" }
 
@@ -341,6 +349,9 @@ type TransientSettings struct {
 
 	// OIDC login of the web UI, replaces basic auth when its issuer is set
 	OIDC OIDCSettings `json:"-" yaml:"-"`
+
+	// sign-in the turnstile captcha asks for after the widget passes, when its issuer is set
+	CaptchaOIDC CaptchaOIDCSettings `json:"-" yaml:"-"`
 
 	// authFromCLI marks web auth (hash or password) as held in memory rather
 	// than authoritative in the database. It is set by applyCLIOverrides for
@@ -411,6 +422,12 @@ func (s *Settings) Validate() error {
 		}
 	}
 	if err := ValidateOIDC(s.Transient.OIDC); err != nil {
+		return err
+	}
+	if s.Transient.CaptchaOIDC.Issuer != "" && (!s.Captcha.Enabled || s.Captcha.Turnstile.SiteKey == "") {
+		return fmt.Errorf("captcha.oidc needs the captcha enabled in turnstile mode, drop --captcha.oidc.* to change that")
+	}
+	if err := ValidateCaptchaOIDC(s.Transient.CaptchaOIDC); err != nil {
 		return err
 	}
 	if s.MaxShortMsgCount < 0 {
@@ -559,6 +576,30 @@ func ValidateTurnstile(siteKey, secret, publicURL, listen string) error {
 	return nil
 }
 
+// ValidateCaptchaOIDC checks the captcha sign-in settings when an issuer enables it: an https issuer, a client id
+// and a secret
+func ValidateCaptchaOIDC(o CaptchaOIDCSettings) error {
+	if o.Issuer == "" {
+		if o.ClientID != "" || o.ClientSecret != "" {
+			// a mistyped issuer variable would otherwise leave the sign-in silently off
+			return fmt.Errorf("captcha.oidc client id or secret set without captcha.oidc.issuer")
+		}
+		return nil
+	}
+	return validateOIDCClient("captcha.oidc", o.Issuer, o.ClientID, o.ClientSecret)
+}
+
+// validateOIDCClient checks an https issuer and the presence of the client id and secret
+func validateOIDCClient(name, issuer, clientID, clientSecret string) error {
+	if clientID == "" || clientSecret == "" {
+		return fmt.Errorf("%s needs a client id and a client secret", name)
+	}
+	if u, err := url.Parse(issuer); err != nil || u.Scheme != "https" || u.Hostname() == "" {
+		return fmt.Errorf("%s.issuer (%q) must be an https url", name, issuer)
+	}
+	return nil
+}
+
 // ValidateOIDC checks the OIDC login settings when an issuer enables it: an https issuer, a client id and
 // secret, an allow list (an empty one would let any account of the issuer in), and the public https url of
 // the web UI as a bare host, since the callback is served at /auth/callback from the root
@@ -566,11 +607,8 @@ func ValidateOIDC(o OIDCSettings) error {
 	if !o.Enabled() {
 		return nil
 	}
-	if o.ClientID == "" || o.ClientSecret == "" {
-		return fmt.Errorf("server.oidc needs a client id and a client secret")
-	}
-	if u, err := url.Parse(o.Issuer); err != nil || u.Scheme != "https" || u.Hostname() == "" {
-		return fmt.Errorf("server.oidc.issuer (%q) must be an https url", o.Issuer)
+	if err := validateOIDCClient("server.oidc", o.Issuer, o.ClientID, o.ClientSecret); err != nil {
+		return err
 	}
 	if !isBareHTTPSURL(o.URL) {
 		return fmt.Errorf("server.oidc.url (%q) must be an https url of a host, without a path, query or fragment", o.URL)

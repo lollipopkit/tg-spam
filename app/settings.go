@@ -223,6 +223,7 @@ func optToSettings(opts options) *config.Settings {
 		ConfigDBEncryptKey: opts.ConfigDBEncryptKey,
 		LuaUnrestricted:    opts.LuaPlugins.Unrestricted,
 		OIDC:               oidcSettings(opts),
+		CaptchaOIDC:        captchaOIDCSettings(opts),
 	}
 
 	// set credentials in their respective domain structures
@@ -648,6 +649,15 @@ func oidcSettings(opts options) config.OIDCSettings {
 		ClientSecret: opts.Server.OIDC.ClientSecret,
 		URL:          opts.Server.OIDC.URL,
 		Allow:        oidcAllow(opts.Server.OIDC.Allow),
+	}
+}
+
+// captchaOIDCSettings builds the captcha sign-in settings from the command line; they are never stored
+func captchaOIDCSettings(opts options) config.CaptchaOIDCSettings {
+	return config.CaptchaOIDCSettings{
+		Issuer:       opts.Captcha.OIDC.Issuer,
+		ClientID:     opts.Captcha.OIDC.ClientID,
+		ClientSecret: opts.Captcha.OIDC.ClientSecret,
 	}
 }
 

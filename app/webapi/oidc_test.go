@@ -2,112 +2,31 @@ package webapi
 
 import (
 	"context"
-	"crypto"
-	"crypto/rand"
-	"crypto/rsa"
-	"crypto/sha256"
 	"encoding/base64"
-	"encoding/json"
 	"fmt"
-	"maps"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
-	"github.com/go-jose/go-jose/v4"
 	"github.com/go-pkgz/rest"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/umputun/tg-spam/app/config"
+	"github.com/umputun/tg-spam/app/openid/openidtest"
 	"github.com/umputun/tg-spam/app/webapi/mocks"
 )
 
-// fakeIssuer is a minimal OIDC provider: discovery, jwks and a token endpoint that checks the PKCE verifier
-type fakeIssuer struct {
-	srv *httptest.Server
-	key *rsa.PrivateKey
-
-	mu        sync.Mutex
-	challenge string         // code_challenge of the last authorize request
-	nonce     string         // nonce put into the id token, defaults to the one from the authorize request
-	claims    map[string]any // extra id token claims
-	noLogout  bool           // discovery without end_session_endpoint
-}
-
-func newFakeIssuer(t *testing.T) *fakeIssuer {
-	t.Helper()
-	key, err := rsa.GenerateKey(rand.Reader, 2048)
-	require.NoError(t, err)
-	f := &fakeIssuer{key: key}
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /.well-known/openid-configuration", func(w http.ResponseWriter, _ *http.Request) {
-		meta := map[string]any{
-			"issuer":                                f.srv.URL,
-			"authorization_endpoint":                f.srv.URL + "/authorize",
-			"token_endpoint":                        f.srv.URL + "/token",
-			"jwks_uri":                              f.srv.URL + "/jwks",
-			"end_session_endpoint":                  f.srv.URL + "/logout",
-			"id_token_signing_alg_values_supported": []string{"RS256"},
-		}
-		if f.noLogout {
-			delete(meta, "end_session_endpoint")
-		}
-		_ = json.NewEncoder(w).Encode(meta)
-	})
-	mux.HandleFunc("GET /jwks", func(w http.ResponseWriter, _ *http.Request) {
-		_ = json.NewEncoder(w).Encode(jose.JSONWebKeySet{Keys: []jose.JSONWebKey{
-			{Key: &key.PublicKey, KeyID: "k1", Algorithm: "RS256", Use: "sig"}}})
-	})
-	mux.HandleFunc("POST /token", func(w http.ResponseWriter, r *http.Request) {
-		if err := r.ParseForm(); err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
-			return
-		}
-		sum := sha256.Sum256([]byte(r.PostForm.Get("code_verifier")))
-		f.mu.Lock()
-		defer f.mu.Unlock()
-		if r.PostForm.Get("code") != "good-code" || base64.RawURLEncoding.EncodeToString(sum[:]) != f.challenge {
-			http.Error(w, `{"error":"invalid_grant"}`, http.StatusBadRequest)
-			return
-		}
-		claims := map[string]any{"iss": f.srv.URL, "aud": "tg-spam", "sub": "u1", "nonce": f.nonce,
-			"exp": time.Now().Add(time.Hour).Unix(), "iat": time.Now().Unix()}
-		maps.Copy(claims, f.claims)
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]any{"access_token": "at", "token_type": "Bearer",
-			"id_token": f.sign(t, claims)})
-	})
-	f.srv = httptest.NewTLSServer(mux)
-	t.Cleanup(f.srv.Close)
-	return f
-}
-
-func (f *fakeIssuer) sign(t *testing.T, claims map[string]any) string {
-	t.Helper()
-	enc := func(v any) string {
-		b, err := json.Marshal(v)
-		require.NoError(t, err)
-		return base64.RawURLEncoding.EncodeToString(b)
-	}
-	unsigned := enc(map[string]string{"alg": "RS256", "kid": "k1", "typ": "JWT"}) + "." + enc(claims)
-	sum := sha256.Sum256([]byte(unsigned))
-	sig, err := rsa.SignPKCS1v15(rand.Reader, f.key, crypto.SHA256, sum[:])
-	require.NoError(t, err)
-	return unsigned + "." + base64.RawURLEncoding.EncodeToString(sig)
-}
-
 // newTestOIDC returns the auth wired to the fake issuer and a handler with the middleware and the login routes
-func newTestOIDC(t *testing.T, f *fakeIssuer, allow ...string) (*oidcAuth, http.Handler) {
+func newTestOIDC(t *testing.T, f *openidtest.Issuer, allow ...string) (*oidcAuth, http.Handler) {
 	t.Helper()
-	a, err := newOIDCAuth(config.OIDCSettings{Issuer: f.srv.URL, ClientID: "tg-spam", ClientSecret: "secret",
+	a, err := newOIDCAuth(config.OIDCSettings{Issuer: f.Srv.URL, ClientID: "tg-spam", ClientSecret: "secret",
 		URL: "https://example.com", Allow: allow})
 	require.NoError(t, err)
-	a.client = f.srv.Client()
+	a.idp.HTTP = f.Srv.Client()
 	// same layout as Server.Run: login routes outside the guarded handler, everything else inside
 	guarded := http.NewServeMux()
 	guarded.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte("ok")) })
@@ -122,20 +41,13 @@ func newTestOIDC(t *testing.T, f *fakeIssuer, allow ...string) (*oidcAuth, http.
 }
 
 // login runs the login redirect and returns the state cookie and the authorize request parameters
-func login(t *testing.T, f *fakeIssuer, h http.Handler, rd string) (*http.Cookie, url.Values) {
+func login(t *testing.T, f *openidtest.Issuer, h http.Handler, rd string) (*http.Cookie, url.Values) {
 	t.Helper()
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, oidcLoginPath+"?rd="+url.QueryEscape(rd), http.NoBody))
 	require.Equal(t, http.StatusFound, rec.Code, rec.Body.String())
-	loc, err := url.Parse(rec.Header().Get("Location"))
-	require.NoError(t, err)
-	q := loc.Query()
-	assert.Equal(t, f.srv.URL+"/authorize", loc.Scheme+"://"+loc.Host+loc.Path)
-	assert.Equal(t, "S256", q.Get("code_challenge_method"))
+	q := f.Authorize(t, rec.Header().Get("Location"))
 	assert.Equal(t, "https://example.com/auth/callback", q.Get("redirect_uri"))
-	f.mu.Lock()
-	f.challenge, f.nonce = q.Get("code_challenge"), q.Get("nonce")
-	f.mu.Unlock()
 	cookies := rec.Result().Cookies()
 	require.Len(t, cookies, 1)
 	assert.Equal(t, oidcStatePrefix+q.Get("state"), cookies[0].Name)
@@ -164,7 +76,7 @@ func sessionCookie(rec *httptest.ResponseRecorder) *http.Cookie {
 }
 
 func TestOIDC_Middleware(t *testing.T) {
-	_, h := newTestOIDC(t, newFakeIssuer(t), "role:admin")
+	_, h := newTestOIDC(t, openidtest.New(t, "tg-spam"), "role:admin")
 
 	t.Run("page load redirects to login", func(t *testing.T) {
 		rec := httptest.NewRecorder()
@@ -264,8 +176,8 @@ func TestOIDC_LoginFlow(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			f := newFakeIssuer(t)
-			f.claims = tc.claims
+			f := openidtest.New(t, "tg-spam")
+			f.SetClaims(tc.claims)
 			_, h := newTestOIDC(t, f, tc.allow...)
 			state, q := login(t, f, h, "/manage_users")
 
@@ -290,8 +202,8 @@ func TestOIDC_LoginFlow(t *testing.T) {
 }
 
 func TestOIDC_CallbackRejects(t *testing.T) {
-	f := newFakeIssuer(t)
-	f.claims = map[string]any{"roles": []string{"admin"}}
+	f := openidtest.New(t, "tg-spam")
+	f.SetClaims(map[string]any{"roles": []string{"admin"}})
 	a, h := newTestOIDC(t, f, "role:admin")
 
 	t.Run("no state cookie", func(t *testing.T) {
@@ -317,13 +229,9 @@ func TestOIDC_CallbackRejects(t *testing.T) {
 	})
 	t.Run("logins in two tabs", func(t *testing.T) {
 		first, q1 := login(t, f, h, "/first")
-		f.mu.Lock()
-		challenge, nonce := f.challenge, f.nonce
-		f.mu.Unlock()
+		challenge, nonce := f.Pending()
 		_, _ = login(t, f, h, "/second") // overwrites the fake issuer's record, not the first tab's cookie
-		f.mu.Lock()
-		f.challenge, f.nonce = challenge, nonce
-		f.mu.Unlock()
+		f.SetPending(challenge, nonce)
 		rec := callback(h, first, "code=good-code&state="+q1.Get("state"))
 		require.Equal(t, http.StatusFound, rec.Code, rec.Body.String())
 		assert.Equal(t, "/first", rec.Header().Get("Location"))
@@ -338,9 +246,7 @@ func TestOIDC_CallbackRejects(t *testing.T) {
 	})
 	t.Run("nonce mismatch", func(t *testing.T) {
 		state, q := login(t, f, h, "/")
-		f.mu.Lock()
-		f.nonce = "other"
-		f.mu.Unlock()
+		f.SetNonce("other")
 		rec := callback(h, state, "code=good-code&state="+q.Get("state"))
 		assert.Equal(t, http.StatusForbidden, rec.Code)
 		assert.Nil(t, sessionCookie(rec))
@@ -381,7 +287,7 @@ func TestOIDC_CallbackRejects(t *testing.T) {
 }
 
 func TestOIDC_Session(t *testing.T) {
-	a, h := newTestOIDC(t, newFakeIssuer(t), "role:admin")
+	a, h := newTestOIDC(t, openidtest.New(t, "tg-spam"), "role:admin")
 	do := func(c *http.Cookie) int {
 		req := httptest.NewRequest(http.MethodPost, "/check", http.NoBody)
 		req.AddCookie(c)
@@ -419,7 +325,7 @@ func TestOIDC_Session(t *testing.T) {
 }
 
 func TestOIDC_Logout(t *testing.T) {
-	f := newFakeIssuer(t)
+	f := openidtest.New(t, "tg-spam")
 	_, h := newTestOIDC(t, f, "role:admin")
 	checkCleared := func(rec *httptest.ResponseRecorder) {
 		cookies := rec.Result().Cookies()
@@ -433,7 +339,7 @@ func TestOIDC_Logout(t *testing.T) {
 		rec := httptest.NewRecorder()
 		h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/logout", http.NoBody))
 		assert.Equal(t, http.StatusSeeOther, rec.Code)
-		assert.Equal(t, f.srv.URL+"/logout?client_id=tg-spam", rec.Header().Get("Location"))
+		assert.Equal(t, f.Srv.URL+"/logout?client_id=tg-spam", rec.Header().Get("Location"))
 		checkCleared(rec)
 	})
 	t.Run("logout revokes the session", func(t *testing.T) {
@@ -460,13 +366,13 @@ func TestOIDC_Logout(t *testing.T) {
 		req.Header.Set("HX-Request", "true")
 		h.ServeHTTP(rec, req)
 		assert.Equal(t, http.StatusNoContent, rec.Code)
-		assert.Equal(t, f.srv.URL+"/logout?client_id=tg-spam", rec.Header().Get("HX-Redirect"))
+		assert.Equal(t, f.Srv.URL+"/logout?client_id=tg-spam", rec.Header().Get("HX-Redirect"))
 		assert.Empty(t, rec.Header().Get("Location"))
 		checkCleared(rec)
 	})
 	t.Run("provider without logout endpoint ends on a local page", func(t *testing.T) {
-		nf := newFakeIssuer(t)
-		nf.noLogout = true
+		nf := openidtest.New(t, "tg-spam")
+		nf.SetNoLogout()
 		_, nh := newTestOIDC(t, nf, "role:admin")
 		rec := httptest.NewRecorder()
 		nh.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/logout", http.NoBody))
@@ -503,7 +409,7 @@ func TestOIDC_Logout(t *testing.T) {
 }
 
 func TestOIDC_Scopes(t *testing.T) {
-	f := newFakeIssuer(t)
+	f := openidtest.New(t, "tg-spam")
 	_, h := newTestOIDC(t, f, "role:admin")
 	_, q := login(t, f, h, "/")
 	assert.Equal(t, "openid profile email", q.Get("scope"))
@@ -587,41 +493,4 @@ func TestServer_RunOIDC(t *testing.T) {
 
 	cancel()
 	<-done
-}
-
-func TestOIDC_DiscoveryFailureIsCached(t *testing.T) {
-	var calls int
-	var mu sync.Mutex
-	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		mu.Lock()
-		calls++
-		mu.Unlock()
-		http.Error(w, "down", http.StatusServiceUnavailable)
-	}))
-	defer srv.Close()
-	a, err := newOIDCAuth(config.OIDCSettings{Issuer: srv.URL, ClientID: "c", ClientSecret: "s",
-		URL: "https://tg.example.com", Allow: []string{"sub:x"}})
-	require.NoError(t, err)
-	a.client = srv.Client()
-
-	var wg sync.WaitGroup
-	for range 10 {
-		wg.Go(func() {
-			_, derr := a.discover(t.Context())
-			assert.Error(t, derr)
-		})
-	}
-	wg.Wait()
-	mu.Lock()
-	assert.Equal(t, 1, calls, "concurrent and repeated discoveries within the retry interval share one fetch")
-	mu.Unlock()
-
-	a.mu.Lock()
-	a.failedAt = time.Now().Add(-oidcRetryAfter)
-	a.mu.Unlock()
-	_, err = a.discover(t.Context())
-	require.Error(t, err)
-	mu.Lock()
-	assert.Equal(t, 2, calls, "retried after the interval")
-	mu.Unlock()
 }

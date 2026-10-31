@@ -885,6 +885,42 @@ func TestSettings_ValidateCaptcha(t *testing.T) {
 	}
 }
 
+func TestSettings_ValidateCaptchaOIDC(t *testing.T) {
+	turnstile := CaptchaSettings{Enabled: true, Timeout: time.Minute, Turnstile: TurnstileSettings{SiteKey: "k",
+		Secret: "s", URL: "https://verify.example.com", Listen: ":8081"}}
+	valid := CaptchaOIDCSettings{Issuer: "https://auth.example.com/auth/v1/", ClientID: "tg-bot", ClientSecret: "s"}
+	tests := []struct {
+		name    string
+		captcha CaptchaSettings
+		oidc    CaptchaOIDCSettings
+		wantErr string
+	}{
+		{name: "valid", captcha: turnstile, oidc: valid},
+		{name: "off", captcha: CaptchaSettings{}, oidc: CaptchaOIDCSettings{}},
+		{name: "client without issuer", captcha: turnstile, oidc: CaptchaOIDCSettings{ClientID: "x"},
+			wantErr: "without captcha.oidc.issuer"},
+		{name: "captcha disabled", captcha: CaptchaSettings{}, oidc: valid,
+			wantErr: "captcha.oidc needs the captcha enabled in turnstile mode"},
+		{name: "animation mode", captcha: CaptchaSettings{Enabled: true, Timeout: time.Minute}, oidc: valid,
+			wantErr: "captcha.oidc needs the captcha enabled in turnstile mode"},
+		{name: "no secret", captcha: turnstile, oidc: CaptchaOIDCSettings{Issuer: valid.Issuer, ClientID: "c"},
+			wantErr: "needs a client id and a client secret"},
+		{name: "http issuer", captcha: turnstile, oidc: CaptchaOIDCSettings{Issuer: "http://auth.example.com",
+			ClientID: "c", ClientSecret: "s"}, wantErr: "captcha.oidc.issuer"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := &Settings{Captcha: tt.captcha, Transient: TransientSettings{CaptchaOIDC: tt.oidc}}
+			err := s.Validate()
+			if tt.wantErr == "" {
+				require.NoError(t, err)
+				return
+			}
+			require.ErrorContains(t, err, tt.wantErr)
+		})
+	}
+}
+
 func TestSettings_ValidateOIDC(t *testing.T) {
 	valid := OIDCSettings{Issuer: "https://auth.example.com/auth/v1/", ClientID: "tg-spam", ClientSecret: "s",
 		URL: "https://tg.example.com", Allow: []string{"role:admin", "email:a@example.com"}}

@@ -15,6 +15,7 @@ import (
 	tbapi "github.com/OvyFlash/telegram-bot-api"
 
 	"github.com/umputun/tg-spam/app/bot"
+	"github.com/umputun/tg-spam/app/openid"
 )
 
 // captchaPrefix marks callback data of captcha buttons, "C<userID>:<choice>" with choice a candidate number
@@ -74,6 +75,7 @@ type pendingCaptcha struct {
 	page   bool   // posted as a turnstile page rather than the animation
 	lang   string // member's telegram language, for the texts the bot shows them
 	timer  *time.Timer
+	login  *openid.Login // sign-in started after turnstile passed, when the captcha asks for an account; guarded by mu
 }
 
 type captchaFailure struct {
@@ -155,9 +157,20 @@ func (c *captcha) verify(p *pendingCaptcha) {
 
 	sent, code, page, err := c.challenge(c.chatID, p)
 	if err != nil {
-		if c.take(c.pending, user.ID, p) != nil {
-			c.unmute(user)
+		if c.take(c.pending, user.ID, p) == nil {
+			return
 		}
+		if c.signInRequired() {
+			// the sign-in is reachable only through the page, letting the member in would skip it
+			if merr := c.muteForever(user); merr != nil {
+				log.Printf("[ERROR] failed to send captcha to %s and to mute for good, the mute expires: %v, %v",
+					user, err, merr)
+				return
+			}
+			log.Printf("[ERROR] failed to send captcha to %s, muted for good as sign-in is required: %v", user, err)
+			return
+		}
+		c.unmute(user)
 		log.Printf("[WARN] failed to send captcha to %s, unmuted: %v", user, err)
 		return
 	}
@@ -253,6 +266,9 @@ const (
 	txtPageLogin
 	txtPromptMotion    // default caption of the animation, with {user} and {timeout}
 	txtPromptTurnstile // default caption of the turnstile button
+	txtPageSignIn      // the sign-in step after turnstile, when the captcha asks for an account
+	txtPageSignInButton
+	txtPageSignInFailed
 )
 
 var captchaTexts = map[string][]string{
@@ -279,28 +295,34 @@ var captchaTexts = map[string][]string{
 			"removed from the chat. Tap the animation if it does not play.",
 		txtPromptTurnstile: "{user}, press the button below and complete the check within {timeout}, " +
 			"otherwise you will be removed from the chat.",
-		txtTestTimeoutPage: "captcha test timed out after %s. a member would be removed (test only, nothing happened to you)",
+		txtTestTimeoutPage:  "captcha test timed out after %s. a member would be removed (test only, nothing happened to you)",
+		txtPageSignIn:       "One more step: sign in to your account, or create one, to be let into the chat.",
+		txtPageSignInButton: "Sign in",
+		txtPageSignInFailed: "Sign-in did not complete. Please try again.",
 	},
 	"zh": { //nolint:gosec // user-facing texts, not credentials
-		txtExpired:         "此验证已失效",
-		txtOtherUser:       "这不是你的验证",
-		txtVerified:        "验证通过",
-		txtWrong:           "答案错误",
-		txtDisabled:        "入群验证未启用",
-		txtTestPassed:      "验证测试通过，成员这样操作会被放行",
-		txtTestFailed:      "验证测试未通过：选择了 %s，正确答案是 %s。成员会被移出 %s，之后每次失败时长翻倍（仅为测试，你不受影响）",
-		txtTestTimeout:     "验证测试已超时（%s），正确答案是 %s。成员会被移出（仅为测试，你不受影响）",
-		txtTestError:       "验证测试失败：%s",
-		txtVerifyButton:    "点击验证",
-		txtPageTitle:       "入群验证",
-		txtPageHint:        "完成下方验证后即可在群里发言。",
-		txtPageDone:        "验证通过，可以返回 Telegram 了。",
-		txtPageFailed:      "验证未通过，请重试。",
-		txtPageExpired:     "此验证已失效或已完成。",
-		txtPageLogin:       "请在 Telegram 里点按钮打开此页面，并允许登录，bot 需要据此确认你的身份。",
-		txtPromptMotion:    "{user}，请在 {timeout} 内选择动图中移动的数字，否则会被移出群组。动图不动请点一下。",
-		txtPromptTurnstile: "{user}，请在 {timeout} 内点击下方按钮完成验证，否则会被移出群组。",
-		txtTestTimeoutPage: "验证测试已超时（%s）。成员会被移出（仅为测试，你不受影响）",
+		txtExpired:          "此验证已失效",
+		txtOtherUser:        "这不是你的验证",
+		txtVerified:         "验证通过",
+		txtWrong:            "答案错误",
+		txtDisabled:         "入群验证未启用",
+		txtTestPassed:       "验证测试通过，成员这样操作会被放行",
+		txtTestFailed:       "验证测试未通过：选择了 %s，正确答案是 %s。成员会被移出 %s，之后每次失败时长翻倍（仅为测试，你不受影响）",
+		txtTestTimeout:      "验证测试已超时（%s），正确答案是 %s。成员会被移出（仅为测试，你不受影响）",
+		txtTestError:        "验证测试失败：%s",
+		txtVerifyButton:     "点击验证",
+		txtPageTitle:        "入群验证",
+		txtPageHint:         "完成下方验证后即可在群里发言。",
+		txtPageDone:         "验证通过，可以返回 Telegram 了。",
+		txtPageFailed:       "验证未通过，请重试。",
+		txtPageExpired:      "此验证已失效或已完成。",
+		txtPageLogin:        "请在 Telegram 里点按钮打开此页面，并允许登录，bot 需要据此确认你的身份。",
+		txtPromptMotion:     "{user}，请在 {timeout} 内选择动图中移动的数字，否则会被移出群组。动图不动请点一下。",
+		txtPromptTurnstile:  "{user}，请在 {timeout} 内点击下方按钮完成验证，否则会被移出群组。",
+		txtTestTimeoutPage:  "验证测试已超时（%s）。成员会被移出（仅为测试，你不受影响）",
+		txtPageSignIn:       "还差一步：登录账号（没有账号可以注册）后即可在群里发言。",
+		txtPageSignInButton: "登录",
+		txtPageSignInFailed: "登录未完成，请重试。",
 	},
 	"ru": { //nolint:gosec // user-facing texts, not credentials
 		txtExpired:    "эта проверка устарела",
@@ -325,7 +347,10 @@ var captchaTexts = map[string][]string{
 			"удалены из чата. Нажмите на анимацию, если она не воспроизводится.",
 		txtPromptTurnstile: "{user}, нажмите кнопку ниже и пройдите проверку в течение {timeout}, иначе вы будете " +
 			"удалены из чата.",
-		txtTestTimeoutPage: "время теста истекло (%s). участник был бы удалён (это только тест, вас это не затронуло)",
+		txtTestTimeoutPage:  "время теста истекло (%s). участник был бы удалён (это только тест, вас это не затронуло)",
+		txtPageSignIn:       "Остался один шаг: войдите в аккаунт или создайте его, чтобы писать в чате.",
+		txtPageSignInButton: "Войти",
+		txtPageSignInFailed: "Вход не завершён. Попробуйте ещё раз.",
 	},
 }
 
@@ -569,6 +594,14 @@ func (c *captcha) challenge(chatID int64, p *pendingCaptcha) (sent tbapi.Message
 		if err == nil {
 			return sent, nonce, true, nil
 		}
+		if c.signInRequired() {
+			// the animation has no sign-in step, so there is no fallback; the send is tried again on each join
+			if strings.Contains(err.Error(), "BOT_DOMAIN_INVALID") {
+				log.Printf("[ERROR] telegram refuses the turnstile login button, set the bot domain with @BotFather "+
+					"/setdomain: %v", err)
+			}
+			return tbapi.Message{}, "", false, err
+		}
 		// a login button is refused while the bot's domain is not set; falling back keeps members verified,
 		// and remembering the refusal spares a failing send per join until a restart
 		if strings.Contains(err.Error(), "BOT_DOMAIN_INVALID") && !c.turnstile.refused.Swap(true) {
@@ -582,6 +615,9 @@ func (c *captcha) challenge(chatID int64, p *pendingCaptcha) (sent tbapi.Message
 	sent, err = c.send(chatID, p.user, code, c.motionPrompt(p))
 	return sent, code, false, err
 }
+
+// signInRequired reports whether members must sign in at an OIDC issuer after Turnstile
+func (c *captcha) signInRequired() bool { return c.turnstile != nil && c.turnstile.idp != nil }
 
 // isCurrent reports whether p is still the member's captcha in m
 func (c *captcha) isCurrent(m map[int64]*pendingCaptcha, p *pendingCaptcha) bool {
