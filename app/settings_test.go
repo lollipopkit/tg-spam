@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"math"
 	"os"
 	"path/filepath"
@@ -1704,6 +1705,17 @@ func Test_applyAutoAuthFallback_DisabledServerSkipsAutoAuth(t *testing.T) {
 	assert.Empty(t, settings.Server.AuthHash)
 }
 
+func Test_applyAutoAuthFallback_OIDCSkipsAutoAuth(t *testing.T) {
+	settings := &config.Settings{}
+	settings.Server.Enabled = true
+	settings.Transient.OIDC.Issuer = "https://auth.example.com"
+
+	applyAutoAuthFallback(settings)
+
+	assert.Empty(t, settings.Transient.WebAuthPasswd, "oidc login must skip the basic auth fallback")
+	assert.False(t, settings.Transient.AuthFromCLI)
+}
+
 func Test_applyAutoAuthFallback_NonEmptyPasswdHonored(t *testing.T) {
 	settings := &config.Settings{}
 	settings.Server.Enabled = true
@@ -1813,4 +1825,22 @@ func TestJevNaNThresholdRejectedFromCLIPath(t *testing.T) {
 	err := got.Validate()
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "finite")
+}
+
+func TestOIDCSettingsFromOptions(t *testing.T) {
+	var opts options
+	require.NoError(t, applyStructTagDefaults(reflect.ValueOf(&opts).Elem()))
+	opts.Server.OIDC.Issuer = "https://auth.example.com"
+	opts.Server.OIDC.ClientID = "tg-spam"
+	opts.Server.OIDC.ClientSecret = "oidc-cs-7f3a"
+	opts.Server.OIDC.URL = "https://tg.example.com"
+	opts.Server.OIDC.Allow = []string{"role:admin", " ", " email:a@example.com "}
+	want := config.OIDCSettings{Issuer: "https://auth.example.com", ClientID: "tg-spam", ClientSecret: "oidc-cs-7f3a",
+		URL: "https://tg.example.com", Allow: []string{"role:admin", "email:a@example.com"}}
+	assert.Equal(t, want, optToSettings(opts).Transient.OIDC)
+
+	blob, err := json.Marshal(optToSettings(opts))
+	require.NoError(t, err)
+	assert.NotContains(t, string(blob), "auth.example.com", "oidc settings are never stored")
+	assert.NotContains(t, string(blob), "oidc-cs-7f3a")
 }

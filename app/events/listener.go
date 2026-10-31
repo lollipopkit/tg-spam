@@ -72,7 +72,8 @@ type TelegramListener struct {
 	AdmitContacts           bool            // admit text-less shared contacts, same as AdmitDocuments
 	AdmitAudio              bool            // admit text-less audio files, same as AdmitDocuments
 	CaptchaEnabled          bool            // verify new members of the primary chat with a captcha
-	CaptchaTimeout          time.Duration   // time to solve the captcha before the member is removed
+	CaptchaTimeout          time.Duration   // time to solve the captcha before the timeout action applies
+	CaptchaTimeoutMute      bool            // on timeout mute the member for good instead of banning for the cooldown
 	CaptchaMessage          string          // captcha prompt with {user} and {timeout} placeholders, empty for the default
 	CaptchaTurnstile        TurnstileConfig // Turnstile instead of the motion animation, when its site key is set
 
@@ -189,6 +190,7 @@ func (l *TelegramListener) Do(ctx context.Context) error {
 			log.Printf("[WARN] captcha disabled in training and dry modes")
 		default:
 			l.captcha = newCaptcha(l.TbAPI, l.chatID, l.CaptchaTimeout, l.CaptchaMessage)
+			l.captcha.timeoutMute = l.CaptchaTimeoutMute
 			defer l.captcha.Stop()
 			if l.CaptchaTurnstile.SiteKey != "" {
 				if err := l.captcha.WithTurnstile(l.CaptchaTurnstile); err != nil {

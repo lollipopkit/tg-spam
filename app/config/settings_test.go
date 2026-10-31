@@ -837,6 +837,10 @@ func TestSettings_ValidateCaptcha(t *testing.T) {
 		{name: "timeout too long", s: captcha(25*time.Hour, "x"), wantErr: "captcha.timeout (25h0m0s) must be between"},
 		{name: "empty message selects the default", s: captcha(time.Minute, "")},
 		{name: "blank message", s: captcha(time.Minute, "  "), wantErr: "captcha.message must not be blank"},
+		{name: "timeout action mute", s: &Settings{Captcha: CaptchaSettings{Enabled: true, Timeout: time.Minute,
+			TimeoutAction: CaptchaTimeoutMute}}},
+		{name: "unknown timeout action", s: &Settings{Captcha: CaptchaSettings{Enabled: true, Timeout: time.Minute,
+			TimeoutAction: "kick"}}, wantErr: `captcha.timeout-action ("kick") must be "ban" or "mute"`},
 		{name: "turnstile complete", s: turnstile(TurnstileSettings{SiteKey: "k", Secret: "s",
 			URL: "https://verify.example.com", Listen: ":8081"})},
 		{name: "turnstile without secret", s: turnstile(TurnstileSettings{SiteKey: "k",
@@ -861,6 +865,47 @@ func TestSettings_ValidateCaptcha(t *testing.T) {
 			s: captcha(time.Minute, "{user}"+strings.Repeat("字", 1024-128)), wantErr: "captcha.message is too long, 1025"},
 		{name: "emoji count as two units", s: captcha(time.Minute, strings.Repeat("🙂", 513)),
 			wantErr: "captcha.message is too long, 1026"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := tt.s.Validate()
+			if tt.wantErr == "" {
+				require.NoError(t, err)
+				return
+			}
+			require.ErrorContains(t, err, tt.wantErr)
+		})
+	}
+}
+
+func TestSettings_ValidateOIDC(t *testing.T) {
+	valid := OIDCSettings{Issuer: "https://auth.example.com/auth/v1/", ClientID: "tg-spam", ClientSecret: "s",
+		URL: "https://tg.example.com", Allow: []string{"role:admin", "email:a@example.com"}}
+	with := func(f func(o *OIDCSettings)) *Settings {
+		o := valid
+		f(&o)
+		return &Settings{Transient: TransientSettings{OIDC: o}}
+	}
+	tests := []struct {
+		name    string
+		s       *Settings
+		wantErr string
+	}{
+		{name: "valid", s: with(func(*OIDCSettings) {})},
+		{name: "no issuer, oidc off", s: &Settings{Transient: TransientSettings{OIDC: OIDCSettings{URL: "nonsense"}}}},
+		{name: "no client id", s: with(func(o *OIDCSettings) { o.ClientID = "" }), wantErr: "needs a client id and a client secret"},
+		{name: "no secret", s: with(func(o *OIDCSettings) { o.ClientSecret = "" }), wantErr: "needs a client id and a client secret"},
+		{name: "http issuer", s: with(func(o *OIDCSettings) { o.Issuer = "http://auth.example.com" }),
+			wantErr: "server.oidc.issuer"},
+		{name: "http url", s: with(func(o *OIDCSettings) { o.URL = "http://tg.example.com" }), wantErr: "server.oidc.url"},
+		{name: "url with a path", s: with(func(o *OIDCSettings) { o.URL = "https://tg.example.com/ui" }),
+			wantErr: "server.oidc.url"},
+		{name: "url with a trailing slash", s: with(func(o *OIDCSettings) { o.URL = "https://tg.example.com/" })},
+		{name: "empty allow list", s: with(func(o *OIDCSettings) { o.Allow = nil }), wantErr: "server.oidc.allow must list"},
+		{name: "unknown allow kind", s: with(func(o *OIDCSettings) { o.Allow = []string{"user:x"} }),
+			wantErr: `server.oidc.allow entry "user:x"`},
+		{name: "allow entry without value", s: with(func(o *OIDCSettings) { o.Allow = []string{"role:"} }),
+			wantErr: `server.oidc.allow entry "role:"`},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

@@ -361,7 +361,8 @@ the running process won't pick up the new value through the web UI.
 - Telegram connection: `Telegram.Token`, `Telegram.IdleDuration`,
   `Telegram.Timeout`
 - Server: `Server.Enabled`, `Server.ListenAddr`, `Server.AuthUser`,
-  `Server.AuthHash`
+  `Server.AuthHash` (the OIDC login, `--server.oidc.*`, is transient: flags
+  or env only, never stored, shown read-only as "Web Login")
 - CAS: `CAS.Timeout`, `CAS.UserAgent`
 - Logger: `Logger.FileName`, `Logger.MaxSize`, `Logger.MaxBackups`
 - History: `History.Duration`, `History.MinSize`

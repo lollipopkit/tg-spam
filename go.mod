@@ -4,10 +4,12 @@ go 1.25.0
 
 require (
 	github.com/OvyFlash/telegram-bot-api v0.0.0-20260714195021-948927f23598
+	github.com/coreos/go-oidc/v3 v3.20.0
 	github.com/didip/tollbooth/v8 v8.0.1
 	github.com/fatih/color v1.18.0
 	github.com/forPelevin/gomoji v1.4.1
 	github.com/fsnotify/fsnotify v1.9.0
+	github.com/go-jose/go-jose/v4 v4.1.4
 	github.com/go-pkgz/expirable-cache/v3 v3.1.0
 	github.com/go-pkgz/fileutils v0.4.0
 	github.com/go-pkgz/lgr v0.12.1
@@ -25,9 +27,11 @@ require (
 	github.com/stretchr/testify v1.11.1
 	github.com/yuin/gopher-lua v1.1.1
 	golang.org/x/crypto v0.55.0
+	golang.org/x/oauth2 v0.36.0
 	google.golang.org/genai v1.52.1
 	gopkg.in/natefinch/lumberjack.v2 v2.2.1
 	gopkg.in/yaml.v3 v3.0.1
+	lukechampine.com/blake3 v1.4.1
 	modernc.org/sqlite v1.42.2
 )
 
@@ -86,6 +90,7 @@ require (
 	github.com/hashicorp/errwrap v1.1.0 // indirect
 	github.com/jlaffaye/ftp v0.2.0 // indirect
 	github.com/klauspost/compress v1.18.7 // indirect
+	github.com/klauspost/cpuid/v2 v2.4.1 // indirect
 	github.com/kr/fs v0.1.0 // indirect
 	github.com/lufia/plan9stats v0.0.0-20260330125221-c963978e514e // indirect
 	github.com/magiconair/properties v1.8.10 // indirect

@@ -9,6 +9,7 @@ import (
 	"math"
 	"net/url"
 	"reflect"
+	"slices"
 	"strings"
 	"time"
 	"unicode/utf16"
@@ -243,7 +244,16 @@ type CaptchaSettings struct {
 	Timeout   time.Duration     `json:"timeout" yaml:"timeout" db:"captcha_timeout"`
 	Message   string            `json:"message" yaml:"message" db:"captcha_message"`
 	Turnstile TurnstileSettings `json:"turnstile" yaml:"turnstile" db:"captcha_turnstile"`
+	// TimeoutAction is CaptchaTimeoutBan (ban for the cooldown) or CaptchaTimeoutMute (mute for good, the member
+	// stays in the chat); empty means ban
+	TimeoutAction string `json:"timeout_action" yaml:"timeout_action" db:"captcha_timeout_action"`
 }
+
+// captcha timeout actions
+const (
+	CaptchaTimeoutBan  = "ban"
+	CaptchaTimeoutMute = "mute"
+)
 
 // TurnstileSettings switch the captcha to Cloudflare Turnstile when SiteKey is set
 type TurnstileSettings struct {
@@ -293,6 +303,20 @@ type ServerSettings struct {
 	AuthHash   string `json:"auth_hash" yaml:"auth_hash" db:"server_auth_hash"`
 }
 
+// OIDCSettings switch the web UI from basic auth to an OpenID Connect login when Issuer is set. They come
+// from flags or env only and are never stored: a login kept in the database could lock the operator out of
+// the page that edits it, and leaving the flags off is the way back in.
+type OIDCSettings struct {
+	Issuer       string
+	ClientID     string
+	ClientSecret string
+	URL          string
+	Allow        []string
+}
+
+// Enabled reports whether the OIDC login replaces basic auth
+func (o OIDCSettings) Enabled() bool { return o.Issuer != "" }
+
 // TransientSettings contains settings that should never be persisted
 type TransientSettings struct {
 	// connection parameters
@@ -312,6 +336,9 @@ type TransientSettings struct {
 
 	// temporary auth password (used only to generate hash)
 	WebAuthPasswd string `json:"-" yaml:"-"`
+
+	// OIDC login of the web UI, replaces basic auth when its issuer is set
+	OIDC OIDCSettings `json:"-" yaml:"-"`
 
 	// authFromCLI marks web auth (hash or password) as held in memory rather
 	// than authoritative in the database. It is set by applyCLIOverrides for
@@ -364,9 +391,18 @@ func (s *Settings) Validate() error {
 		if err := validateCaptchaMessage(s.Captcha.Message); err != nil {
 			return err
 		}
+		switch s.Captcha.TimeoutAction {
+		case "", CaptchaTimeoutBan, CaptchaTimeoutMute:
+		default:
+			return fmt.Errorf("captcha.timeout-action (%q) must be %q or %q", s.Captcha.TimeoutAction,
+				CaptchaTimeoutBan, CaptchaTimeoutMute)
+		}
 		if err := validateTurnstile(s.Captcha.Turnstile); err != nil {
 			return err
 		}
+	}
+	if err := ValidateOIDC(s.Transient.OIDC); err != nil {
+		return err
 	}
 	if s.MaxShortMsgCount < 0 {
 		return fmt.Errorf("max-short-msg-count (%d) must be >= 0 (0 disables)", s.MaxShortMsgCount)
@@ -507,13 +543,47 @@ func ValidateTurnstile(siteKey, secret, publicURL, listen string) error {
 	if siteKey == "" || secret == "" || listen == "" {
 		return fmt.Errorf("captcha.turnstile needs a site key, a secret and a listen address")
 	}
-	u, err := url.Parse(publicURL)
-	if err != nil || u.Scheme != "https" || u.Hostname() == "" || (u.Path != "" && u.Path != "/") ||
-		u.RawQuery != "" || u.ForceQuery || strings.Contains(publicURL, "#") || u.User != nil {
+	if !isBareHTTPSURL(publicURL) {
 		return fmt.Errorf("captcha.turnstile.url (%q) must be an https url of a host, without a path, query or fragment",
 			publicURL)
 	}
 	return nil
+}
+
+// ValidateOIDC checks the OIDC login settings when an issuer enables it: an https issuer, a client id and
+// secret, an allow list (an empty one would let any account of the issuer in), and the public https url of
+// the web UI as a bare host, since the callback is served at /auth/callback from the root
+func ValidateOIDC(o OIDCSettings) error {
+	if !o.Enabled() {
+		return nil
+	}
+	if o.ClientID == "" || o.ClientSecret == "" {
+		return fmt.Errorf("server.oidc needs a client id and a client secret")
+	}
+	if u, err := url.Parse(o.Issuer); err != nil || u.Scheme != "https" || u.Hostname() == "" {
+		return fmt.Errorf("server.oidc.issuer (%q) must be an https url", o.Issuer)
+	}
+	if !isBareHTTPSURL(o.URL) {
+		return fmt.Errorf("server.oidc.url (%q) must be an https url of a host, without a path, query or fragment", o.URL)
+	}
+	if len(o.Allow) == 0 {
+		return fmt.Errorf("server.oidc.allow must list at least one role:, group:, email: or sub: entry")
+	}
+	for _, a := range o.Allow {
+		kind, value, ok := strings.Cut(a, ":")
+		if !ok || value == "" || !slices.Contains([]string{"role", "group", "email", "sub"}, kind) {
+			return fmt.Errorf("server.oidc.allow entry %q must be role:<name>, group:<name>, email:<address> or sub:<id>", a)
+		}
+	}
+	return nil
+}
+
+// isBareHTTPSURL reports whether raw is an https url of a host with no path beyond "/", no query, no fragment
+// and no user info
+func isBareHTTPSURL(raw string) bool {
+	u, err := url.Parse(raw)
+	return err == nil && u.Scheme == "https" && u.Hostname() != "" && (u.Path == "" || u.Path == "/") &&
+		u.RawQuery == "" && !u.ForceQuery && !strings.Contains(raw, "#") && u.User == nil
 }
 
 // zeroAwarePaths lists Settings field paths where the zero value is a meaningful

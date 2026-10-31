@@ -494,8 +494,9 @@ When a member joins:
 2. The member is muted and the bot posts the animation with `--captcha.message` (empty for a built-in prompt in the member's language) as its caption and six candidate numbers as buttons: the answer and five random ones, unrelated to it, so the buttons alone give nothing away. `{user}` becomes a mention of the member, `{timeout}` the time limit
 3. Choosing the right number lifts the mute, so the group's default permissions apply, and deletes the captcha. The first press decides, so a guess has a 1 in 6 chance; the cooldown below keeps repeated guessing slow. Presses by anyone else are ignored (in Turnstile mode the page checks the Telegram login instead). The bot's own short replies (verified, wrong answer, and the test results below) follow the member's Telegram language: Chinese, Russian, or English for any other; the caption is `--captcha.message`
 4. A wrong number, or no answer within `--captcha.timeout` (default `2m`, allowed `10s` to `24h`), deletes the captcha and bans the member for a cooldown: 5 minutes after the first failure, doubling with each further one up to 24 hours. Telegram lifts the ban when it ends, so a person who failed can join again later, while guessing by rejoining stays slow. Failures older than 24 hours are forgotten, and solving a captcha clears them
+5. With `--captcha.timeout-action=mute` a member who does not answer in time is not banned: the captcha is deleted and the member stays in the group muted for good, unable to send anything, until an admin lifts the restriction. Leaving and rejoining keeps the mute and brings no new captcha, after restarts too. If Telegram refuses the permanent mute, the member is banned for the cooldown instead, so nobody is left free to post unverified. There is no rejoin cooldown in this mode: a member who rejoins without any restriction, e.g. one who left before answering or was unbanned by an admin, gets a new captcha; one still under a restriction keeps it. If the bot can't read the status of a member it muted for good within the last 24 hours, it mutes them for good again rather than risk replacing that mute; past 24 hours it no longer remembers them, and a rejoin during a failed status read gets the usual short join mute and a captcha. A wrong answer still bans as above; if Telegram refuses that ban, the member is muted for good instead of for the cooldown
 
-Messages that reach the group from a member with an unsolved captcha are deleted. A member who leaves before answering has their captcha removed, and this counts as a failure without a ban, so leaving and rejoining for a fresh challenge runs into the cooldown. Superusers, group administrators, approved users, bots and members added by a superuser skip the captcha. The verification runs in the background, so a burst of joins does not hold up the bot; the timeout starts once the member can see the challenge.
+Messages that reach the group from a member with an unsolved captcha are deleted. A member who leaves before answering has their captcha removed, and once the challenge was posted this counts as a failure without a ban, so leaving and rejoining for a fresh challenge runs into the cooldown (in the default ban mode, see item 5 for the mute mode). Superusers, group administrators, approved users, bots and members added by a superuser skip the captcha. The verification runs in the background, so a burst of joins does not hold up the bot; the timeout starts once the member can see the challenge.
 
 Notes:
 
@@ -845,8 +846,9 @@ warn:
 
 captcha:
       --captcha.enabled                 verify new members with a captcha [$CAPTCHA_ENABLED]
-      --captcha.timeout=                time to solve the captcha before the member is removed (default: 2m) [$CAPTCHA_TIMEOUT]
+      --captcha.timeout=                time to solve the captcha before the timeout action applies (default: 2m) [$CAPTCHA_TIMEOUT]
       --captcha.message=                captcha prompt, {user} and {timeout} are replaced, empty for the default of the mode [$CAPTCHA_MESSAGE]
+      --captcha.timeout-action=[ban|mute] on timeout ban for the cooldown or mute for good, keeping the member in the chat (default: ban) [$CAPTCHA_TIMEOUT_ACTION]
 
 turnstile:
       --captcha.turnstile.site-key=     Cloudflare Turnstile site key, switches the captcha to Turnstile [$CAPTCHA_TURNSTILE_SITE_KEY]
@@ -870,6 +872,13 @@ server:
       --server.listen=                  listen address (default: :8080) [$SERVER_LISTEN]
       --server.auth=                    basic auth password (default: auto) [$SERVER_AUTH]
       --server.auth-hash=               basic auth password hash [$SERVER_AUTH_HASH]
+
+oidc:
+      --server.oidc.issuer=             OIDC issuer url, replaces basic auth with an OIDC login [$SERVER_OIDC_ISSUER]
+      --server.oidc.client-id=          OIDC client id [$SERVER_OIDC_CLIENT_ID]
+      --server.oidc.client-secret=      OIDC client secret [$SERVER_OIDC_CLIENT_SECRET]
+      --server.oidc.url=                public https url of the web UI, callback at <url>/auth/callback [$SERVER_OIDC_URL]
+      --server.oidc.allow=              allowed accounts: role:, group:, email:, sub: [$SERVER_OIDC_ALLOW]
 
 Help Options:
   -h, --help                            Show this help message
@@ -945,6 +954,16 @@ openssl passwd -apr1 your_password
 In case if both `--server.auth` and `--server.auth-hash` are set, the hash will be used.
 
 In `--confdb` mode, if the server is enabled but the database has no stored auth hash AND the operator did not pass any `--server.auth*` flag on the CLI, a random password is generated automatically and logged at startup (the same behavior as the default legacy mode). The automatic fallback never overrides an explicit `--server.auth=` (empty) intent — passing an empty `--server.auth` deliberately leaves the UI unauthenticated.
+
+### OIDC login
+
+Setting `--server.oidc.issuer [$SERVER_OIDC_ISSUER]` replaces basic auth with an OpenID Connect login (authorization code flow with PKCE): `--server.auth` and `--server.auth-hash` are ignored and no random password is generated. Every request, API calls included, needs the login session; there is no basic auth fallback for scripts.
+
+- Register a confidential client at the provider with the redirect URI `<url>/auth/callback`, where `--server.oidc.url [$SERVER_OIDC_URL]` is the public https url of the web UI as a bare host (`https://tg.example.com`; requests for any other host, e.g. a direct LAN address, are redirected there), and pass `--server.oidc.client-id` and `--server.oidc.client-secret` (`$SERVER_OIDC_CLIENT_SECRET`). The scopes requested are `openid profile email`, plus `groups` when the allow list has a `group:` entry.
+- `--server.oidc.allow [$SERVER_OIDC_ALLOW]` lists who may sign in, repeated or comma-separated in the env var (spaces around entries are ignored): `role:<name>` and `group:<name>` match the id token's `roles` and `groups` claims, `email:<address>` matches a verified `email`, `sub:<id>` the subject (a single role or group sent as a string and `email_verified` sent as `"true"` are accepted). It must not be empty, since an empty list would admit every account of the issuer.
+- Sessions are cookies signed with a key generated at startup and last 12 hours; a restart signs everyone out. Logout (`POST /logout`, the navbar's Logout; `GET /logout` only shows a confirmation button) revokes the session in the running process and opens the provider's `end_session_endpoint` with `client_id`, so the provider session ends too. A provider without one ends on a local "signed out" page instead. The allow list is checked at login only: removing an account at the provider or from the list does not end a session it already has, restart tg-spam for that.
+- The provider is discovered on the first login, so the web UI starts while the issuer is unreachable.
+- These settings come from flags or env only, also with `--confdb`: they are never stored in the database and not editable from the `/settings` page. If the login locks you out, start without `--server.oidc.issuer` to get basic auth back.
 
 It is truly a **bad idea** to run the server without basic auth protection, as it allows adding/removing users and updating spam samples to anyone who knows the endpoint. The only reason to run it without protection is inside the trusted network or for testing purposes.  Exposing the server directly to the internet is not recommended either, as basic auth is not secure enough if used without SSL. It is better to use a reverse proxy with TLS termination in front of the server.
 

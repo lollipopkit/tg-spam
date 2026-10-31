@@ -7,6 +7,7 @@ import (
 	"reflect"
 	"slices"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/umputun/tg-spam/app/config"
@@ -145,9 +146,10 @@ func optToSettings(opts options) *config.Settings {
 		},
 
 		Captcha: config.CaptchaSettings{
-			Enabled: opts.Captcha.Enabled,
-			Timeout: opts.Captcha.Timeout,
-			Message: opts.Captcha.Message,
+			Enabled:       opts.Captcha.Enabled,
+			Timeout:       opts.Captcha.Timeout,
+			Message:       opts.Captcha.Message,
+			TimeoutAction: opts.Captcha.TimeoutAction,
 			Turnstile: config.TurnstileSettings{
 				SiteKey: opts.Captcha.Turnstile.SiteKey,
 				URL:     opts.Captcha.Turnstile.URL,
@@ -219,6 +221,7 @@ func optToSettings(opts options) *config.Settings {
 		WebAuthPasswd:      opts.Server.AuthPasswd,
 		ConfigDBEncryptKey: opts.ConfigDBEncryptKey,
 		LuaUnrestricted:    opts.LuaPlugins.Unrestricted,
+		OIDC:               oidcSettings(opts),
 	}
 
 	// set credentials in their respective domain structures
@@ -471,6 +474,7 @@ func applyOperationalCLIOverrides(settings *config.Settings, opts options, defau
 // would persist an empty hash to the DB.
 func applyAutoAuthFallback(settings *config.Settings) {
 	if settings.Server.Enabled &&
+		!settings.Transient.OIDC.Enabled() &&
 		settings.Server.AuthHash == "" &&
 		settings.Transient.WebAuthPasswd == "" &&
 		!settings.Transient.AuthFromCLI {
@@ -633,4 +637,26 @@ func saveConfigToDB(ctx context.Context, settings *config.Settings) error {
 
 	log.Printf("[INFO] configuration saved to database successfully")
 	return nil
+}
+
+// oidcSettings builds the web UI OIDC login settings from the command line; they are never stored
+func oidcSettings(opts options) config.OIDCSettings {
+	return config.OIDCSettings{
+		Issuer:       opts.Server.OIDC.Issuer,
+		ClientID:     opts.Server.OIDC.ClientID,
+		ClientSecret: opts.Server.OIDC.ClientSecret,
+		URL:          opts.Server.OIDC.URL,
+		Allow:        oidcAllow(opts.Server.OIDC.Allow),
+	}
+}
+
+// oidcAllow trims the allow list entries and drops empty ones, as "a, b" is a natural way to write the env var
+func oidcAllow(entries []string) []string {
+	var res []string
+	for _, e := range entries {
+		if e = strings.TrimSpace(e); e != "" {
+			res = append(res, e)
+		}
+	}
+	return res
 }

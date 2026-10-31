@@ -1313,6 +1313,22 @@ func TestServer_htmlSettingsHandler(t *testing.T) {
 		assert.Contains(t, body, "System Status")
 		assert.Contains(t, body, "Spam Detection")
 	})
+	t.Run("web login row", func(t *testing.T) {
+		detectorMock := &mocks.DetectorMock{GetLuaPluginNamesFunc: func() []string { return nil }}
+		render := func(o config.OIDCSettings) string {
+			server := NewServer(Config{Version: "1.0", Detector: detectorMock,
+				AppSettings: &config.Settings{Transient: config.TransientSettings{OIDC: o}}})
+			rr := httptest.NewRecorder()
+			http.HandlerFunc(server.htmlSettingsHandler).ServeHTTP(rr, httptest.NewRequest("GET", "/settings", http.NoBody))
+			require.Equal(t, http.StatusOK, rr.Code)
+			return rr.Body.String()
+		}
+		body := render(config.OIDCSettings{Issuer: "https://auth.example.com", ClientID: "tg-spam",
+			ClientSecret: "oidc-secret", Allow: []string{"role:admin", "sub:u1"}})
+		assert.Contains(t, body, "OIDC https://auth.example.com (client tg-spam, allow role:admin, sub:u1)")
+		assert.NotContains(t, body, "oidc-secret")
+		assert.Contains(t, render(config.OIDCSettings{}), "<tr><th>Web Login</th><td>basic auth</td></tr>")
+	})
 	// test with StorageEngine
 	t.Run("with SQL storage engine", func(t *testing.T) {
 		sqlEngine := &mocks.StorageEngineMock{}

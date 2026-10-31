@@ -59,26 +59,29 @@ type Server struct {
 	// appSettingsMu guards AppSettings against data races between the config
 	// handlers (load/update/save) and read paths (settings pages, /settings API).
 	appSettingsMu sync.RWMutex
+
+	oidc *oidcAuth // oidc login, set by Run when Config.OIDC is enabled
 }
 
 // Config defines server parameters
 type Config struct {
-	Version         string           // version to show in /ping
-	ListenAddr      string           // listen address
-	Detector        Detector         // spam detector
-	SpamFilter      SpamFilter       // spam filter (bot)
-	DetectedSpam    DetectedSpam     // detected spam accessor
-	Locator         Locator          // locator for user info
-	Dictionary      Dictionary       // dictionary for stop phrases and ignored words
-	StorageEngine   StorageEngine    // database engine access for backups
-	DMUsersProvider DMUsersProvider  // provider for recent DM users
-	SettingsStore   SettingsStore    // configuration storage interface
-	AuthUser        string           // basic auth user; empty falls back to AppSettings.Server.AuthUser, then "tg-spam"
-	AuthHash        string           // basic auth bcrypt hash
-	Dbg             bool             // debug mode
-	BotUsername     string           // resolved telegram bot username
-	AppSettings     *config.Settings // application settings (domain model)
-	ConfigDBMode    bool             // indicates if app is running with database config
+	Version         string              // version to show in /ping
+	ListenAddr      string              // listen address
+	Detector        Detector            // spam detector
+	SpamFilter      SpamFilter          // spam filter (bot)
+	DetectedSpam    DetectedSpam        // detected spam accessor
+	Locator         Locator             // locator for user info
+	Dictionary      Dictionary          // dictionary for stop phrases and ignored words
+	StorageEngine   StorageEngine       // database engine access for backups
+	DMUsersProvider DMUsersProvider     // provider for recent DM users
+	SettingsStore   SettingsStore       // configuration storage interface
+	AuthUser        string              // basic auth user; empty falls back to AppSettings.Server.AuthUser, then "tg-spam"
+	AuthHash        string              // basic auth bcrypt hash
+	OIDC            config.OIDCSettings // OIDC login, replaces basic auth when its issuer is set
+	Dbg             bool                // debug mode
+	BotUsername     string              // resolved telegram bot username
+	AppSettings     *config.Settings    // application settings (domain model)
+	ConfigDBMode    bool                // indicates if app is running with database config
 	// ReloadNormalize, when non-nil, is invoked by loadConfigHandler on the
 	// freshly loaded *config.Settings before transient/auth preservation. It
 	// must perform the same defaults-fill and operational CLI override
@@ -160,20 +163,41 @@ func (s *Server) Run(ctx context.Context) error {
 	router.Use(rest.SizeLimit(1024 * 1024)) // 1M max request size
 	router.Use(http.NewCrossOriginProtection().Handler)
 
-	// hash-based authentication for maximum security. The middleware reads the
-	// current hash from AppSettings under the same mutex used by the config
-	// handlers so DB-sourced rotations via POST /config/reload take effect
-	// immediately without restarting the server. Startup AuthHash is used as
-	// a safety fallback if AppSettings hash is empty so a DB that lost the
-	// hash can't silently unlock the API.
-	if s.AuthHash != "" {
+	protected := router
+	switch {
+	case s.OIDC.Enabled():
+		// the OIDC login routes are registered outside the guarded group and everything else inside it.
+		// exempting paths inside the middleware instead would miss requests the mux routes elsewhere, e.g.
+		// "/auth%2Flogin" whose decoded path is the login path while the mux sends it to the catch-all page
+		auth, err := newOIDCAuth(s.OIDC)
+		if err != nil {
+			return fmt.Errorf("can't set up oidc login: %w", err)
+		}
+		s.oidc = auth
+		log.Printf("[INFO] oidc login enabled for webapi server (issuer: %s)", s.OIDC.Issuer)
+		router.Route(func(login *routegroup.Bundle) {
+			login.HandleFunc("GET "+oidcLoginPath, auth.loginHandler)
+			login.HandleFunc("GET "+oidcCallbackPath, auth.callbackHandler)
+			login.HandleFunc("POST "+oidcLogoutPath, auth.logoutHandler)
+			login.HandleFunc("GET "+oidcLogoutPath, auth.logoutPageHandler)
+			login.HandleFunc("GET "+oidcLoggedOutPath, auth.loggedOutHandler)
+		})
+		protected = router.Group()
+		protected.Use(auth.middleware)
+	case s.AuthHash != "":
+		// hash-based authentication. The middleware reads the current hash from AppSettings under the same
+		// mutex used by the config handlers so DB-sourced rotations via POST /config/reload take effect
+		// immediately without restarting the server. Startup AuthHash is used as a safety fallback if
+		// AppSettings hash is empty so a DB that lost the hash can't silently unlock the API.
 		log.Printf("[INFO] basic auth enabled for webapi server (user: %s)", s.activeAuthUser())
 		router.Use(s.basicAuthMiddleware)
-	} else {
+		router.Route(s.basicLogoutRoutes)
+	default:
 		log.Printf("[WARN] basic auth disabled, access to webapi is not protected")
+		router.Route(s.basicLogoutRoutes)
 	}
 
-	router = s.routes(router) // setup routes
+	s.routes(protected) // setup routes
 
 	srv := &http.Server{Addr: s.ListenAddr, Handler: router, ReadTimeout: 5 * time.Second, WriteTimeout: 5 * time.Second}
 	go func() {
@@ -248,7 +272,7 @@ func (s *Server) activeAuthUser() string {
 }
 
 func (s *Server) routes(router *routegroup.Bundle) *routegroup.Bundle {
-	// auth api routes; auth is applied globally by router.Use in Run, so no per-subrouter auth here
+	// auth api routes; auth is applied by Run, globally for basic auth and on the passed group for oidc
 	router.Route(func(authApi *routegroup.Bundle) {
 		authApi.HandleFunc("POST /check", s.checkMsgHandler)         // check a message for spam
 		authApi.HandleFunc("GET /check/{user_id}", s.checkIDHandler) // check user id for spam
@@ -322,13 +346,6 @@ func (s *Server) routes(router *routegroup.Bundle) *routegroup.Bundle {
 			})
 		}
 
-		// handle logout - force Basic Auth re-authentication
-		webUI.HandleFunc("GET /logout", func(w http.ResponseWriter, _ *http.Request) {
-			w.Header().Set("WWW-Authenticate", `Basic realm="tg-spam"`)
-			w.WriteHeader(http.StatusUnauthorized)
-			fmt.Fprintln(w, "Logged out successfully")
-		})
-
 		// serve only specific static files at root level
 		staticFiles := newStaticFS(templateFS,
 			staticFileMapping{urlPath: "styles.css", filesysPath: "assets/styles.css"},
@@ -339,6 +356,18 @@ func (s *Server) routes(router *routegroup.Bundle) *routegroup.Bundle {
 	})
 
 	return router
+}
+
+// basicLogoutRoutes registers the logout of basic auth: it forces the browser to re-authenticate
+func (s *Server) basicLogoutRoutes(r *routegroup.Bundle) {
+	logout := func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("WWW-Authenticate", `Basic realm="tg-spam"`)
+		w.WriteHeader(http.StatusUnauthorized)
+		fmt.Fprintln(w, "Logged out successfully")
+	}
+	r.HandleFunc("POST /logout", logout) // the navbar posts it
+	// TODO: remove GET once bookmarks and pages cached from before the navbar posted logout are gone
+	r.HandleFunc("GET /logout", logout)
 }
 
 // checkMsgHandler handles POST /check request.

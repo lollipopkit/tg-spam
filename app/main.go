@@ -193,8 +193,10 @@ type options struct {
 
 	Captcha struct {
 		Enabled bool          `long:"enabled" env:"ENABLED" description:"verify new members with a captcha"`
-		Timeout time.Duration `long:"timeout" env:"TIMEOUT" default:"2m" description:"time to solve the captcha before the member is removed"`
+		Timeout time.Duration `long:"timeout" env:"TIMEOUT" default:"2m" description:"time to solve the captcha before the timeout action applies"`
 		Message string        `long:"message" env:"MESSAGE" description:"captcha prompt, {user} and {timeout} are replaced, empty for the default of the mode"`
+		// TimeoutAction choices mirror config.CaptchaTimeoutBan / CaptchaTimeoutMute
+		TimeoutAction string `long:"timeout-action" env:"TIMEOUT_ACTION" choice:"ban" choice:"mute" default:"ban" description:"on timeout ban for the cooldown or mute for good, keeping the member in the chat"`
 
 		Turnstile struct {
 			SiteKey string `long:"site-key" env:"SITE_KEY" description:"Cloudflare Turnstile site key, switches the captcha to Turnstile"`
@@ -237,6 +239,13 @@ type options struct {
 		ListenAddr string `long:"listen" env:"LISTEN" default:":8080" description:"listen address"`
 		AuthPasswd string `long:"auth" env:"AUTH" default:"auto" description:"basic auth password"`
 		AuthHash   string `long:"auth-hash" env:"AUTH_HASH" default:"" description:"basic auth password hash"`
+		OIDC       struct {
+			Issuer       string   `long:"issuer" env:"ISSUER" description:"OIDC issuer url, replaces basic auth with an OIDC login"`
+			ClientID     string   `long:"client-id" env:"CLIENT_ID" description:"OIDC client id"`
+			ClientSecret string   `long:"client-secret" env:"CLIENT_SECRET" description:"OIDC client secret"`
+			URL          string   `long:"url" env:"URL" description:"public https url of the web UI, callback at <url>/auth/callback"`
+			Allow        []string `long:"allow" env:"ALLOW" env-delim:"," description:"allowed accounts: role:, group:, email:, sub:"`
+		} `group:"oidc" namespace:"oidc" env-namespace:"OIDC"`
 	} `group:"server" namespace:"server" env-namespace:"SERVER"`
 
 	Training bool `long:"training" env:"TRAINING" description:"training mode, passive spam detection only"`
@@ -333,6 +342,7 @@ func main() {
 		appSettings.Transient.TGDbg = opts.TGDbg
 		appSettings.Transient.StorageTimeout = opts.StorageTimeout
 		appSettings.Transient.LuaUnrestricted = opts.LuaPlugins.Unrestricted
+		appSettings.Transient.OIDC = oidcSettings(opts)
 
 		// apply explicit CLI overrides for non-transient values
 		applyCLIOverrides(appSettings, opts, defaults)
@@ -562,6 +572,7 @@ func execute(ctx context.Context, settings *config.Settings, reloadNormalize fun
 		CaptchaEnabled:          settings.Captcha.Enabled,
 		CaptchaTimeout:          settings.Captcha.Timeout,
 		CaptchaMessage:          captchaMessage(settings.Captcha.Message),
+		CaptchaTimeoutMute:      settings.Captcha.TimeoutAction == config.CaptchaTimeoutMute,
 		CaptchaTurnstile: events.TurnstileConfig{SiteKey: settings.Captcha.Turnstile.SiteKey,
 			Secret: settings.Captcha.Turnstile.Secret, PublicURL: settings.Captcha.Turnstile.URL,
 			Listen: settings.Captcha.Turnstile.Listen, BotToken: settings.Telegram.Token},
@@ -684,8 +695,10 @@ func activateServer(ctx context.Context, settings *config.Settings, sf *bot.Spam
 	authPasswd := settings.Transient.WebAuthPasswd
 	authHash := settings.Server.AuthHash
 
-	// if hash is provided, use it directly
-	if authHash != "" {
+	if settings.Transient.OIDC.Enabled() {
+		// the OIDC login replaces basic auth entirely; webapi logs it
+		authHash = ""
+	} else if authHash != "" {
 		log.Printf("[INFO] using provided bcrypt hash for authentication")
 	} else if authPasswd != "" {
 		// generate hash from password if no hash but password is provided
@@ -732,6 +745,7 @@ func activateServer(ctx context.Context, settings *config.Settings, sf *bot.Spam
 		DMUsersProvider: dmUsersProvider,
 		AuthUser:        settings.Server.AuthUser, // optional basic auth user (defaults to "tg-spam" when empty)
 		AuthHash:        authHash,                 // use the hash (either from options or generated)
+		OIDC:            settings.Transient.OIDC,
 		Version:         revision,
 		Dbg:             settings.Transient.Dbg,
 		BotUsername:     botUsername,
@@ -786,6 +800,7 @@ func collectMaskedSecrets(appSettings *config.Settings) []string {
 	add(appSettings.Jev.Token)
 	add(appSettings.CAS.Token)
 	add(appSettings.Captcha.Turnstile.Secret)
+	add(appSettings.Transient.OIDC.ClientSecret)
 	// the auto-generated password is printed for the operator, so it is not masked
 	if appSettings.Transient.WebAuthPasswd != "auto" {
 		add(appSettings.Transient.WebAuthPasswd)
