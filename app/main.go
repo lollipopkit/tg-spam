@@ -237,6 +237,13 @@ type options struct {
 		ListenAddr string `long:"listen" env:"LISTEN" default:":8080" description:"listen address"`
 		AuthPasswd string `long:"auth" env:"AUTH" default:"auto" description:"basic auth password"`
 		AuthHash   string `long:"auth-hash" env:"AUTH_HASH" default:"" description:"basic auth password hash"`
+		OIDC       struct {
+			Issuer       string   `long:"issuer" env:"ISSUER" description:"OIDC issuer url, replaces basic auth with an OIDC login"`
+			ClientID     string   `long:"client-id" env:"CLIENT_ID" description:"OIDC client id"`
+			ClientSecret string   `long:"client-secret" env:"CLIENT_SECRET" description:"OIDC client secret"`
+			URL          string   `long:"url" env:"URL" description:"public https url of the web UI, callback at <url>/auth/callback"`
+			Allow        []string `long:"allow" env:"ALLOW" env-delim:"," description:"allowed accounts: role:, group:, email:, sub:"`
+		} `group:"oidc" namespace:"oidc" env-namespace:"OIDC"`
 	} `group:"server" namespace:"server" env-namespace:"SERVER"`
 
 	Training bool `long:"training" env:"TRAINING" description:"training mode, passive spam detection only"`
@@ -684,8 +691,11 @@ func activateServer(ctx context.Context, settings *config.Settings, sf *bot.Spam
 	authPasswd := settings.Transient.WebAuthPasswd
 	authHash := settings.Server.AuthHash
 
-	// if hash is provided, use it directly
-	if authHash != "" {
+	if settings.Server.OIDC.Enabled() {
+		// the OIDC login replaces basic auth entirely
+		log.Printf("[INFO] OIDC login enabled for webapi server (issuer: %s)", settings.Server.OIDC.Issuer)
+		authHash = ""
+	} else if authHash != "" {
 		log.Printf("[INFO] using provided bcrypt hash for authentication")
 	} else if authPasswd != "" {
 		// generate hash from password if no hash but password is provided
@@ -732,6 +742,7 @@ func activateServer(ctx context.Context, settings *config.Settings, sf *bot.Spam
 		DMUsersProvider: dmUsersProvider,
 		AuthUser:        settings.Server.AuthUser, // optional basic auth user (defaults to "tg-spam" when empty)
 		AuthHash:        authHash,                 // use the hash (either from options or generated)
+		OIDC:            settings.Server.OIDC,
 		Version:         revision,
 		Dbg:             settings.Transient.Dbg,
 		BotUsername:     botUsername,
@@ -786,6 +797,7 @@ func collectMaskedSecrets(appSettings *config.Settings) []string {
 	add(appSettings.Jev.Token)
 	add(appSettings.CAS.Token)
 	add(appSettings.Captcha.Turnstile.Secret)
+	add(appSettings.Server.OIDC.ClientSecret)
 	// the auto-generated password is printed for the operator, so it is not masked
 	if appSettings.Transient.WebAuthPasswd != "auto" {
 		add(appSettings.Transient.WebAuthPasswd)

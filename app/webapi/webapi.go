@@ -59,26 +59,29 @@ type Server struct {
 	// appSettingsMu guards AppSettings against data races between the config
 	// handlers (load/update/save) and read paths (settings pages, /settings API).
 	appSettingsMu sync.RWMutex
+
+	oidc *oidcAuth // oidc login, set by Run when Config.OIDC is enabled
 }
 
 // Config defines server parameters
 type Config struct {
-	Version         string           // version to show in /ping
-	ListenAddr      string           // listen address
-	Detector        Detector         // spam detector
-	SpamFilter      SpamFilter       // spam filter (bot)
-	DetectedSpam    DetectedSpam     // detected spam accessor
-	Locator         Locator          // locator for user info
-	Dictionary      Dictionary       // dictionary for stop phrases and ignored words
-	StorageEngine   StorageEngine    // database engine access for backups
-	DMUsersProvider DMUsersProvider  // provider for recent DM users
-	SettingsStore   SettingsStore    // configuration storage interface
-	AuthUser        string           // basic auth user; empty falls back to AppSettings.Server.AuthUser, then "tg-spam"
-	AuthHash        string           // basic auth bcrypt hash
-	Dbg             bool             // debug mode
-	BotUsername     string           // resolved telegram bot username
-	AppSettings     *config.Settings // application settings (domain model)
-	ConfigDBMode    bool             // indicates if app is running with database config
+	Version         string              // version to show in /ping
+	ListenAddr      string              // listen address
+	Detector        Detector            // spam detector
+	SpamFilter      SpamFilter          // spam filter (bot)
+	DetectedSpam    DetectedSpam        // detected spam accessor
+	Locator         Locator             // locator for user info
+	Dictionary      Dictionary          // dictionary for stop phrases and ignored words
+	StorageEngine   StorageEngine       // database engine access for backups
+	DMUsersProvider DMUsersProvider     // provider for recent DM users
+	SettingsStore   SettingsStore       // configuration storage interface
+	AuthUser        string              // basic auth user; empty falls back to AppSettings.Server.AuthUser, then "tg-spam"
+	AuthHash        string              // basic auth bcrypt hash
+	OIDC            config.OIDCSettings // OIDC login, replaces basic auth when its issuer is set
+	Dbg             bool                // debug mode
+	BotUsername     string              // resolved telegram bot username
+	AppSettings     *config.Settings    // application settings (domain model)
+	ConfigDBMode    bool                // indicates if app is running with database config
 	// ReloadNormalize, when non-nil, is invoked by loadConfigHandler on the
 	// freshly loaded *config.Settings before transient/auth preservation. It
 	// must perform the same defaults-fill and operational CLI override
@@ -166,7 +169,15 @@ func (s *Server) Run(ctx context.Context) error {
 	// immediately without restarting the server. Startup AuthHash is used as
 	// a safety fallback if AppSettings hash is empty so a DB that lost the
 	// hash can't silently unlock the API.
-	if s.AuthHash != "" {
+	if s.OIDC.Enabled() {
+		auth, err := newOIDCAuth(s.OIDC)
+		if err != nil {
+			return fmt.Errorf("can't set up oidc login: %w", err)
+		}
+		s.oidc = auth
+		log.Printf("[INFO] oidc login enabled for webapi server (issuer: %s)", s.OIDC.Issuer)
+		router.Use(auth.middleware)
+	} else if s.AuthHash != "" {
 		log.Printf("[INFO] basic auth enabled for webapi server (user: %s)", s.activeAuthUser())
 		router.Use(s.basicAuthMiddleware)
 	} else {
@@ -322,12 +333,18 @@ func (s *Server) routes(router *routegroup.Bundle) *routegroup.Bundle {
 			})
 		}
 
-		// handle logout - force Basic Auth re-authentication
-		webUI.HandleFunc("GET /logout", func(w http.ResponseWriter, _ *http.Request) {
-			w.Header().Set("WWW-Authenticate", `Basic realm="tg-spam"`)
-			w.WriteHeader(http.StatusUnauthorized)
-			fmt.Fprintln(w, "Logged out successfully")
-		})
+		if s.oidc != nil {
+			webUI.HandleFunc("GET "+oidcLoginPath, s.oidc.loginHandler)
+			webUI.HandleFunc("GET "+oidcCallbackPath, s.oidc.callbackHandler)
+			webUI.HandleFunc("GET "+oidcLogoutPath, s.oidc.logoutHandler)
+		} else {
+			// handle logout - force Basic Auth re-authentication
+			webUI.HandleFunc("GET /logout", func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("WWW-Authenticate", `Basic realm="tg-spam"`)
+				w.WriteHeader(http.StatusUnauthorized)
+				fmt.Fprintln(w, "Logged out successfully")
+			})
+		}
 
 		// serve only specific static files at root level
 		staticFiles := newStaticFS(templateFS,
@@ -620,6 +637,7 @@ func (s *Server) getSettingsHandler(w http.ResponseWriter, _ *http.Request) {
 	safe.CAS.Token = ""
 	safe.Captcha.Turnstile.Secret = ""
 	safe.Server.AuthHash = ""
+	safe.Server.OIDC.ClientSecret = ""
 
 	resp := struct {
 		*config.Settings

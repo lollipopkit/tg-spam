@@ -186,6 +186,12 @@ func optToSettings(opts options) *config.Settings {
 		Server: config.ServerSettings{
 			Enabled:    opts.Server.Enabled,
 			ListenAddr: opts.Server.ListenAddr,
+			OIDC: config.OIDCSettings{
+				Issuer:   opts.Server.OIDC.Issuer,
+				ClientID: opts.Server.OIDC.ClientID,
+				URL:      opts.Server.OIDC.URL,
+				Allow:    opts.Server.OIDC.Allow,
+			},
 		},
 
 		SimilarityThreshold:    opts.SimilarityThreshold,
@@ -229,6 +235,7 @@ func optToSettings(opts options) *config.Settings {
 	settings.CAS.Token = opts.CAS.Token
 	settings.Captcha.Turnstile.Secret = opts.Captcha.Turnstile.Secret
 	settings.Server.AuthHash = opts.Server.AuthHash
+	settings.Server.OIDC.ClientSecret = opts.Server.OIDC.ClientSecret
 
 	return settings
 }
@@ -381,6 +388,7 @@ func applyCLIOverrides(settings *config.Settings, opts options, defaults *config
 		{config.FieldJevToken, opts.Jev.Token, &settings.Jev.Token},
 		{config.FieldCASToken, opts.CAS.Token, &settings.CAS.Token},
 		{config.FieldTurnstileSecret, opts.Captcha.Turnstile.Secret, &settings.Captcha.Turnstile.Secret},
+		{config.FieldOIDCSecret, opts.Server.OIDC.ClientSecret, &settings.Server.OIDC.ClientSecret},
 	}
 	for _, c := range cliCredentials {
 		if c.value == "" {
@@ -471,6 +479,7 @@ func applyOperationalCLIOverrides(settings *config.Settings, opts options, defau
 // would persist an empty hash to the DB.
 func applyAutoAuthFallback(settings *config.Settings) {
 	if settings.Server.Enabled &&
+		!settings.Server.OIDC.Enabled() &&
 		settings.Server.AuthHash == "" &&
 		settings.Transient.WebAuthPasswd == "" &&
 		!settings.Transient.AuthFromCLI {

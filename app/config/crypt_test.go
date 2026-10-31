@@ -293,6 +293,19 @@ func TestCrypter_CASTokenRoundTrip(t *testing.T) {
 	assert.Equal(t, "CAS token", entry.label)
 }
 
+func TestCrypter_OIDCSecretRoundTrip(t *testing.T) {
+	crypter, err := NewCrypter("test-master-key-20-chars", "test-instance")
+	require.NoError(t, err)
+
+	settings := &Settings{Server: ServerSettings{OIDC: OIDCSettings{Issuer: "https://auth.example.com", ClientSecret: "oidc-secret"}}}
+	require.NoError(t, crypter.EncryptSensitiveFields(settings))
+	assert.True(t, IsEncrypted(settings.Server.OIDC.ClientSecret))
+	assert.Equal(t, "https://auth.example.com", settings.Server.OIDC.Issuer, "issuer is not sensitive")
+
+	require.NoError(t, crypter.DecryptSensitiveFields(settings))
+	assert.Equal(t, "oidc-secret", settings.Server.OIDC.ClientSecret)
+}
+
 func TestSensitiveFieldAccessors_CoversJev(t *testing.T) {
 	entry, ok := sensitiveFieldAccessors[FieldJevToken]
 	require.True(t, ok, "jev token must be registered or it is stored in clear under --confdb")

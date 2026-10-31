@@ -844,6 +844,7 @@
                         <tr><th>Captcha Timeout</th><td>{{.Captcha.Timeout}}</td></tr>
                         <tr><th>Captcha Message</th><td>{{if .Captcha.Message}}{{.Captcha.Message}}{{else}}default{{end}}</td></tr>
                         <tr><th>Captcha Turnstile</th><td>{{if .Captcha.Turnstile.SiteKey}}{{.Captcha.Turnstile.URL}} (listen {{.Captcha.Turnstile.Listen}}){{if not .Captcha.Turnstile.Secret}}, no secret{{end}}{{else}}off, motion animation{{end}}</td></tr>
+                        <tr><th>Web Login</th><td>{{if .Server.OIDC.Issuer}}OIDC {{.Server.OIDC.Issuer}} (client {{.Server.OIDC.ClientID}}, allow {{range $i, $a := .Server.OIDC.Allow}}{{if $i}}, {{end}}{{$a}}{{end}}){{else}}basic auth{{end}}</td></tr>
                     </tbody>
                 </table>
             </div>

@@ -235,7 +235,7 @@ Settings resolve based on the run mode:
 
 - Without `--confdb`: CLI is the sole source of truth; `optToSettings` converts the flag struct to `*config.Settings`
 - With `--confdb`: the database is the source of truth for persisted fields; CLI-provided credentials (`--telegram.token`, `--openai.token`, `--gemini.token`), auth (`--server.auth`, `--server.auth-hash`), `--dry`, and non-default values for `--server.listen`, `--files.dynamic`, `--files.samples` are overlaid on top via `applyCLIOverrides` so an operator can rotate secrets, toggle dry-run, or relocate runtime paths without touching the DB
-- A credential supplied on the CLI or through the environment (`--telegram.token`, `--openai.token`, `--gemini.token`, `--jev.token`, `--server.auth`, `--server.auth-hash`) belongs to the running process: `applyCLIOverrides` records it in `Transient.CredentialsFromCLI`, `Store.Save` writes the value already stored in the DB for it (or nothing), so saving from the settings UI never copies it into the database or its backups, and `POST /config/reload` keeps the in-memory value. `save-config --confdb` with the same `--db`, `--instance-id` and `--confdb-encrypt-key` is the explicit way to store it in an existing config; plain `save-config` builds the whole config from CLI flags and is only for seeding a fresh database. The auto-generated password from the no-auth fallback is not a CLI credential and is persisted by a UI save as before
+- A credential supplied on the CLI or through the environment (`--telegram.token`, `--openai.token`, `--gemini.token`, `--jev.token`, `--server.auth`, `--server.auth-hash`, `--server.oidc.client-secret`) belongs to the running process: `applyCLIOverrides` records it in `Transient.CredentialsFromCLI`, `Store.Save` writes the value already stored in the DB for it (or nothing), so saving from the settings UI never copies it into the database or its backups, and `POST /config/reload` keeps the in-memory value. `save-config --confdb` with the same `--db`, `--instance-id` and `--confdb-encrypt-key` is the explicit way to store it in an existing config; plain `save-config` builds the whole config from CLI flags and is only for seeding a fresh database. The auto-generated password from the no-auth fallback is not a CLI credential and is persisted by a UI save as before
 - A credential that an earlier dashboard save already wrote stays in the config row and in older backups: `Store.Save` keeps writing back the stored value, so removing it is up to the operator
 - Always from CLI regardless of mode: `DataBaseURL`, `StorageTimeout`, `ConfigDB`, `ConfigDBEncryptKey`, `Dbg`, `TGDbg` (marked transient, never persisted)
 - `Dry` is persisted in the DB and one-way-overridable from CLI: `--dry` forces true, CLI default (unset) preserves the DB value. To disable dry-run after enabling it, use the settings UI; `--confdb` can only turn it on, and plain `save-config` replaces the whole stored config
@@ -338,7 +338,7 @@ To run the application with database configuration:
     --telegram.token "BOT_TOKEN"
 ```
 
-Note: tokens and the bcrypt auth hash are persisted in the config DB and (when `--confdb-encrypt-key` is set) encrypted at rest with the `ENC:` prefix. CLI flags like `--telegram.token`, `--openai.token`, `--gemini.token`, `--jev.token`, and `--server.auth`/`--server.auth-hash` are *override-only* and apply to the running process: saving from the settings UI never writes them to the DB, and reload keeps them. Use plain `save-config` to seed a fresh DB. To rotate a stored value in an existing config, run `save-config --confdb` with the same `--db`, `--instance-id` and `--confdb-encrypt-key`; on this `save-config --confdb` path, an empty token or `--server.auth-hash` leaves the DB-stored value in place, while an empty `--server.auth=` clears the stored hash. Plain `save-config` builds the whole config from CLI flags and replaces everything set in the web UI, `server.enabled` included. See "CLI/DB Precedence" above for the full rule set.
+Note: tokens and the bcrypt auth hash are persisted in the config DB and (when `--confdb-encrypt-key` is set) encrypted at rest with the `ENC:` prefix. CLI flags like `--telegram.token`, `--openai.token`, `--gemini.token`, `--jev.token`, `--server.oidc.client-secret`, and `--server.auth`/`--server.auth-hash` are *override-only* and apply to the running process: saving from the settings UI never writes them to the DB, and reload keeps them. Use plain `save-config` to seed a fresh DB. To rotate a stored value in an existing config, run `save-config --confdb` with the same `--db`, `--instance-id` and `--confdb-encrypt-key`; on this `save-config --confdb` path, an empty token or `--server.auth-hash` leaves the DB-stored value in place, while an empty `--server.auth=` clears the stored hash. Plain `save-config` builds the whole config from CLI flags and replaces everything set in the web UI, `server.enabled` included. See "CLI/DB Precedence" above for the full rule set.
 
 ### Web UI Configuration Management
 
@@ -361,7 +361,9 @@ the running process won't pick up the new value through the web UI.
 - Telegram connection: `Telegram.Token`, `Telegram.IdleDuration`,
   `Telegram.Timeout`
 - Server: `Server.Enabled`, `Server.ListenAddr`, `Server.AuthUser`,
-  `Server.AuthHash`
+  `Server.AuthHash`, `Server.OIDC.Issuer`, `Server.OIDC.ClientID`,
+  `Server.OIDC.URL`, `Server.OIDC.Allow` (shown read-only as "Web Login";
+  editing the login from the page it guards could lock the operator out)
 - CAS: `CAS.Timeout`, `CAS.UserAgent`
 - Logger: `Logger.FileName`, `Logger.MaxSize`, `Logger.MaxBackups`
 - History: `History.Duration`, `History.MinSize`
@@ -387,7 +389,8 @@ the running process won't pick up the new value through the web UI.
 
 **Credentials** (intentionally never UI-editable, managed via CLI/env
 or `save-config`):
-- `Telegram.Token`, `OpenAI.Token`, `Gemini.Token`, `Server.AuthHash`
+- `Telegram.Token`, `OpenAI.Token`, `Gemini.Token`, `Server.AuthHash`,
+  `Server.OIDC.ClientSecret`
 
 Surfacing the detection-tuning and message-template groups in the web
 UI is reasonable future work; this list is the canonical inventory of
@@ -420,7 +423,7 @@ what's missing today.
    - Form-based updates with in-memory and DB persistence options
 
 4. **Security Features**:
-   - Field-level encryption for sensitive data (`Telegram.Token`, `OpenAI.Token`, `Gemini.Token`, `Server.AuthHash`)
+   - Field-level encryption for sensitive data (`Telegram.Token`, `OpenAI.Token`, `Gemini.Token`, `Server.AuthHash`, `Server.OIDC.ClientSecret`)
    - Transient settings never persisted
    - Web auth password/hash overridable from CLI even in `--confdb` mode (bootstrap recovery)
    - Bcrypt hash generation for web authentication

@@ -317,7 +317,7 @@ export CONFDB_ENCRYPT_KEY="your-secure-master-key-at-least-20-chars"
 ./tg-spam --confdb --telegram.group=your-group
 ```
 
-On subsequent `--confdb` starts the bot loads every persisted group from the database; transient flags (paths, server listen address, debug flags) still come from the CLI. Credentials passed on the command line or through the environment (`--telegram.token`, `--openai.token`, `--gemini.token`, `--jev.token`, `--server.auth`, `--server.auth-hash`) override the database for the running process only: saving settings from the web UI never writes them to the database, and a reload keeps them. To store one in an existing config, run `save-config --confdb` with the same `--db`, `--instance-id` and `--confdb-encrypt-key`; plain `save-config` builds the whole config from CLI flags and replaces everything set in the web UI, so use it only to seed a fresh database. See [db-conf.md](db-conf.md) for the full persisted settings inventory and the CLI/DB precedence rules. Note that not every persisted field has a form input on the `/settings` page — connection settings, message templates, OpenAI/Gemini prompt and tuning, abnormal-spacing thresholds, and several others require a CLI restart or `save-config` round-trip to change. The "Settings UI vs CLI-only Fields" section in db-conf.md lists the full inventory.
+On subsequent `--confdb` starts the bot loads every persisted group from the database; transient flags (paths, server listen address, debug flags) still come from the CLI. Credentials passed on the command line or through the environment (`--telegram.token`, `--openai.token`, `--gemini.token`, `--jev.token`, `--server.auth`, `--server.auth-hash`, `--server.oidc.client-secret`) override the database for the running process only: saving settings from the web UI never writes them to the database, and a reload keeps them. To store one in an existing config, run `save-config --confdb` with the same `--db`, `--instance-id` and `--confdb-encrypt-key`; plain `save-config` builds the whole config from CLI flags and replaces everything set in the web UI, so use it only to seed a fresh database. See [db-conf.md](db-conf.md) for the full persisted settings inventory and the CLI/DB precedence rules. Note that not every persisted field has a form input on the `/settings` page — connection settings, message templates, OpenAI/Gemini prompt and tuning, abnormal-spacing thresholds, and several others require a CLI restart or `save-config` round-trip to change. The "Settings UI vs CLI-only Fields" section in db-conf.md lists the full inventory.
 
 #### Security Details
 
@@ -871,6 +871,13 @@ server:
       --server.auth=                    basic auth password (default: auto) [$SERVER_AUTH]
       --server.auth-hash=               basic auth password hash [$SERVER_AUTH_HASH]
 
+oidc:
+      --server.oidc.issuer=             OIDC issuer url, replaces basic auth with an OIDC login [$SERVER_OIDC_ISSUER]
+      --server.oidc.client-id=          OIDC client id [$SERVER_OIDC_CLIENT_ID]
+      --server.oidc.client-secret=      OIDC client secret [$SERVER_OIDC_CLIENT_SECRET]
+      --server.oidc.url=                public https url of the web UI, callback at <url>/auth/callback [$SERVER_OIDC_URL]
+      --server.oidc.allow=              allowed accounts: role:, group:, email:, sub: [$SERVER_OIDC_ALLOW]
+
 Help Options:
   -h, --help                            Show this help message
 
@@ -945,6 +952,16 @@ openssl passwd -apr1 your_password
 In case if both `--server.auth` and `--server.auth-hash` are set, the hash will be used.
 
 In `--confdb` mode, if the server is enabled but the database has no stored auth hash AND the operator did not pass any `--server.auth*` flag on the CLI, a random password is generated automatically and logged at startup (the same behavior as the default legacy mode). The automatic fallback never overrides an explicit `--server.auth=` (empty) intent — passing an empty `--server.auth` deliberately leaves the UI unauthenticated.
+
+### OIDC login
+
+Setting `--server.oidc.issuer [$SERVER_OIDC_ISSUER]` replaces basic auth with an OpenID Connect login (authorization code flow with PKCE): `--server.auth` and `--server.auth-hash` are ignored and no random password is generated. Every request, API calls included, needs the login session; there is no basic auth fallback for scripts.
+
+- Register a confidential client at the provider with the redirect URI `<url>/auth/callback`, where `--server.oidc.url [$SERVER_OIDC_URL]` is the public https url of the web UI as a bare host (`https://tg.example.com`), and pass `--server.oidc.client-id` and `--server.oidc.client-secret` (`$SERVER_OIDC_CLIENT_SECRET`, stored encrypted with `--confdb` like the other tokens). The scopes requested are `openid profile email groups`.
+- `--server.oidc.allow [$SERVER_OIDC_ALLOW]` lists who may sign in, repeated or comma-separated in the env var: `role:<name>` and `group:<name>` match the id token's `roles` and `groups` claims, `email:<address>` matches a verified `email`, `sub:<id>` the subject. It must not be empty, since an empty list would admit every account of the issuer. It is checked at login only.
+- Sessions are cookies signed with a key generated at startup and last 12 hours; a restart signs everyone out. `/logout` drops the session and opens the provider's logout page, so the provider session ends too.
+- The provider is discovered on the first login, so the web UI starts while the issuer is unreachable.
+- These settings are not editable from the `/settings` page; change them by flag or env and restart.
 
 It is truly a **bad idea** to run the server without basic auth protection, as it allows adding/removing users and updating spam samples to anyone who knows the endpoint. The only reason to run it without protection is inside the trusted network or for testing purposes.  Exposing the server directly to the internet is not recommended either, as basic auth is not secure enough if used without SSL. It is better to use a reverse proxy with TLS termination in front of the server.
 

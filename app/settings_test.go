@@ -163,6 +163,15 @@ func TestApplyCLIOverrides(t *testing.T) {
 		assert.Equal(t, []string{config.FieldCASToken}, settings.Transient.CredentialsFromCLI)
 	})
 
+	t.Run("oidc client secret CLI overrides DB value and is recorded", func(t *testing.T) {
+		settings := config.Settings{Server: config.ServerSettings{OIDC: config.OIDCSettings{ClientSecret: "db-oidc"}}}
+		opts := newDefaultOpts(t)
+		opts.Server.OIDC.ClientSecret = "cli-oidc"
+		applyCLIOverrides(&settings, opts, defaults)
+		assert.Equal(t, "cli-oidc", settings.Server.OIDC.ClientSecret)
+		assert.Equal(t, []string{config.FieldOIDCSecret}, settings.Transient.CredentialsFromCLI)
+	})
+
 	t.Run("empty cas token CLI keeps DB value", func(t *testing.T) {
 		settings := config.Settings{CAS: config.CASSettings{Token: "db-cas"}}
 		applyCLIOverrides(&settings, newDefaultOpts(t), defaults)
@@ -1702,6 +1711,17 @@ func Test_applyAutoAuthFallback_DisabledServerSkipsAutoAuth(t *testing.T) {
 
 	assert.Empty(t, settings.Transient.WebAuthPasswd, "disabled server must skip the fallback")
 	assert.Empty(t, settings.Server.AuthHash)
+}
+
+func Test_applyAutoAuthFallback_OIDCSkipsAutoAuth(t *testing.T) {
+	settings := &config.Settings{}
+	settings.Server.Enabled = true
+	settings.Server.OIDC.Issuer = "https://auth.example.com"
+
+	applyAutoAuthFallback(settings)
+
+	assert.Empty(t, settings.Transient.WebAuthPasswd, "oidc login must skip the basic auth fallback")
+	assert.False(t, settings.Transient.AuthFromCLI)
 }
 
 func Test_applyAutoAuthFallback_NonEmptyPasswdHonored(t *testing.T) {

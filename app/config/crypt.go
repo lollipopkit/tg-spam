@@ -25,6 +25,7 @@ const (
 	FieldCASToken        = "cas.token"
 	FieldTurnstileSecret = "captcha.turnstile.secret" //nolint:gosec // field name, not a credential
 	FieldServerAuthHash  = "server.auth_hash"
+	FieldOIDCSecret      = "server.oidc.client_secret" //nolint:gosec // field name, not a credential
 )
 
 // MinKeyLength defines the minimum acceptable length for an encryption key
@@ -166,6 +167,7 @@ var sensitiveFieldAccessors = map[string]struct {
 	FieldCASToken:        {"CAS token", func(s *Settings) *string { return &s.CAS.Token }},
 	FieldTurnstileSecret: {"Turnstile secret", func(s *Settings) *string { return &s.Captcha.Turnstile.Secret }},
 	FieldServerAuthHash:  {"Server auth hash", func(s *Settings) *string { return &s.Server.AuthHash }},
+	FieldOIDCSecret:      {"OIDC client secret", func(s *Settings) *string { return &s.Server.OIDC.ClientSecret }},
 }
 
 // CopySensitiveFields sets the named sensitive fields of dst to their values in src,

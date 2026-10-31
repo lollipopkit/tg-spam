@@ -9,6 +9,7 @@ import (
 	"math"
 	"net/url"
 	"reflect"
+	"slices"
 	"strings"
 	"time"
 	"unicode/utf16"
@@ -287,11 +288,24 @@ type MessageSettings struct {
 
 // ServerSettings contains web server settings
 type ServerSettings struct {
-	Enabled    bool   `json:"enabled" yaml:"enabled" db:"server_enabled"`
-	ListenAddr string `json:"listen_addr" yaml:"listen_addr" db:"server_listen_addr"`
-	AuthUser   string `json:"auth_user,omitempty" yaml:"auth_user,omitempty" db:"server_auth_user"`
-	AuthHash   string `json:"auth_hash" yaml:"auth_hash" db:"server_auth_hash"`
+	Enabled    bool         `json:"enabled" yaml:"enabled" db:"server_enabled"`
+	ListenAddr string       `json:"listen_addr" yaml:"listen_addr" db:"server_listen_addr"`
+	AuthUser   string       `json:"auth_user,omitempty" yaml:"auth_user,omitempty" db:"server_auth_user"`
+	AuthHash   string       `json:"auth_hash" yaml:"auth_hash" db:"server_auth_hash"`
+	OIDC       OIDCSettings `json:"oidc" yaml:"oidc" db:"server_oidc"`
 }
+
+// OIDCSettings switch the web UI from basic auth to an OpenID Connect login when Issuer is set
+type OIDCSettings struct {
+	Issuer       string   `json:"issuer" yaml:"issuer" db:"server_oidc_issuer"`
+	ClientID     string   `json:"client_id" yaml:"client_id" db:"server_oidc_client_id"`
+	ClientSecret string   `json:"client_secret" yaml:"client_secret" db:"server_oidc_client_secret"`
+	URL          string   `json:"url" yaml:"url" db:"server_oidc_url"`
+	Allow        []string `json:"allow" yaml:"allow" db:"server_oidc_allow"`
+}
+
+// Enabled reports whether the OIDC login replaces basic auth
+func (o OIDCSettings) Enabled() bool { return o.Issuer != "" }
 
 // TransientSettings contains settings that should never be persisted
 type TransientSettings struct {
@@ -367,6 +381,9 @@ func (s *Settings) Validate() error {
 		if err := validateTurnstile(s.Captcha.Turnstile); err != nil {
 			return err
 		}
+	}
+	if err := ValidateOIDC(s.Server.OIDC); err != nil {
+		return err
 	}
 	if s.MaxShortMsgCount < 0 {
 		return fmt.Errorf("max-short-msg-count (%d) must be >= 0 (0 disables)", s.MaxShortMsgCount)
@@ -507,13 +524,47 @@ func ValidateTurnstile(siteKey, secret, publicURL, listen string) error {
 	if siteKey == "" || secret == "" || listen == "" {
 		return fmt.Errorf("captcha.turnstile needs a site key, a secret and a listen address")
 	}
-	u, err := url.Parse(publicURL)
-	if err != nil || u.Scheme != "https" || u.Hostname() == "" || (u.Path != "" && u.Path != "/") ||
-		u.RawQuery != "" || u.ForceQuery || strings.Contains(publicURL, "#") || u.User != nil {
+	if !isBareHTTPSURL(publicURL) {
 		return fmt.Errorf("captcha.turnstile.url (%q) must be an https url of a host, without a path, query or fragment",
 			publicURL)
 	}
 	return nil
+}
+
+// ValidateOIDC checks the OIDC login settings when an issuer enables it: an https issuer, a client id and
+// secret, an allow list (an empty one would let any account of the issuer in), and the public https url of
+// the web UI as a bare host, since the callback is served at /auth/callback from the root
+func ValidateOIDC(o OIDCSettings) error {
+	if !o.Enabled() {
+		return nil
+	}
+	if o.ClientID == "" || o.ClientSecret == "" {
+		return fmt.Errorf("server.oidc needs a client id and a client secret")
+	}
+	if u, err := url.Parse(o.Issuer); err != nil || u.Scheme != "https" || u.Hostname() == "" {
+		return fmt.Errorf("server.oidc.issuer (%q) must be an https url", o.Issuer)
+	}
+	if !isBareHTTPSURL(o.URL) {
+		return fmt.Errorf("server.oidc.url (%q) must be an https url of a host, without a path, query or fragment", o.URL)
+	}
+	if len(o.Allow) == 0 {
+		return fmt.Errorf("server.oidc.allow must list at least one role:, group:, email: or sub: entry")
+	}
+	for _, a := range o.Allow {
+		kind, value, ok := strings.Cut(a, ":")
+		if !ok || value == "" || !slices.Contains([]string{"role", "group", "email", "sub"}, kind) {
+			return fmt.Errorf("server.oidc.allow entry %q must be role:<name>, group:<name>, email:<address> or sub:<id>", a)
+		}
+	}
+	return nil
+}
+
+// isBareHTTPSURL reports whether raw is an https url of a host with no path beyond "/", no query, no fragment
+// and no user info
+func isBareHTTPSURL(raw string) bool {
+	u, err := url.Parse(raw)
+	return err == nil && u.Scheme == "https" && u.Hostname() != "" && (u.Path == "" || u.Path == "/") &&
+		u.RawQuery == "" && !u.ForceQuery && !strings.Contains(raw, "#") && u.User == nil
 }
 
 // zeroAwarePaths lists Settings field paths where the zero value is a meaningful
