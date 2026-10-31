@@ -162,7 +162,7 @@ func TestCaptcha_Start(t *testing.T) {
 	assert.Equal(t, int64(123), mutes[0].ChatID)
 	assert.Equal(t, int64(42), mutes[0].UserID)
 	assert.Equal(t, &tbapi.ChatPermissions{}, mutes[0].Permissions)
-	assert.InDelta(t, before.Add(3*time.Minute).Unix(), mutes[0].UntilDate, 2, "mute outlives the timeout")
+	assert.InDelta(t, before.Add(2*time.Minute).Unix(), mutes[0].UntilDate, 2, "the join mute lasts the timeout")
 
 	require.Len(t, api.SendCalls(), 1)
 	anim := api.SendCalls()[0].C.(tbapi.AnimationConfig)
@@ -450,16 +450,21 @@ func TestCaptcha_Timeout(t *testing.T) {
 	assert.Equal(t, 1, failuresOf(c, 42))
 }
 
-func TestCaptcha_TimeoutStartsWhenPosted(t *testing.T) {
+func TestCaptcha_TimeoutEndsWithJoinMute(t *testing.T) {
 	api := newCaptchaAPI("member")
-	c := newCaptcha(api, 123, 50*time.Millisecond, testCaptchaMsg)
+	c := newCaptcha(api, 123, 2*time.Minute, testCaptchaMsg)
 	defer c.Stop()
 	c.render = func(string) ([]byte, error) { time.Sleep(100 * time.Millisecond); return []byte("gif"), nil }
+	before := time.Now()
 	startPosted(t, c, bot.User{ID: 42})
-	assert.True(t, c.IsPending(42), "a slow post does not eat the timeout")
-	assert.Empty(t, requestsOf[tbapi.BanChatMemberConfig](api))
-	require.Eventually(t, func() bool { return len(requestsOf[tbapi.BanChatMemberConfig](api)) == 1 },
-		time.Second, 10*time.Millisecond)
+	c.mu.Lock()
+	deadline := c.pending[42].deadline
+	c.mu.Unlock()
+	assert.WithinRange(t, deadline, before.Add(2*time.Minute), before.Add(2*time.Minute+100*time.Millisecond),
+		"the timeout counts from the join mute, a slow post does not extend it")
+	mutes := requestsOf[tbapi.RestrictChatMemberConfig](api)
+	require.Len(t, mutes, 1)
+	assert.Equal(t, deadline.Unix(), mutes[0].UntilDate, "the join mute ends when the timeout action applies")
 }
 
 func TestCaptcha_Restart(t *testing.T) {
@@ -1214,7 +1219,7 @@ func TestCaptcha_TimeoutMute(t *testing.T) {
 		api := statusFails()
 		c := newMuteCaptcha(api, time.Minute)
 		require.NoError(t, c.fail(bot.User{ID: 42}, "timeout", false))
-		c.muteForeverOrBan(bot.User{ID: 42}, "captcha timeout")
+		c.muteForeverOrBan(bot.User{ID: 42}, "captcha timeout", true)
 		require.True(t, c.mutedForGood(42))
 		startPosted(t, c, bot.User{ID: 42})
 		rs := requestsOf[tbapi.RestrictChatMemberConfig](api)
@@ -1234,7 +1239,7 @@ func TestCaptcha_TimeoutMute(t *testing.T) {
 		api := newCaptchaAPI("member")
 		c := newMuteCaptcha(api, time.Minute)
 		require.NoError(t, c.fail(bot.User{ID: 42}, "timeout", false))
-		c.muteForeverOrBan(bot.User{ID: 42}, "captcha timeout")
+		c.muteForeverOrBan(bot.User{ID: 42}, "captcha timeout", true)
 		base := api.RequestFunc
 		api.RequestFunc = func(cfg tbapi.Chattable) (*tbapi.APIResponse, error) {
 			if _, ok := cfg.(tbapi.GetChatMemberConfig); ok {
@@ -1314,7 +1319,7 @@ func TestCaptcha_TimeoutMute(t *testing.T) {
 		refuseForeverAndBan(api)
 		c := newMuteCaptcha(api, time.Minute)
 		require.NoError(t, c.fail(bot.User{ID: 42}, "timeout", false))
-		c.muteForeverOrBan(bot.User{ID: 42}, "status unknown after a permanent mute")
+		c.muteForeverOrBan(bot.User{ID: 42}, "status unknown after a permanent mute", c.isMutedByCaptcha(42))
 		rs := requestsOf[tbapi.RestrictChatMemberConfig](api)
 		require.Len(t, rs, 1, "only the refused permanent mute, no timed mute over an existing one")
 		assert.Zero(t, rs[0].UntilDate)
