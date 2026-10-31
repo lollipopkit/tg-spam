@@ -52,9 +52,11 @@ const (
 // cookies signed with a key generated at startup, so a restart signs everyone out; logout revokes the
 // session id until it would expire. The allow list is checked once, at login.
 type oidcAuth struct {
-	cfg    config.OIDCSettings
-	key    []byte
-	client *http.Client
+	cfg        config.OIDCSettings
+	key        []byte
+	client     *http.Client
+	publicBase string // cfg.URL without a trailing slash
+	publicHost string // its host, lower case, without the default port
 
 	fetchMu  sync.Mutex // serializes discovery, so waiters share one fetch instead of each starting one
 	mu       sync.Mutex // guards the fields below
@@ -143,7 +145,12 @@ func newOIDCAuth(cfg config.OIDCSettings) (*oidcAuth, error) {
 	if _, err := rand.Read(key); err != nil {
 		return nil, fmt.Errorf("can't generate session key: %w", err)
 	}
-	return &oidcAuth{cfg: cfg, key: key, client: &http.Client{Timeout: 10 * time.Second}, revoked: map[string]int64{}}, nil
+	public, err := url.Parse(cfg.URL)
+	if err != nil {
+		return nil, fmt.Errorf("invalid oidc url: %w", err)
+	}
+	return &oidcAuth{cfg: cfg, key: key, client: &http.Client{Timeout: 10 * time.Second}, revoked: map[string]int64{},
+		publicBase: strings.TrimSuffix(cfg.URL, "/"), publicHost: canonicalHost(public.Host)}, nil
 }
 
 // discover fetches the provider metadata on first use and keeps it, so the web UI starts even while the
@@ -208,7 +215,7 @@ func (a *oidcAuth) fetchProvider(ctx context.Context) (*oidcProvider, error) {
 			ClientID:     a.cfg.ClientID,
 			ClientSecret: a.cfg.ClientSecret,
 			Endpoint:     provider.Endpoint(),
-			RedirectURL:  strings.TrimSuffix(a.cfg.URL, "/") + oidcCallbackPath,
+			RedirectURL:  a.publicBase + oidcCallbackPath,
 			Scopes:       scopes,
 		},
 	}, nil
@@ -359,7 +366,12 @@ func (a *oidcAuth) logoutHandler(w http.ResponseWriter, r *http.Request) {
 	// one gets a local page that does not trigger a login
 	target := oidcLoggedOutPath
 	if p, err := a.discover(r.Context()); err == nil && p.endSession != "" {
-		target = p.endSession + sep(p.endSession) + url.Values{"client_id": {a.cfg.ClientID}}.Encode()
+		if u, perr := url.Parse(p.endSession); perr == nil {
+			q := u.Query()
+			q.Set("client_id", a.cfg.ClientID)
+			u.RawQuery = q.Encode()
+			target = u.String()
+		}
 	}
 	if r.Header.Get("HX-Request") == "true" {
 		w.Header().Set("HX-Redirect", target)
@@ -370,7 +382,8 @@ func (a *oidcAuth) logoutHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 // logoutPageHandler answers GET /logout, left in bookmarks and pages cached from before logout was a POST,
-// with a page that posts it; logging out on a GET would let any site sign the admin out
+// with a page that posts it; logging out on a GET would let any site sign the admin out.
+// TODO: remove with the basic auth GET /logout once such bookmarks and cached pages are gone
 func (a *oidcAuth) logoutPageHandler(w http.ResponseWriter, _ *http.Request) {
 	writeOIDCPage(w, "Sign out of tg-spam?", `<form method="post" action="`+oidcLogoutPath+`"><button>Sign out</button></form>`)
 }
@@ -381,20 +394,31 @@ func (a *oidcAuth) loggedOutHandler(w http.ResponseWriter, _ *http.Request) {
 }
 
 // redirectToPublicHost sends a request for another host (a tailnet address, another proxy name) to the
-// public url: the login cookies are host-bound and the provider calls back on the public url only
+// public url: the login cookies are host-bound and the provider calls back on the public url only. A proxy
+// that rewrites Host is recognized by X-Forwarded-Host; trusting it is safe here, it only decides whether to
+// redirect, and the target is always the configured url.
 func (a *oidcAuth) redirectToPublicHost(w http.ResponseWriter, r *http.Request) bool {
-	public, err := url.Parse(a.cfg.URL)
-	if err != nil || strings.EqualFold(r.Host, public.Host) {
+	host := cmp.Or(r.Header.Get("X-Forwarded-Host"), r.Host)
+	if canonicalHost(host) == a.publicHost {
 		return false
 	}
-	target := strings.TrimSuffix(a.cfg.URL, "/") + r.URL.RequestURI()
-	if r.Method == http.MethodGet {
+	target := a.publicBase + r.URL.RequestURI()
+	switch {
+	case r.Header.Get("HX-Request") == "true":
+		w.Header().Set("HX-Redirect", target) // an XHR can't follow a cross-origin redirect
+		w.WriteHeader(http.StatusMisdirectedRequest)
+	case r.Method == http.MethodGet || r.Method == http.MethodHead:
 		// the host comes from the configured public url; the request part can only add a path to it
 		http.Redirect(w, r, target, http.StatusFound) //nolint:gosec // not an open redirect, see above
-		return true
+	default:
+		http.Error(w, "use "+a.publicHost, http.StatusMisdirectedRequest)
 	}
-	http.Error(w, "use "+public.Host, http.StatusMisdirectedRequest)
 	return true
+}
+
+// canonicalHost lower-cases a host and drops the default https port, which browsers leave out of Host
+func canonicalHost(h string) string {
+	return strings.TrimSuffix(strings.ToLower(h), ":443")
 }
 
 // allowed matches the id token claims against the allow list; email entries need a verified email
@@ -554,18 +578,11 @@ func localPath(p string) string {
 	return clean
 }
 
-// sep returns the separator for appending a query to u
-func sep(u string) string {
-	if strings.Contains(u, "?") {
-		return "&"
-	}
-	return "?"
-}
-
 // writeOIDCPage writes a minimal html page; title and body are fixed strings, never user input
 func writeOIDCPage(w http.ResponseWriter, title, body string) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	w.Header().Set("Content-Security-Policy", "default-src 'none'; form-action 'self'; frame-ancestors 'none'")
+	// no form-action: the logout form's 303 goes on to the provider, and form-action applies to that redirect
+	w.Header().Set("Content-Security-Policy", "default-src 'none'; frame-ancestors 'none'")
 	w.Header().Set("Cache-Control", "no-store")
 	_, _ = fmt.Fprintf(w, "<!doctype html><title>tg-spam</title><p>%s</p>%s\n", title, body)
 }

@@ -203,6 +203,31 @@ func TestOIDC_Middleware(t *testing.T) {
 		rec = httptest.NewRecorder()
 		h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "http://100.64.0.1:8080/check", http.NoBody))
 		assert.Equal(t, http.StatusMisdirectedRequest, rec.Code)
+
+		rec = httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest(http.MethodHead, "http://100.64.0.1:8080/", http.NoBody))
+		assert.Equal(t, http.StatusFound, rec.Code, "head is redirected like get")
+
+		rec = httptest.NewRecorder()
+		req = httptest.NewRequest(http.MethodGet, "http://100.64.0.1:8080/dm-users", http.NoBody)
+		req.Header.Set("HX-Request", "true")
+		h.ServeHTTP(rec, req)
+		assert.Equal(t, "https://example.com/dm-users", rec.Header().Get("HX-Redirect"))
+		assert.Empty(t, rec.Header().Get("Location"))
+	})
+	t.Run("public host behind a proxy or with the default port is not redirected", func(t *testing.T) {
+		for _, req := range []*http.Request{
+			func() *http.Request {
+				r := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:8080/x", http.NoBody)
+				r.Header.Set("X-Forwarded-Host", "Example.com")
+				return r
+			}(),
+			httptest.NewRequest(http.MethodGet, "https://example.com:443/x", http.NoBody),
+		} {
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, req)
+			assert.Equal(t, "/auth/login?rd=%2Fx", rec.Header().Get("Location"), req.Host)
+		}
 	})
 	t.Run("post is refused", func(t *testing.T) {
 		rec := httptest.NewRecorder()
@@ -457,6 +482,8 @@ func TestOIDC_Logout(t *testing.T) {
 		h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/logout", http.NoBody))
 		assert.Equal(t, http.StatusOK, rec.Code)
 		assert.Contains(t, rec.Body.String(), `<form method="post" action="/logout">`)
+		assert.NotContains(t, rec.Header().Get("Content-Security-Policy"), "form-action",
+			"form-action would block the 303 to the provider")
 		assert.Empty(t, rec.Result().Cookies(), "a get does not log out")
 	})
 	t.Run("other methods and encoded paths stay behind the login", func(t *testing.T) {
