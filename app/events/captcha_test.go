@@ -1210,7 +1210,7 @@ func TestCaptcha_TimeoutMute(t *testing.T) {
 		}
 		return api
 	}
-	t.Run("unknown status of a member who failed recently keeps the restriction", func(t *testing.T) {
+	t.Run("unknown status of a member who failed recently mutes for good", func(t *testing.T) {
 		api := statusFails()
 		c := newMuteCaptcha(api, time.Minute)
 		require.NoError(t, c.fail(bot.User{ID: 42}, "timeout", false))
@@ -1220,9 +1220,25 @@ func TestCaptcha_TimeoutMute(t *testing.T) {
 		c.failures[42] = f
 		c.mu.Unlock()
 		startPosted(t, c, bot.User{ID: 42})
-		assert.Empty(t, requestsOf[tbapi.RestrictChatMemberConfig](api), "a permanent mute may be in place")
+		assert.Zero(t, lastRestrict(api).UntilDate, "keeps a permanent mute if there is one, leaves nobody unverified")
 		assert.Empty(t, api.SendCalls())
 		assert.False(t, c.IsPending(42))
+	})
+	t.Run("leaving while the status is read mutes nobody", func(t *testing.T) {
+		api := newCaptchaAPI("member")
+		c := newMuteCaptcha(api, time.Minute)
+		base := api.RequestFunc
+		api.RequestFunc = func(cfg tbapi.Chattable) (*tbapi.APIResponse, error) {
+			if _, ok := cfg.(tbapi.GetChatMemberConfig); ok {
+				c.Cancel(42) // the member leaves, which records a failure and starts the cooldown
+			}
+			return base(cfg)
+		}
+		c.Start(bot.User{ID: 42}, "")
+		require.Eventually(t, func() bool { return failuresOf(c, 42) == 1 }, time.Second, 10*time.Millisecond)
+		c.running.Wait()
+		assert.Empty(t, requestsOf[tbapi.RestrictChatMemberConfig](api), "never saw a captcha, never muted")
+		assert.Empty(t, api.SendCalls())
 	})
 	t.Run("unknown status of a new member verifies anyway", func(t *testing.T) {
 		api := statusFails()

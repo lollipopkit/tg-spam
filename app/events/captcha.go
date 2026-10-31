@@ -127,8 +127,13 @@ func (c *captcha) verify(p *pendingCaptcha) {
 	status, err := c.memberStatus(user.ID)
 	switch {
 	case err != nil && c.timeoutMute && c.failedRecently(user.ID):
-		c.take(c.pending, user.ID, p)
-		log.Printf("[WARN] can't get member status of %s, who failed a captcha recently, restriction kept: %v", user, err)
+		// a permanent mute may be in place, which the join mute would replace with one that expires; muting for
+		// good keeps it if so and leaves nobody unverified if not
+		if c.take(c.pending, user.ID, p) == nil {
+			return
+		}
+		log.Printf("[WARN] can't get member status of %s, who failed a captcha recently: %v", user, err)
+		c.muteForeverOrBan(user, "status unknown after a recent captcha failure")
 		return
 	case err != nil:
 		log.Printf("[WARN] can't get member status of %s, verifying anyway: %v", user, err)
@@ -142,7 +147,9 @@ func (c *captcha) verify(p *pendingCaptcha) {
 		return
 	}
 	if c.timeoutMute && c.cooldownLeft(user.ID) > 0 {
-		c.take(c.pending, user.ID, p)
+		if c.take(c.pending, user.ID, p) == nil {
+			return // canceled (left again) or replaced while the status was read
+		}
 		c.muteForeverOrBan(user, "rejoined during captcha cooldown")
 		return
 	}
@@ -475,7 +482,8 @@ func (c *captcha) muteForeverOrBan(user bot.User, reason string) {
 		log.Printf("[INFO] %s muted for good, %s", user, reason)
 		return
 	}
-	if rerr := c.remove(user, max(c.cooldownLeft(user.ID), captchaCooldown), reason); rerr != nil {
+	// under 30 seconds is forever for telegram, so the ban lasts at least a minute
+	if rerr := c.remove(user, max(c.cooldownLeft(user.ID), time.Minute), reason); rerr != nil {
 		log.Printf("[WARN] failed to mute %s for good, %s: %v; %v", user, reason, err, rerr)
 		return
 	}
@@ -486,8 +494,8 @@ func (c *captcha) muteForeverOrBan(user bot.User, reason string) {
 func (c *captcha) failedRecently(userID int64) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	f, ok := c.failures[userID]
-	return ok && time.Since(f.last) <= captchaMaxCooldown
+	_, ok := c.failure(userID)
+	return ok
 }
 
 // register makes p the member's captcha in m (pending or tests), deleting the one it replaces
@@ -599,7 +607,7 @@ func (c *captcha) fail(user bot.User, reason string, remove bool) error {
 	now := time.Now()
 	c.mu.Lock()
 	for id, f := range c.failures {
-		if now.Sub(f.last) > captchaMaxCooldown {
+		if failureForgotten(f, now) {
 			delete(c.failures, id)
 		}
 	}
@@ -620,11 +628,26 @@ func (c *captcha) fail(user bot.User, reason string, remove bool) error {
 func (c *captcha) cooldownLeft(userID int64) time.Duration {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	f, ok := c.failures[userID]
+	f, ok := c.failure(userID)
 	if !ok {
 		return 0
 	}
 	return max(time.Until(f.last.Add(cooldownFor(f.count))), 0)
+}
+
+// failure returns the member's failure record unless it is forgotten, older than captchaMaxCooldown, the rule
+// fail prunes by. call with mu held
+func (c *captcha) failure(userID int64) (captchaFailure, bool) {
+	f, ok := c.failures[userID]
+	if !ok || failureForgotten(f, time.Now()) {
+		return captchaFailure{}, false
+	}
+	return f, true
+}
+
+// failureForgotten reports whether a failure is old enough to be forgotten
+func failureForgotten(f captchaFailure, now time.Time) bool {
+	return now.Sub(f.last) > captchaMaxCooldown
 }
 
 // cooldownFor returns the ban duration after the given number of failures
