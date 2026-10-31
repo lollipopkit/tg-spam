@@ -100,15 +100,10 @@ func (c *captcha) Start(user bot.User, lang string) {
 	go c.verify(p)
 }
 
-// verify runs a pending captcha up to the posted challenge. in the ban mode a member still in a failure
-// cooldown is banned for the rest of it, before any status read. the mute mode has no such step: a wrong
-// answer bans, so nobody rejoins during that cooldown unless an admin let them, a member muted for good reads
-// as restricted below, and a member who left before answering never pressed a button, so a fresh challenge
-// gives nothing away. administrators and members restricted by anyone but the captcha are left alone: muting
-// a restricted member would replace a soft ban, an admin mute or a permanent timeout mute with one that
-// expires. with the status unknown the member is verified anyway, except in the mute mode a member whose last
-// failure muted them for good, who is muted for good again rather than risk replacing that mute. the timeout
-// starts once the challenge is posted, a member waiting for a worker can't time out before seeing it
+// verify runs a pending captcha up to the posted challenge. ban mode: a member in a failure cooldown is banned
+// for the rest of it, before any status read. administrators and members restricted by anyone but the join
+// mute are left alone. an unknown status verifies anyway, except a member muted for good, muted for good
+// again (mute mode). the timeout starts once the challenge is posted
 func (c *captcha) verify(p *pendingCaptcha) {
 	defer c.running.Done()
 	c.workers <- struct{}{}
@@ -363,8 +358,8 @@ func (c *captcha) IsPending(userID int64) bool {
 	return ok
 }
 
-// Cancel drops the captcha of a member who has left the chat. it counts as a failure, so leaving and
-// rejoining for a fresh challenge runs into the cooldown, but nobody is banned since the member is gone
+// Cancel drops the captcha of a member who has left the chat. once the challenge was posted it counts as a
+// failure, which in the ban mode makes a rejoin run into the cooldown; nobody is banned, the member is gone
 func (c *captcha) Cancel(userID int64) {
 	p := c.take(c.pending, userID, nil)
 	if p == nil {
@@ -478,10 +473,12 @@ func (c *captcha) muteForeverOrBan(user bot.User, reason string) {
 	err := c.muteForever(user)
 	if err == nil {
 		c.mu.Lock()
-		if f, ok := c.failures[user.ID]; ok {
-			f.forever = true
-			c.failures[user.ID] = f
+		f := c.failures[user.ID] // normally the failure just recorded, created if it was pruned meanwhile
+		if f.count == 0 {
+			f.count, f.last = 1, time.Now()
 		}
+		f.forever = true
+		c.failures[user.ID] = f
 		c.mu.Unlock()
 		log.Printf("[INFO] %s muted for good, %s", user, reason)
 		return
@@ -666,20 +663,26 @@ func cooldownFor(failures int) time.Duration {
 // remove bans the member until the cooldown ends, telegram lifts the ban by itself then. if the ban fails
 // the member is muted for the cooldown instead, a failed captcha must not leave them free to post
 func (c *captcha) remove(user bot.User, d time.Duration, reason string) error {
+	// the join mute is replaced by the ban or the cooldown mute below, which must not read as the captcha's own
+	c.mu.Lock()
+	delete(c.muted, user.ID)
+	c.mu.Unlock()
 	err := banUserOrChannel(banRequest{tbAPI: c.tbAPI, userID: user.ID, chatID: c.chatID, duration: d,
 		userName: user.String()})
 	if err == nil {
 		log.Printf("[INFO] %s removed for %v, captcha %s", user, d.Round(time.Second), reason)
 		return nil
 	}
-	if merr := c.mute(user, d); merr != nil {
+	// not recorded as the captcha's own mute: on a rejoin it is kept like anybody's restriction, so leaving
+	// and rejoining can't trade it for the short join mute and a fresh challenge
+	if merr := c.restrict(user, time.Now().Add(max(d, time.Minute)).Unix()); merr != nil {
 		return fmt.Errorf("failed to remove %s after captcha %s: %w, and to mute: %w", user, reason, err, merr)
 	}
 	return fmt.Errorf("failed to remove %s after captcha %s, muted for %v instead: %w", user, reason, d, err)
 }
 
-// mute takes every permission from the member for d. the mute expires on its own, so a member whose
-// captcha is lost is not muted for good. it is recorded, telling it apart from other restrictions on rejoin
+// mute is the join mute: every permission taken for d, expiring on its own so a member whose captcha is lost
+// is not muted for good. it is recorded, telling it apart from other restrictions on rejoin
 func (c *captcha) mute(user bot.User, d time.Duration) error {
 	until := time.Now().Add(max(d, time.Minute)) // under 30 seconds is forever for telegram
 	if err := c.restrict(user, until.Unix()); err != nil {
