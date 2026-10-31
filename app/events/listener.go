@@ -74,6 +74,7 @@ type TelegramListener struct {
 	CaptchaEnabled          bool            // verify new members of the primary chat with a captcha
 	CaptchaTimeout          time.Duration   // time to solve the captcha before the timeout action applies
 	CaptchaTimeoutMute      bool            // on timeout mute the member for good instead of banning for the cooldown
+	CaptchaOnly             bool            // skip the message, join and reaction spam checks, the captcha is the only protection
 	CaptchaMessage          string          // captcha prompt with {user} and {timeout} placeholders, empty for the default
 	CaptchaTurnstile        TurnstileConfig // Turnstile instead of the motion animation, when its site key is set
 
@@ -106,6 +107,9 @@ func (l *TelegramListener) Do(ctx context.Context) error {
 
 	if l.TrainingMode {
 		log.Printf("[WARN] training mode, no bans")
+	}
+	if l.CaptchaOnly {
+		log.Printf("[WARN] captcha only, message, join and reaction spam checks are off")
 	}
 
 	if l.SoftBanMode {
@@ -500,6 +504,10 @@ func (l *TelegramListener) procEvents(update tbapi.Update) error {
 		return nil
 	}
 
+	if l.CaptchaOnly {
+		return nil
+	}
+
 	resp := l.Bot.OnMessage(*msg, false)
 
 	if !resp.Send { // not spam
@@ -673,7 +681,10 @@ func (l *TelegramListener) procJoin(ctx context.Context, msg *tbapi.Message) err
 			LastName: strings.TrimSpace(member.LastName), IsPremium: member.IsPremium}
 		user.DisplayName = strings.TrimSpace(user.FirstName + " " + user.LastName)
 
-		resp := l.Bot.OnJoin(user)
+		var resp bot.Response
+		if !l.CaptchaOnly {
+			resp = l.Bot.OnJoin(user)
+		}
 		if resp.BanInterval <= 0 {
 			l.startCaptcha(msg, member, user)
 			continue
@@ -1021,6 +1032,9 @@ func (l *TelegramListener) deleteExtraMessages(checkResults []spamcheck.Response
 
 // procReaction handles a message_reaction update: checks if the reacting user is a spam bot and bans if needed.
 func (l *TelegramListener) procReaction(ctx context.Context, r *tbapi.MessageReactionUpdated) error {
+	if l.CaptchaOnly {
+		return nil
+	}
 	if r.User == nil {
 		log.Printf("[DEBUG] reaction from anonymous user, skipped")
 		return nil

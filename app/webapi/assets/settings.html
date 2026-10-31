@@ -800,6 +800,13 @@
                     <div class="form-text">Mute new members until they enter the number shown in a motion animation</div>
                 </div>
                 <div class="col-md-6 mb-3">
+                    <div class="form-check form-switch mt-2">
+                        <input class="form-check-input" type="checkbox" id="captchaOnly" name="captchaOnly" {{if .Captcha.Only}}checked{{end}}>
+                        <label class="form-check-label" for="captchaOnly">Captcha Only</label>
+                    </div>
+                    <div class="form-text">Turn off the message, join and reaction spam checks, keep the captcha as the only protection (applied on restart)</div>
+                </div>
+                <div class="col-md-6 mb-3">
                     <label for="captchaTimeout" class="form-label">Captcha Timeout</label>
                     <input type="text" class="form-control" id="captchaTimeout" name="captchaTimeout" value="{{.Captcha.Timeout}}">
                     <div class="form-text">Time to solve the captcha before the timeout action applies (10s to 24h)</div>
@@ -849,6 +856,7 @@
                         <tr><th>Warn Threshold</th><td>{{if eq .Warn.Threshold 0}}disabled{{else}}{{.Warn.Threshold}}{{end}}</td></tr>
                         <tr><th>Warn Window</th><td>{{.Warn.Window}}</td></tr>
                         <tr><th>Captcha Enabled</th><td>{{.Captcha.Enabled}}</td></tr>
+                        <tr><th>Captcha Only</th><td>{{.Captcha.Only}}</td></tr>
                         <tr><th>Captcha Timeout</th><td>{{.Captcha.Timeout}}</td></tr>
                         <tr><th>Captcha Timeout Action</th><td>{{if eq .Captcha.TimeoutAction "mute"}}mute for good{{else}}ban for the cooldown{{end}}</td></tr>
                         <tr><th>Captcha Message</th><td>{{if .Captcha.Message}}{{.Captcha.Message}}{{else}}default{{end}}</td></tr>
