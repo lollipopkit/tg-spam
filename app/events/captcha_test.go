@@ -1177,15 +1177,59 @@ func TestCaptcha_TimeoutMute(t *testing.T) {
 		}
 	})
 
-	t.Run("left before answering and rejoined in the cooldown is muted for the rest of it", func(t *testing.T) {
+	t.Run("left before answering and rejoined in the cooldown is muted for good", func(t *testing.T) {
 		api := newCaptchaAPI("member")
 		c := newMuteCaptcha(api, time.Minute)
 		require.NoError(t, c.fail(bot.User{ID: 42}, "left the chat", false))
 		startPosted(t, c, bot.User{ID: 42})
-		r := lastRestrict(api)
-		assert.InDelta(t, time.Now().Add(captchaCooldown).Unix(), r.UntilDate, 2, "timed, not for good")
+		assert.Zero(t, lastRestrict(api).UntilDate, "the cooldown running out must not leave them unverified")
 		assert.Empty(t, requestsOf[tbapi.BanChatMemberConfig](api))
 		assert.Empty(t, api.SendCalls())
+		assert.False(t, c.IsPending(42))
+	})
+
+	t.Run("admins and members who left again are skipped in the cooldown", func(t *testing.T) {
+		for _, status := range []string{"administrator", "left"} {
+			api := newCaptchaAPI(status)
+			c := newMuteCaptcha(api, time.Minute)
+			require.NoError(t, c.fail(bot.User{ID: 42}, "left the chat", false))
+			startPosted(t, c, bot.User{ID: 42})
+			assert.Empty(t, requestsOf[tbapi.RestrictChatMemberConfig](api), status)
+			assert.Empty(t, requestsOf[tbapi.BanChatMemberConfig](api), status)
+		}
+	})
+
+	statusFails := func() *mocks.TbAPIMock {
+		api := newCaptchaAPI("member")
+		base := api.RequestFunc
+		api.RequestFunc = func(cfg tbapi.Chattable) (*tbapi.APIResponse, error) {
+			if _, ok := cfg.(tbapi.GetChatMemberConfig); ok {
+				return nil, errors.New("too many requests")
+			}
+			return base(cfg)
+		}
+		return api
+	}
+	t.Run("unknown status of a member who failed recently keeps the restriction", func(t *testing.T) {
+		api := statusFails()
+		c := newMuteCaptcha(api, time.Minute)
+		require.NoError(t, c.fail(bot.User{ID: 42}, "timeout", false))
+		c.mu.Lock()
+		f := c.failures[42]
+		f.last = time.Now().Add(-captchaCooldown - time.Second) // past the cooldown, not forgotten
+		c.failures[42] = f
+		c.mu.Unlock()
+		startPosted(t, c, bot.User{ID: 42})
+		assert.Empty(t, requestsOf[tbapi.RestrictChatMemberConfig](api), "a permanent mute may be in place")
+		assert.Empty(t, api.SendCalls())
+		assert.False(t, c.IsPending(42))
+	})
+	t.Run("unknown status of a new member verifies anyway", func(t *testing.T) {
+		api := statusFails()
+		c := newMuteCaptcha(api, time.Minute)
+		startPosted(t, c, bot.User{ID: 42})
+		assert.Len(t, api.SendCalls(), 1)
+		assert.True(t, c.IsPending(42))
 	})
 
 	t.Run("a wrong answer still bans", func(t *testing.T) {
