@@ -72,7 +72,7 @@ type TelegramListener struct {
 	AdmitContacts           bool            // admit text-less shared contacts, same as AdmitDocuments
 	AdmitAudio              bool            // admit text-less audio files, same as AdmitDocuments
 	CaptchaEnabled          bool            // verify new members of the primary chat with a captcha
-	CaptchaTimeout          time.Duration   // time to solve the captcha before the member is removed
+	CaptchaTimeout          time.Duration   // time to solve the captcha before the timeout action applies
 	CaptchaTimeoutMute      bool            // on timeout mute the member for good instead of banning for the cooldown
 	CaptchaMessage          string          // captcha prompt with {user} and {timeout} placeholders, empty for the default
 	CaptchaTurnstile        TurnstileConfig // Turnstile instead of the motion animation, when its site key is set

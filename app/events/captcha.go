@@ -48,7 +48,8 @@ type captcha struct {
 	timeout time.Duration
 	message string // prompt template with {user} and {timeout}, empty for the mode default
 	// timeoutMute mutes a member who times out for good instead of banning for the cooldown; the member stays in
-	// the chat, a rejoin during the cooldown keeps the mute, and a later rejoin gets a new captcha
+	// the chat until an admin lifts the restriction. the permanent mute is not recorded in muted, so on a rejoin
+	// it reads as anybody's restriction and is kept, with no new captcha that could lift it
 	timeoutMute bool
 	render      func(code string) ([]byte, error) // draws the challenge image
 	turnstile   *turnstile                        // set in Turnstile mode, nil for the motion animation
@@ -99,10 +100,10 @@ func (c *captcha) Start(user bot.User, lang string) {
 }
 
 // verify runs a pending captcha up to the posted challenge. a member still in a failure cooldown is banned
-// for the rest of it. administrators and members restricted by anyone but the captcha are left alone: muting
-// a restricted member would replace a soft ban or an admin mute with one that expires. with the status
-// unknown the member is verified anyway. the timeout starts once the challenge is posted, a member waiting
-// for a worker can't time out before seeing it
+// for the rest of it, or in the mute mode muted for it (see muteForCooldown). administrators and members
+// restricted by anyone but the captcha are left alone: muting a restricted member would replace a soft ban
+// or an admin mute with one that expires. with the status unknown the member is verified anyway. the timeout
+// starts once the challenge is posted, a member waiting for a worker can't time out before seeing it
 func (c *captcha) verify(p *pendingCaptcha) {
 	defer c.running.Done()
 	c.workers <- struct{}{}
@@ -115,9 +116,7 @@ func (c *captcha) verify(p *pendingCaptcha) {
 	if left := c.cooldownLeft(user.ID); left > 0 {
 		c.take(c.pending, user.ID, p)
 		if c.timeoutMute {
-			if err := c.mute(user, 0); err != nil {
-				log.Printf("[WARN] failed to keep %s muted, rejoined during captcha cooldown: %v", user, err)
-			}
+			c.muteForCooldown(user, left)
 			return
 		}
 		if err := c.remove(user, left, "rejoined during captcha cooldown"); err != nil {
@@ -368,7 +367,7 @@ func (c *captcha) Cancel(userID int64) {
 }
 
 // Stop cancels all pending captchas and deletes their messages, waiting for verifications in progress.
-// the muted members are released by their mute expiry
+// members under the join mute are released by its expiry; permanent mutes from timeouts are not touched
 func (c *captcha) Stop() {
 	c.mu.Lock()
 	posted := make([]*pendingCaptcha, 0, len(c.pending)+len(c.tests))
@@ -452,20 +451,35 @@ func (c *captcha) expire(p *pendingCaptcha) {
 		return // solved, replaced or canceled in the meantime
 	}
 	deleteMessage(c.tbAPI, c.chatID, p.msgID, "captcha")
+	if err := c.fail(p.user, "timeout", !c.timeoutMute); err != nil {
+		log.Printf("[WARN] %v", err)
+	}
 	if !c.timeoutMute {
-		if err := c.fail(p.user, "timeout", true); err != nil {
-			log.Printf("[WARN] %v", err)
+		return
+	}
+	if err := c.muteForever(p.user); err != nil {
+		// the join mute ends a minute after the timeout, a member must not be left free to post unverified
+		if rerr := c.remove(p.user, c.cooldownLeft(p.user.ID), "timeout, permanent mute failed"); rerr != nil {
+			log.Printf("[WARN] failed to mute %s for good after captcha timeout: %v; %v", p.user, err, rerr)
 		}
 		return
 	}
-	if err := c.fail(p.user, "timeout", false); err != nil {
-		log.Printf("[WARN] %v", err)
-	}
-	if err := c.mute(p.user, 0); err != nil {
-		log.Printf("[WARN] failed to mute %s for good after captcha timeout, the join mute expires: %v", p.user, err)
+	log.Printf("[INFO] %s muted for good, captcha timeout", p.user)
+}
+
+// muteForCooldown handles a rejoin during the cooldown in the mute mode: a restriction the captcha did not set
+// (a permanent mute from a timeout, an admin's mute, a soft ban) is kept as it is, otherwise the member is
+// muted for the rest of the cooldown. the cooldown may come from leaving before answering, which bans nobody,
+// so it never earns a permanent mute here
+func (c *captcha) muteForCooldown(user bot.User, left time.Duration) {
+	status, err := c.memberStatus(user.ID)
+	if err == nil && status == "restricted" && !c.isMutedByCaptcha(user.ID) {
+		log.Printf("[INFO] %s rejoined during captcha cooldown, restricted already", user)
 		return
 	}
-	log.Printf("[INFO] %s muted for good, captcha timeout", p.user)
+	if merr := c.mute(user, left); merr != nil {
+		log.Printf("[WARN] failed to mute %s, rejoined during captcha cooldown: %v", user, merr)
+	}
 }
 
 // register makes p the member's captcha in m (pending or tests), deleting the one it replaces
@@ -629,18 +643,13 @@ func (c *captcha) remove(user bot.User, d time.Duration, reason string) error {
 	return fmt.Errorf("failed to remove %s after captcha %s, muted for %v instead: %w", user, reason, d, err)
 }
 
-// mute takes every permission from the member for d. the join mute expires on its own, so a member whose
-// captcha is lost is not muted for good. a d of zero or less mutes for good (timeout in the mute mode). it is
-// recorded, telling it apart from other restrictions on rejoin
+// mute takes every permission from the member for d. the mute expires on its own, so a member whose
+// captcha is lost is not muted for good. it is recorded, telling it apart from other restrictions on rejoin
 func (c *captcha) mute(user bot.User, d time.Duration) error {
 	until := time.Now().Add(max(d, time.Minute)) // under 30 seconds is forever for telegram
-	untilDate := until.Unix()
-	if d <= 0 {
-		until, untilDate = time.Now().AddDate(100, 0, 0), 0 // 0 is forever for telegram
-	}
 	err := c.request(tbapi.RestrictChatMemberConfig{
 		ChatMemberConfig: tbapi.ChatMemberConfig{ChatConfig: tbapi.ChatConfig{ChatID: c.chatID}, UserID: user.ID},
-		UntilDate:        untilDate,
+		UntilDate:        until.Unix(),
 		Permissions:      &tbapi.ChatPermissions{},
 	})
 	if err != nil {
@@ -655,6 +664,23 @@ func (c *captcha) mute(user bot.User, d time.Duration) error {
 		}
 	}
 	c.muted[user.ID] = until
+	return nil
+}
+
+// muteForever takes every permission from the member with no end. unlike mute it drops the member from muted,
+// so the restriction is never taken for the captcha's own and lifted by a later captcha; an admin lifts it
+func (c *captcha) muteForever(user bot.User) error {
+	err := c.request(tbapi.RestrictChatMemberConfig{
+		ChatMemberConfig: tbapi.ChatMemberConfig{ChatConfig: tbapi.ChatConfig{ChatID: c.chatID}, UserID: user.ID},
+		UntilDate:        0, // forever for telegram
+		Permissions:      &tbapi.ChatPermissions{},
+	})
+	if err != nil {
+		return err
+	}
+	c.mu.Lock()
+	delete(c.muted, user.ID)
+	c.mu.Unlock()
 	return nil
 }
 

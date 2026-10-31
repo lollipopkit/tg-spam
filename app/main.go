@@ -193,7 +193,7 @@ type options struct {
 
 	Captcha struct {
 		Enabled bool          `long:"enabled" env:"ENABLED" description:"verify new members with a captcha"`
-		Timeout time.Duration `long:"timeout" env:"TIMEOUT" default:"2m" description:"time to solve the captcha before the member is removed"`
+		Timeout time.Duration `long:"timeout" env:"TIMEOUT" default:"2m" description:"time to solve the captcha before the timeout action applies"`
 		Message string        `long:"message" env:"MESSAGE" description:"captcha prompt, {user} and {timeout} are replaced, empty for the default of the mode"`
 		// TimeoutAction choices mirror config.CaptchaTimeoutBan / CaptchaTimeoutMute
 		TimeoutAction string `long:"timeout-action" env:"TIMEOUT_ACTION" choice:"ban" choice:"mute" default:"ban" description:"on timeout ban for the cooldown or mute for good, keeping the member in the chat"`
