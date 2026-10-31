@@ -1284,7 +1284,7 @@ func TestCaptcha_TimeoutMute(t *testing.T) {
 		assert.Len(t, api.SendCalls(), 1, "no fresh challenge")
 	})
 
-	t.Run("refused permanent mute and ban fall back to a mute for the cooldown", func(t *testing.T) {
+	t.Run("refused permanent mute and ban send nothing more", func(t *testing.T) {
 		api := newCaptchaAPI("member")
 		base := api.RequestFunc
 		api.RequestFunc = func(cfg tbapi.Chattable) (*tbapi.APIResponse, error) {
@@ -1300,8 +1300,11 @@ func TestCaptcha_TimeoutMute(t *testing.T) {
 		}
 		c := newMuteCaptcha(api, time.Minute)
 		require.NoError(t, c.fail(bot.User{ID: 42}, "timeout", false))
-		c.muteForeverOrBan(bot.User{ID: 42}, "captcha timeout")
-		assert.InDelta(t, time.Now().Add(captchaCooldown).Unix(), lastRestrict(api).UntilDate, 2)
+		c.muteForeverOrBan(bot.User{ID: 42}, "status unknown after a permanent mute")
+		rs := requestsOf[tbapi.RestrictChatMemberConfig](api)
+		require.Len(t, rs, 1, "only the refused permanent mute, no timed mute over an existing one")
+		assert.Zero(t, rs[0].UntilDate)
+		assert.Len(t, requestsOf[tbapi.BanChatMemberConfig](api), 1)
 	})
 
 	t.Run("a wrong answer still bans", func(t *testing.T) {
@@ -1314,25 +1317,30 @@ func TestCaptcha_TimeoutMute(t *testing.T) {
 }
 
 func TestCaptcha_CancelBeforePostedIsNoFailure(t *testing.T) {
-	for _, mute := range []bool{false, true} {
-		api := newCaptchaAPI("member")
-		c := newCaptcha(api, 123, time.Minute, testCaptchaMsg)
-		c.render = stubRender
-		c.timeoutMute = mute
-		base := api.RequestFunc
-		api.RequestFunc = func(cfg tbapi.Chattable) (*tbapi.APIResponse, error) {
-			if _, ok := cfg.(tbapi.GetChatMemberConfig); ok {
-				c.Cancel(42) // leaves while the status is read, before any challenge
+	for _, tc := range []struct {
+		name string
+		mute bool
+	}{{"ban mode", false}, {"mute mode", true}} {
+		t.Run(tc.name, func(t *testing.T) {
+			api := newCaptchaAPI("member")
+			c := newCaptcha(api, 123, time.Minute, testCaptchaMsg)
+			c.render = stubRender
+			c.timeoutMute = tc.mute
+			defer c.Stop()
+			base := api.RequestFunc
+			api.RequestFunc = func(cfg tbapi.Chattable) (*tbapi.APIResponse, error) {
+				if _, ok := cfg.(tbapi.GetChatMemberConfig); ok {
+					c.Cancel(42) // leaves while the status is read, before any challenge
+				}
+				return base(cfg)
 			}
-			return base(cfg)
-		}
-		c.Start(bot.User{ID: 42}, "")
-		c.running.Wait()
-		assert.Zero(t, failuresOf(c, 42), "no cooldown for a member who never saw a challenge, mute mode %v", mute)
-		assert.Empty(t, api.SendCalls())
-		assert.Empty(t, requestsOf[tbapi.RestrictChatMemberConfig](api))
-		assert.Empty(t, requestsOf[tbapi.BanChatMemberConfig](api))
-		c.Stop()
+			c.Start(bot.User{ID: 42}, "")
+			c.running.Wait()
+			assert.Zero(t, failuresOf(c, 42), "no cooldown for a member who never saw a challenge")
+			assert.Empty(t, api.SendCalls())
+			assert.Empty(t, requestsOf[tbapi.RestrictChatMemberConfig](api))
+			assert.Empty(t, requestsOf[tbapi.BanChatMemberConfig](api))
+		})
 	}
 }
 

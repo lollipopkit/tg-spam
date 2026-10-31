@@ -476,18 +476,13 @@ func (c *captcha) muteForeverOrBan(user bot.User, reason string) {
 		return
 	}
 	d := max(c.cooldownLeft(user.ID), captchaCooldown)
-	berr := c.ban(user, d)
-	if berr == nil {
-		log.Printf("[WARN] failed to mute %s for good, %s, banned for %v instead: %v", user, reason, d.Round(time.Second), err)
+	if berr := c.ban(user, d); berr != nil {
+		// nothing else is sent: a timed mute here would replace a permanent mute the member may carry already.
+		// after a timeout the join mute ends a minute later, an admin has to act
+		log.Printf("[ERROR] failed to mute %s for good, %s: %v, and to ban: %v", user, reason, err, berr)
 		return
 	}
-	// last resort, keeps the member from posting at least for the cooldown
-	if merr := c.mute(user, d); merr != nil {
-		log.Printf("[WARN] failed to mute %s for good, %s: %v, to ban: %v, and to mute: %v", user, reason, err, berr, merr)
-		return
-	}
-	log.Printf("[WARN] failed to mute %s for good, %s, and to ban, muted for %v: %v; %v", user, reason,
-		d.Round(time.Second), err, berr)
+	log.Printf("[WARN] failed to mute %s for good, %s, banned for %v instead: %v", user, reason, d.Round(time.Second), err)
 }
 
 // mutedForGood reports whether the member's last, not forgotten failure muted them for good
@@ -680,18 +675,23 @@ func (c *captcha) remove(user bot.User, d time.Duration, reason string) error {
 	if merr := c.mute(user, d); merr != nil {
 		return fmt.Errorf("failed to remove %s after captcha %s: %w, and to mute: %w", user, reason, err, merr)
 	}
-	return fmt.Errorf("failed to remove %s after captcha %s, muted for %v instead: %w", user, reason, d, err)
+	return fmt.Errorf("failed to remove %s after captcha %s, muted for %v instead: %w", user, reason, d.Round(time.Second), err)
 }
 
 // ban removes the member until d from now, telegram lifts the ban by itself. the join mute is gone with the
 // ban, so its record is dropped: a restriction set later must not read as the captcha's own
 func (c *captcha) ban(user bot.User, d time.Duration) error {
+	c.mu.Lock()
+	before, had := c.muted[user.ID]
+	c.mu.Unlock()
 	if err := banUserOrChannel(banRequest{tbAPI: c.tbAPI, userID: user.ID, chatID: c.chatID, duration: d,
 		userName: user.String()}); err != nil {
 		return err
 	}
 	c.mu.Lock()
-	delete(c.muted, user.ID)
+	if now, ok := c.muted[user.ID]; had && ok && now.Equal(before) { // a newer join mute stays recorded
+		delete(c.muted, user.ID)
+	}
 	c.mu.Unlock()
 	return nil
 }
