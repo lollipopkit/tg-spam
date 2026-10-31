@@ -336,14 +336,16 @@ func (s *Server) routes(router *routegroup.Bundle) *routegroup.Bundle {
 		if s.oidc != nil {
 			webUI.HandleFunc("GET "+oidcLoginPath, s.oidc.loginHandler)
 			webUI.HandleFunc("GET "+oidcCallbackPath, s.oidc.callbackHandler)
-			webUI.HandleFunc("GET "+oidcLogoutPath, s.oidc.logoutHandler)
+			webUI.HandleFunc("POST "+oidcLogoutPath, s.oidc.logoutHandler)
 		} else {
-			// handle logout - force Basic Auth re-authentication
-			webUI.HandleFunc("GET /logout", func(w http.ResponseWriter, _ *http.Request) {
+			// handle logout - force Basic Auth re-authentication; the navbar posts it
+			basicLogout := func(w http.ResponseWriter, _ *http.Request) {
 				w.Header().Set("WWW-Authenticate", `Basic realm="tg-spam"`)
 				w.WriteHeader(http.StatusUnauthorized)
 				fmt.Fprintln(w, "Logged out successfully")
-			})
+			}
+			webUI.HandleFunc("GET /logout", basicLogout)
+			webUI.HandleFunc("POST /logout", basicLogout)
 		}
 
 		// serve only specific static files at root level

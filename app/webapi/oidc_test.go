@@ -1,6 +1,7 @@
 package webapi
 
 import (
+	"context"
 	"crypto"
 	"crypto/rand"
 	"crypto/rsa"
@@ -17,10 +18,12 @@ import (
 	"time"
 
 	"github.com/go-jose/go-jose/v4"
+	"github.com/go-pkgz/rest"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/umputun/tg-spam/app/config"
+	"github.com/umputun/tg-spam/app/webapi/mocks"
 )
 
 // fakeIssuer is a minimal OIDC provider: discovery, jwks and a token endpoint that checks the PKCE verifier
@@ -102,7 +105,7 @@ func newTestOIDC(t *testing.T, f *fakeIssuer, allow ...string) (*oidcAuth, http.
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET "+oidcLoginPath, a.loginHandler)
 	mux.HandleFunc("GET "+oidcCallbackPath, a.callbackHandler)
-	mux.HandleFunc("GET /logout", a.logoutHandler)
+	mux.HandleFunc("POST /logout", a.logoutHandler)
 	mux.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte("ok")) })
 	h := a.middleware(mux)
 	return a, h
@@ -125,6 +128,7 @@ func login(t *testing.T, f *fakeIssuer, h http.Handler, rd string) (*http.Cookie
 	f.mu.Unlock()
 	cookies := rec.Result().Cookies()
 	require.Len(t, cookies, 1)
+	assert.Equal(t, oidcStatePrefix+q.Get("state"), cookies[0].Name)
 	assert.True(t, cookies[0].HttpOnly)
 	assert.True(t, cookies[0].Secure)
 	return cookies[0], q
@@ -158,13 +162,22 @@ func TestOIDC_Middleware(t *testing.T) {
 		assert.Equal(t, http.StatusFound, rec.Code)
 		assert.Equal(t, "/auth/login?rd=%2Fmanage_users%3Fx%3D1", rec.Header().Get("Location"))
 	})
-	t.Run("htmx request gets HX-Redirect", func(t *testing.T) {
+	t.Run("htmx request returns to the page it was made from", func(t *testing.T) {
 		rec := httptest.NewRecorder()
 		req := httptest.NewRequest(http.MethodGet, "/dm-users", http.NoBody)
 		req.Header.Set("HX-Request", "true")
+		req.Header.Set("HX-Current-URL", "https://tg.example.com/list_settings?tab=1")
 		h.ServeHTTP(rec, req)
 		assert.Equal(t, http.StatusUnauthorized, rec.Code)
-		assert.Equal(t, "/auth/login?rd=%2Fdm-users", rec.Header().Get("HX-Redirect"))
+		assert.Equal(t, "/auth/login?rd=%2Flist_settings%3Ftab%3D1", rec.Header().Get("HX-Redirect"))
+	})
+	t.Run("htmx request without current url", func(t *testing.T) {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/check", http.NoBody)
+		req.Header.Set("HX-Request", "true")
+		h.ServeHTTP(rec, req)
+		assert.Equal(t, http.StatusUnauthorized, rec.Code)
+		assert.Equal(t, "/auth/login", rec.Header().Get("HX-Redirect"))
 	})
 	t.Run("post is refused", func(t *testing.T) {
 		rec := httptest.NewRecorder()
@@ -188,6 +201,11 @@ func TestOIDC_LoginFlow(t *testing.T) {
 		allowed bool
 	}{
 		{"role", []string{"role:admin"}, map[string]any{"roles": []string{"user", "admin"}}, true},
+		{"single role as a string", []string{"role:admin"}, map[string]any{"roles": "admin"}, true},
+		{"email_verified as a string", []string{"email:a@example.com"},
+			map[string]any{"email": "a@example.com", "email_verified": "true"}, true},
+		{"email_verified false as a string", []string{"email:a@example.com"},
+			map[string]any{"email": "a@example.com", "email_verified": "false"}, false},
 		{"group", []string{"group:ops"}, map[string]any{"groups": []string{"ops"}}, true},
 		{"verified email", []string{"email:A@example.com"}, map[string]any{"email": "a@example.com", "email_verified": true}, true},
 		{"unverified email", []string{"email:a@example.com"}, map[string]any{"email": "a@example.com"}, false},
@@ -230,24 +248,43 @@ func TestOIDC_CallbackRejects(t *testing.T) {
 		_, q := login(t, f, h, "/")
 		assert.Equal(t, http.StatusBadRequest, callback(h, nil, "code=good-code&state="+q.Get("state")).Code)
 	})
-	t.Run("state mismatch", func(t *testing.T) {
+	t.Run("unknown state", func(t *testing.T) {
 		state, _ := login(t, f, h, "/")
 		assert.Equal(t, http.StatusBadRequest, callback(h, state, "code=good-code&state=other").Code)
+	})
+	t.Run("cookie signed for another state", func(t *testing.T) {
+		state, _ := login(t, f, h, "/")
+		moved := &http.Cookie{Name: oidcStatePrefix + "other", Value: state.Value}
+		assert.Equal(t, http.StatusBadRequest, callback(h, moved, "code=good-code&state=other").Code)
 	})
 	t.Run("expired state cookie", func(t *testing.T) {
 		_, q := login(t, f, h, "/")
 		value, err := a.sign(oidcState{State: q.Get("state"), Expires: time.Now().Add(-time.Second).Unix()})
 		require.NoError(t, err)
-		rec := callback(h, &http.Cookie{Name: oidcStateCookie, Value: value}, "code=good-code&state="+q.Get("state"))
+		rec := callback(h, &http.Cookie{Name: oidcStatePrefix + q.Get("state"), Value: value},
+			"code=good-code&state="+q.Get("state"))
 		assert.Equal(t, http.StatusBadRequest, rec.Code)
+	})
+	t.Run("logins in two tabs", func(t *testing.T) {
+		first, q1 := login(t, f, h, "/first")
+		f.mu.Lock()
+		challenge, nonce := f.challenge, f.nonce
+		f.mu.Unlock()
+		_, _ = login(t, f, h, "/second") // overwrites the fake issuer's record, not the first tab's cookie
+		f.mu.Lock()
+		f.challenge, f.nonce = challenge, nonce
+		f.mu.Unlock()
+		rec := callback(h, first, "code=good-code&state="+q1.Get("state"))
+		require.Equal(t, http.StatusFound, rec.Code, rec.Body.String())
+		assert.Equal(t, "/first", rec.Header().Get("Location"))
 	})
 	t.Run("wrong code", func(t *testing.T) {
 		state, q := login(t, f, h, "/")
 		assert.Equal(t, http.StatusForbidden, callback(h, state, "code=bad&state="+q.Get("state")).Code)
 	})
 	t.Run("provider error", func(t *testing.T) {
-		state, _ := login(t, f, h, "/")
-		assert.Equal(t, http.StatusForbidden, callback(h, state, "error=access_denied").Code)
+		state, q := login(t, f, h, "/")
+		assert.Equal(t, http.StatusForbidden, callback(h, state, "error=access_denied&state="+q.Get("state")).Code)
 	})
 	t.Run("nonce mismatch", func(t *testing.T) {
 		state, q := login(t, f, h, "/")
@@ -298,15 +335,54 @@ func TestOIDC_Session(t *testing.T) {
 func TestOIDC_Logout(t *testing.T) {
 	f := newFakeIssuer(t)
 	_, h := newTestOIDC(t, f, "role:admin")
-	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/logout", http.NoBody))
-	assert.Equal(t, http.StatusFound, rec.Code)
-	assert.Equal(t, f.srv.URL+"/logout", rec.Header().Get("Location"))
-	cookies := rec.Result().Cookies()
-	require.Len(t, cookies, 1)
-	assert.Equal(t, oidcSessionCookie, cookies[0].Name)
-	assert.Empty(t, cookies[0].Value)
-	assert.Negative(t, cookies[0].MaxAge)
+	checkCleared := func(rec *httptest.ResponseRecorder) {
+		cookies := rec.Result().Cookies()
+		require.Len(t, cookies, 1)
+		assert.Equal(t, oidcSessionCookie, cookies[0].Name)
+		assert.Empty(t, cookies[0].Value)
+		assert.Negative(t, cookies[0].MaxAge)
+	}
+
+	t.Run("form post", func(t *testing.T) {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/logout", http.NoBody))
+		assert.Equal(t, http.StatusSeeOther, rec.Code)
+		assert.Equal(t, f.srv.URL+"/logout", rec.Header().Get("Location"))
+		checkCleared(rec)
+	})
+	t.Run("htmx post", func(t *testing.T) {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/logout", http.NoBody)
+		req.Header.Set("HX-Request", "true")
+		h.ServeHTTP(rec, req)
+		assert.Equal(t, http.StatusNoContent, rec.Code)
+		assert.Equal(t, f.srv.URL+"/logout", rec.Header().Get("HX-Redirect"))
+		assert.Empty(t, rec.Header().Get("Location"))
+		checkCleared(rec)
+	})
+	t.Run("other methods stay behind the login", func(t *testing.T) {
+		for _, req := range []*http.Request{
+			httptest.NewRequest(http.MethodGet, "/logout", http.NoBody),
+			httptest.NewRequest(http.MethodPost, oidcLoginPath, http.NoBody),
+			httptest.NewRequest(http.MethodPost, oidcCallbackPath, http.NoBody),
+		} {
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, req)
+			assert.NotEqual(t, http.StatusOK, rec.Code, "%s %s", req.Method, req.URL.Path)
+			assert.NotEqual(t, "ok", rec.Body.String(), "catch-all must not be reached")
+		}
+	})
+}
+
+func TestOIDC_Scopes(t *testing.T) {
+	f := newFakeIssuer(t)
+	_, h := newTestOIDC(t, f, "role:admin")
+	_, q := login(t, f, h, "/")
+	assert.Equal(t, "openid profile email", q.Get("scope"))
+
+	_, h = newTestOIDC(t, f, "role:admin", "group:ops")
+	_, q = login(t, f, h, "/")
+	assert.Equal(t, "openid profile email groups", q.Get("scope"))
 }
 
 func TestLocalPath(t *testing.T) {
@@ -318,9 +394,66 @@ func TestLocalPath(t *testing.T) {
 		"/\\evil.com":         "/",
 		"https://evil.com/":   "/",
 		"manage_users":        "/",
+		"/./\\evil.com":       "/",
+		"/a/../\\evil.com":    "/",
+		"/%5Cevil.com":        "/",
+		"/a/../%5Cevil.com":   "/",
+		"/.//evil.com":        "/evil.com",
 		"/%2F%2Fevil.com/abc": "/%2F%2Fevil.com/abc",
+		"/a/./b/../c?d=1":     "/a/c?d=1",
 	}
 	for in, want := range tests {
 		assert.Equal(t, want, localPath(in), in)
 	}
+}
+
+func TestServer_RunOIDC(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	hash, err := rest.GenerateBcryptHash("test")
+	require.NoError(t, err)
+	srv := NewServer(Config{ListenAddr: ":9881", Version: "dev", Detector: &mocks.DetectorMock{},
+		SpamFilter: &mocks.SpamFilterMock{}, AuthHash: hash,
+		OIDC: config.OIDCSettings{Issuer: "https://auth.example.invalid", ClientID: "tg-spam", ClientSecret: "s",
+			URL: "https://tg.example.com", Allow: []string{"role:admin"}}})
+	done := make(chan struct{})
+	go func() {
+		assert.NoError(t, srv.Run(ctx))
+		close(done)
+	}()
+	client := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	do := func(method, target string, basicAuth bool) *http.Response {
+		req, err := http.NewRequest(method, "http://localhost:9881"+target, http.NoBody)
+		require.NoError(t, err)
+		if basicAuth {
+			req.SetBasicAuth("tg-spam", "test")
+		}
+		resp, err := client.Do(req)
+		require.NoError(t, err)
+		resp.Body.Close()
+		return resp
+	}
+	require.Eventually(t, func() bool {
+		resp, err := client.Get("http://localhost:9881/ping")
+		if err != nil {
+			return false
+		}
+		resp.Body.Close()
+		return resp.StatusCode == http.StatusOK
+	}, 2*time.Second, 50*time.Millisecond, "server did not start")
+
+	for _, target := range []string{"/", "/manage_users", "/styles.css", "/logout", "/settings"} {
+		resp := do(http.MethodGet, target, false)
+		assert.Equal(t, http.StatusFound, resp.StatusCode, target)
+		assert.True(t, strings.HasPrefix(resp.Header.Get("Location"), oidcLoginPath+"?rd="), target)
+	}
+	assert.Equal(t, http.StatusUnauthorized, do(http.MethodPost, "/check", true).StatusCode, "basic auth is off")
+	assert.Equal(t, http.StatusBadGateway, do(http.MethodGet, oidcLoginPath, false).StatusCode, "issuer unreachable")
+
+	resp := do(http.MethodPost, "/logout", false)
+	assert.Equal(t, http.StatusSeeOther, resp.StatusCode)
+	assert.Equal(t, "/", resp.Header.Get("Location"), "falls back to / without discovery")
+
+	cancel()
+	<-done
 }

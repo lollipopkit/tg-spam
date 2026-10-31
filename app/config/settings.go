@@ -304,8 +304,12 @@ type OIDCSettings struct {
 	Allow        []string `json:"allow" yaml:"allow" db:"server_oidc_allow"`
 }
 
-// Enabled reports whether the OIDC login replaces basic auth
+// Enabled reports whether the OIDC login is configured
 func (o OIDCSettings) Enabled() bool { return o.Issuer != "" }
+
+// OIDCActive reports whether the OIDC login guards the web UI: configured and not turned off by basic auth
+// passed on the command line
+func (s *Settings) OIDCActive() bool { return s.Server.OIDC.Enabled() && !s.Transient.OIDCOffByCLI }
 
 // TransientSettings contains settings that should never be persisted
 type TransientSettings struct {
@@ -326,6 +330,10 @@ type TransientSettings struct {
 
 	// temporary auth password (used only to generate hash)
 	WebAuthPasswd string `json:"-" yaml:"-"`
+
+	// OIDCOffByCLI marks a stored OIDC login turned off for this process by --server.auth/-hash on the
+	// command line, so an operator locked out by it can get back in
+	OIDCOffByCLI bool `json:"-" yaml:"-"`
 
 	// authFromCLI marks web auth (hash or password) as held in memory rather
 	// than authoritative in the database. It is set by applyCLIOverrides for

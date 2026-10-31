@@ -416,6 +416,18 @@ func applyCLIOverrides(settings *config.Settings, opts options, defaults *config
 		settings.Transient.WebAuthPasswd = ""
 	}
 
+	// an issuer on the command line replaces the stored OIDC login; basic auth on the command line without one
+	// turns a stored login off for this process
+	if opts.Server.OIDC.Issuer != "" {
+		settings.Server.OIDC.Issuer = opts.Server.OIDC.Issuer
+		settings.Server.OIDC.ClientID = opts.Server.OIDC.ClientID
+		settings.Server.OIDC.URL = opts.Server.OIDC.URL
+		settings.Server.OIDC.Allow = opts.Server.OIDC.Allow
+	} else if settings.Transient.AuthFromCLI && settings.Server.OIDC.Enabled() {
+		log.Print("[WARN] basic auth from the command line turns the stored OIDC login off")
+		settings.Transient.OIDCOffByCLI = true
+	}
+
 	// operational CLI overrides (dry-run, listen addr, file paths) live in a
 	// separate helper because they must also be reapplied after POST
 	// /config/reload — credentials/auth above are not reapplied: the reload
@@ -479,7 +491,7 @@ func applyOperationalCLIOverrides(settings *config.Settings, opts options, defau
 // would persist an empty hash to the DB.
 func applyAutoAuthFallback(settings *config.Settings) {
 	if settings.Server.Enabled &&
-		!settings.Server.OIDC.Enabled() &&
+		!settings.OIDCActive() &&
 		settings.Server.AuthHash == "" &&
 		settings.Transient.WebAuthPasswd == "" &&
 		!settings.Transient.AuthFromCLI {

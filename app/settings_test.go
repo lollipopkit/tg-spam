@@ -172,6 +172,42 @@ func TestApplyCLIOverrides(t *testing.T) {
 		assert.Equal(t, []string{config.FieldOIDCSecret}, settings.Transient.CredentialsFromCLI)
 	})
 
+	t.Run("oidc issuer on CLI replaces the stored login", func(t *testing.T) {
+		settings := config.Settings{Server: config.ServerSettings{OIDC: config.OIDCSettings{Issuer: "https://db.example.com",
+			ClientID: "db", URL: "https://db-ui.example.com", Allow: []string{"sub:db"}, ClientSecret: "db-secret"}}}
+		opts := newDefaultOpts(t)
+		opts.Server.OIDC.Issuer = "https://cli.example.com"
+		opts.Server.OIDC.ClientID = "cli"
+		opts.Server.OIDC.URL = "https://cli-ui.example.com"
+		opts.Server.OIDC.Allow = []string{"role:admin"}
+		applyCLIOverrides(&settings, opts, defaults)
+		assert.Equal(t, config.OIDCSettings{Issuer: "https://cli.example.com", ClientID: "cli",
+			URL: "https://cli-ui.example.com", Allow: []string{"role:admin"}, ClientSecret: "db-secret"}, settings.Server.OIDC)
+		assert.True(t, settings.OIDCActive())
+	})
+
+	t.Run("no oidc on CLI keeps the stored login", func(t *testing.T) {
+		settings := config.Settings{Server: config.ServerSettings{OIDC: config.OIDCSettings{Issuer: "https://db.example.com"}}}
+		applyCLIOverrides(&settings, newDefaultOpts(t), defaults)
+		assert.Equal(t, "https://db.example.com", settings.Server.OIDC.Issuer)
+		assert.True(t, settings.OIDCActive())
+	})
+
+	t.Run("basic auth on CLI turns a stored oidc login off", func(t *testing.T) {
+		for _, set := range []func(o *options){
+			func(o *options) { o.Server.AuthPasswd = "recover" },
+			func(o *options) { o.Server.AuthHash = "$2a$10$hash" },
+		} {
+			settings := config.Settings{Server: config.ServerSettings{OIDC: config.OIDCSettings{Issuer: "https://db.example.com"}}}
+			opts := newDefaultOpts(t)
+			set(&opts)
+			applyCLIOverrides(&settings, opts, defaults)
+			assert.Equal(t, "https://db.example.com", settings.Server.OIDC.Issuer, "stored login is kept for later")
+			assert.True(t, settings.Transient.OIDCOffByCLI)
+			assert.False(t, settings.OIDCActive())
+		}
+	})
+
 	t.Run("empty cas token CLI keeps DB value", func(t *testing.T) {
 		settings := config.Settings{CAS: config.CASSettings{Token: "db-cas"}}
 		applyCLIOverrides(&settings, newDefaultOpts(t), defaults)

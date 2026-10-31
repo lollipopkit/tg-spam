@@ -14,6 +14,7 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"path"
 	"slices"
 	"strings"
 	"sync"
@@ -27,12 +28,15 @@ import (
 
 const (
 	oidcSessionCookie = "tgspam_session"
-	oidcStateCookie   = "tgspam_oidc"
+	oidcStatePrefix   = "tgspam_oidc_" // followed by the state value, one cookie per login in flight
 	oidcSessionTTL    = 12 * time.Hour
 	oidcStateTTL      = 10 * time.Minute
 	oidcLoginPath     = "/auth/login"
 	oidcCallbackPath  = "/auth/callback"
 	oidcLogoutPath    = "/logout"
+	// oidcWriteTimeout covers the provider round trips of a login (discovery, code exchange, jwks), longer
+	// than the server's write timeout
+	oidcWriteTimeout = 45 * time.Second
 )
 
 // oidcAuth guards the web UI with an OpenID Connect login (authorization code with PKCE). Sessions are
@@ -43,9 +47,14 @@ type oidcAuth struct {
 	key    []byte
 	client *http.Client
 
-	mu         sync.Mutex // guards the lazily discovered provider fields below
-	verifier   *oidc.IDTokenVerifier
+	mu       sync.Mutex // guards provider, set once discovery succeeds
+	provider *oidcProvider
+}
+
+// oidcProvider is what discovery yields
+type oidcProvider struct {
 	oauth      *oauth2.Config
+	verifier   *oidc.IDTokenVerifier
 	endSession string
 }
 
@@ -67,12 +76,50 @@ type oidcState struct {
 
 // oidcClaims are the id token claims the allow list is matched against
 type oidcClaims struct {
-	Sub           string   `json:"sub"`
-	Email         string   `json:"email"`
-	EmailVerified bool     `json:"email_verified"`
-	Username      string   `json:"preferred_username"`
-	Roles         []string `json:"roles"`
-	Groups        []string `json:"groups"`
+	Sub           string     `json:"sub"`
+	Email         string     `json:"email"`
+	EmailVerified flexBool   `json:"email_verified"`
+	Username      string     `json:"preferred_username"`
+	Roles         stringList `json:"roles"`
+	Groups        stringList `json:"groups"`
+}
+
+// flexBool decodes a JSON bool or the strings "true"/"false", as some providers send email_verified
+type flexBool bool
+
+// UnmarshalJSON implements json.Unmarshaler
+func (b *flexBool) UnmarshalJSON(data []byte) error {
+	var v any
+	if err := json.Unmarshal(data, &v); err != nil {
+		return fmt.Errorf("can't decode bool claim: %w", err)
+	}
+	switch t := v.(type) {
+	case bool:
+		*b = flexBool(t)
+	case string:
+		*b = flexBool(strings.EqualFold(t, "true"))
+	default:
+		*b = false
+	}
+	return nil
+}
+
+// stringList decodes a JSON array of strings or a single string, as some providers send a lone role or group
+type stringList []string
+
+// UnmarshalJSON implements json.Unmarshaler
+func (l *stringList) UnmarshalJSON(data []byte) error {
+	var one string
+	if err := json.Unmarshal(data, &one); err == nil {
+		*l = stringList{one}
+		return nil
+	}
+	var many []string
+	if err := json.Unmarshal(data, &many); err != nil {
+		return fmt.Errorf("can't decode list claim: %w", err)
+	}
+	*l = many
+	return nil
 }
 
 func newOIDCAuth(cfg config.OIDCSettings) (*oidcAuth, error) {
@@ -87,40 +134,55 @@ func newOIDCAuth(cfg config.OIDCSettings) (*oidcAuth, error) {
 }
 
 // discover fetches the provider metadata on first use and keeps it, so the web UI starts even while the
-// issuer is unreachable and a failed discovery is retried on the next login
-func (a *oidcAuth) discover(ctx context.Context) (*oauth2.Config, *oidc.IDTokenVerifier, error) {
+// issuer is unreachable and a failed discovery is retried on the next login. The fetch runs outside the
+// lock, so requests do not queue behind a slow issuer; concurrent first fetches keep the first result.
+func (a *oidcAuth) discover(ctx context.Context) (*oidcProvider, error) {
 	a.mu.Lock()
-	defer a.mu.Unlock()
-	if a.oauth != nil {
-		return a.oauth, a.verifier, nil
+	p := a.provider
+	a.mu.Unlock()
+	if p != nil {
+		return p, nil
 	}
+
 	provider, err := oidc.NewProvider(oidc.ClientContext(ctx, a.client), a.cfg.Issuer)
 	if err != nil {
-		return nil, nil, fmt.Errorf("oidc discovery failed: %w", err)
+		return nil, fmt.Errorf("oidc discovery failed: %w", err)
 	}
 	var meta struct {
 		EndSession string `json:"end_session_endpoint"`
 	}
 	if err := provider.Claims(&meta); err != nil {
-		return nil, nil, fmt.Errorf("can't read oidc provider metadata: %w", err)
+		return nil, fmt.Errorf("can't read oidc provider metadata: %w", err)
 	}
-	a.endSession = meta.EndSession
-	a.verifier = provider.Verifier(&oidc.Config{ClientID: a.cfg.ClientID})
-	a.oauth = &oauth2.Config{
-		ClientID:     a.cfg.ClientID,
-		ClientSecret: a.cfg.ClientSecret,
-		Endpoint:     provider.Endpoint(),
-		RedirectURL:  strings.TrimSuffix(a.cfg.URL, "/") + oidcCallbackPath,
-		Scopes:       []string{oidc.ScopeOpenID, "profile", "email", "groups"},
+	scopes := []string{oidc.ScopeOpenID, "profile", "email"}
+	if slices.ContainsFunc(a.cfg.Allow, func(s string) bool { return strings.HasPrefix(s, "group:") }) {
+		scopes = append(scopes, "groups") // not a standard scope, asked for only when the allow list needs it
 	}
-	return a.oauth, a.verifier, nil
+	p = &oidcProvider{
+		endSession: meta.EndSession,
+		verifier:   provider.Verifier(&oidc.Config{ClientID: a.cfg.ClientID}),
+		oauth: &oauth2.Config{
+			ClientID:     a.cfg.ClientID,
+			ClientSecret: a.cfg.ClientSecret,
+			Endpoint:     provider.Endpoint(),
+			RedirectURL:  strings.TrimSuffix(a.cfg.URL, "/") + oidcCallbackPath,
+			Scopes:       scopes,
+		},
+	}
+
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.provider == nil {
+		a.provider = p
+	}
+	return a.provider, nil
 }
 
-// middleware passes requests with a valid session and the login and logout routes; anything else is sent to the login
-// page when it is a page load, or refused with 401 otherwise
+// middleware passes requests with a valid session and the login and logout routes; anything else is sent
+// to the login page when it is a page load, or refused with 401 otherwise
 func (a *oidcAuth) middleware(h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == oidcLoginPath || r.URL.Path == oidcCallbackPath || r.URL.Path == oidcLogoutPath {
+		if isOIDCRoute(r) {
 			h.ServeHTTP(w, r)
 			return
 		}
@@ -128,25 +190,41 @@ func (a *oidcAuth) middleware(h http.Handler) http.Handler {
 			h.ServeHTTP(w, r)
 			return
 		}
-		login := oidcLoginPath
-		if r.Method == http.MethodGet {
-			login += "?rd=" + url.QueryEscape(r.URL.RequestURI())
-		}
-		switch {
-		case r.Header.Get("HX-Request") == "true":
+		if r.Header.Get("HX-Request") == "true" {
+			// an htmx request is a fragment of the page the user is on, so return there after the login
+			login := oidcLoginPath
+			if u, err := url.Parse(r.Header.Get("HX-Current-URL")); err == nil && u.Path != "" {
+				login += "?rd=" + url.QueryEscape(u.RequestURI())
+			}
 			w.Header().Set("HX-Redirect", login)
 			http.Error(w, "Unauthorized", http.StatusUnauthorized)
-		case r.Method == http.MethodGet:
-			http.Redirect(w, r, login, http.StatusFound)
-		default:
-			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			return
 		}
+		if r.Method == http.MethodGet {
+			http.Redirect(w, r, oidcLoginPath+"?rd="+url.QueryEscape(r.URL.RequestURI()), http.StatusFound)
+			return
+		}
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
 	})
 }
 
+// isOIDCRoute matches the routes served without a session, by method too: any other method on these paths
+// falls through to the catch-all page routes, which must stay behind the login
+func isOIDCRoute(r *http.Request) bool {
+	switch r.Method {
+	case http.MethodGet:
+		return r.URL.Path == oidcLoginPath || r.URL.Path == oidcCallbackPath
+	case http.MethodPost:
+		return r.URL.Path == oidcLogoutPath
+	}
+	return false
+}
+
 // loginHandler starts the authorization code flow, keeping state, nonce and PKCE verifier in a signed cookie
+// named after the state, so logins started in several tabs don't overwrite each other
 func (a *oidcAuth) loginHandler(w http.ResponseWriter, r *http.Request) {
-	oauth, _, err := a.discover(r.Context())
+	extendWriteDeadline(w)
+	p, err := a.discover(r.Context())
 	if err != nil {
 		log.Printf("[WARN] %v", err)
 		http.Error(w, "login provider unavailable", http.StatusBadGateway)
@@ -159,38 +237,41 @@ func (a *oidcAuth) loginHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "can't start login", http.StatusInternalServerError)
 		return
 	}
-	a.setCookie(w, oidcStateCookie, value, oidcCallbackPath, oidcStateTTL)
-	authURL := oauth.AuthCodeURL(st.State, oidc.Nonce(st.Nonce), oauth2.S256ChallengeOption(st.Verifier))
+	setCookie(w, oidcStatePrefix+st.State, value, oidcCallbackPath, oidcStateTTL)
+	authURL := p.oauth.AuthCodeURL(st.State, oidc.Nonce(st.Nonce), oauth2.S256ChallengeOption(st.Verifier))
 	http.Redirect(w, r, authURL, http.StatusFound)
 }
 
 // callbackHandler finishes the flow: checks state, exchanges the code, verifies the id token and its nonce,
 // matches the account against the allow list and issues the session cookie
 func (a *oidcAuth) callbackHandler(w http.ResponseWriter, r *http.Request) {
+	extendWriteDeadline(w)
+	q := r.URL.Query()
 	var st oidcState
-	c, err := r.Cookie(oidcStateCookie)
+	c, err := r.Cookie(oidcStatePrefix + q.Get("state"))
 	if err != nil || !a.verify(c.Value, &st) || time.Now().Unix() > st.Expires {
 		http.Error(w, "login expired, start again", http.StatusBadRequest)
 		return
 	}
-	a.setCookie(w, oidcStateCookie, "", oidcCallbackPath, 0)
-	if e := r.URL.Query().Get("error"); e != "" {
-		http.Error(w, "login failed: "+e, http.StatusForbidden)
-		return
-	}
-	if subtle.ConstantTimeCompare([]byte(r.URL.Query().Get("state")), []byte(st.State)) != 1 {
+	setCookie(w, c.Name, "", oidcCallbackPath, 0)
+	// the cookie is found by the state, so this guards against a cookie signed for another state
+	if subtle.ConstantTimeCompare([]byte(q.Get("state")), []byte(st.State)) != 1 {
 		http.Error(w, "login state mismatch", http.StatusBadRequest)
 		return
 	}
+	if e := q.Get("error"); e != "" {
+		http.Error(w, "login failed: "+e, http.StatusForbidden)
+		return
+	}
 
-	oauth, verifier, err := a.discover(r.Context())
+	p, err := a.discover(r.Context())
 	if err != nil {
 		log.Printf("[WARN] %v", err)
 		http.Error(w, "login provider unavailable", http.StatusBadGateway)
 		return
 	}
 	ctx := oidc.ClientContext(r.Context(), a.client)
-	token, err := oauth.Exchange(ctx, r.URL.Query().Get("code"), oauth2.VerifierOption(st.Verifier))
+	token, err := p.oauth.Exchange(ctx, q.Get("code"), oauth2.VerifierOption(st.Verifier))
 	if err != nil {
 		log.Printf("[WARN] oidc code exchange failed: %v", err)
 		http.Error(w, "login failed", http.StatusForbidden)
@@ -201,7 +282,7 @@ func (a *oidcAuth) callbackHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "login failed: no id token", http.StatusForbidden)
 		return
 	}
-	idToken, err := verifier.Verify(ctx, rawID)
+	idToken, err := p.verifier.Verify(ctx, rawID)
 	if err == nil && subtle.ConstantTimeCompare([]byte(idToken.Nonce), []byte(st.Nonce)) != 1 {
 		err = errors.New("nonce mismatch")
 	}
@@ -212,6 +293,7 @@ func (a *oidcAuth) callbackHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	var claims oidcClaims
 	if err = idToken.Claims(&claims); err != nil {
+		log.Printf("[WARN] can't decode oidc id token claims: %v", err)
 		http.Error(w, "login failed", http.StatusForbidden)
 		return
 	}
@@ -227,20 +309,27 @@ func (a *oidcAuth) callbackHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "can't create session", http.StatusInternalServerError)
 		return
 	}
-	a.setCookie(w, oidcSessionCookie, value, "/", oidcSessionTTL)
+	setCookie(w, oidcSessionCookie, value, "/", oidcSessionTTL)
 	log.Printf("[INFO] oidc login: %s (sub=%s)", name, claims.Sub)
 	http.Redirect(w, r, st.Return, http.StatusFound)
 }
 
-// logoutHandler drops the session and hands over to the provider's logout page, which ends the provider
-// session too; otherwise the next request would sign straight back in
+// logoutHandler (POST, so the router's cross-origin protection covers it) drops the session and hands over
+// to the provider's logout page, which ends the provider session too; otherwise the next request would sign
+// straight back in. The navbar posts it with htmx, which follows HX-Redirect but not a cross-origin 302.
 func (a *oidcAuth) logoutHandler(w http.ResponseWriter, r *http.Request) {
-	a.setCookie(w, oidcSessionCookie, "", "/", 0)
-	if _, _, err := a.discover(r.Context()); err == nil && a.endSession != "" {
-		http.Redirect(w, r, a.endSession, http.StatusFound)
+	extendWriteDeadline(w)
+	setCookie(w, oidcSessionCookie, "", "/", 0)
+	target := "/"
+	if p, err := a.discover(r.Context()); err == nil && p.endSession != "" {
+		target = p.endSession
+	}
+	if r.Header.Get("HX-Request") == "true" {
+		w.Header().Set("HX-Redirect", target)
+		w.WriteHeader(http.StatusNoContent)
 		return
 	}
-	http.Redirect(w, r, "/", http.StatusFound)
+	http.Redirect(w, r, target, http.StatusSeeOther)
 }
 
 // allowed matches the id token claims against the allow list; email entries need a verified email
@@ -257,7 +346,7 @@ func (a *oidcAuth) allowed(c oidcClaims) bool {
 				return true
 			}
 		case "email":
-			if c.EmailVerified && strings.EqualFold(c.Email, value) {
+			if bool(c.EmailVerified) && strings.EqualFold(c.Email, value) {
 				return true
 			}
 		case "sub":
@@ -277,17 +366,6 @@ func (a *oidcAuth) session(r *http.Request) (oidcSession, bool) {
 		return oidcSession{}, false
 	}
 	return s, true
-}
-
-// setCookie sets a cookie living for ttl, or deletes it when ttl is not positive. Secure is unconditional:
-// ValidateOIDC only accepts an https public url
-func (a *oidcAuth) setCookie(w http.ResponseWriter, name, value, path string, ttl time.Duration) {
-	maxAge := -1
-	if ttl > 0 {
-		maxAge = int(ttl.Seconds())
-	}
-	http.SetCookie(w, &http.Cookie{Name: name, Value: value, Path: path, MaxAge: maxAge,
-		HttpOnly: true, Secure: true, SameSite: http.SameSiteLaxMode})
 }
 
 // sign encodes v as base64url(json) "." base64url(hmac-sha256)
@@ -323,13 +401,40 @@ func (a *oidcAuth) mac(payload string) []byte {
 	return m.Sum(nil)
 }
 
-// localPath keeps a post-login return target only when it is a path on this host
+// setCookie sets a cookie living for ttl, or deletes it when ttl is not positive. Secure is unconditional:
+// ValidateOIDC only accepts an https public url
+func setCookie(w http.ResponseWriter, name, value, cookiePath string, ttl time.Duration) {
+	maxAge := -1
+	if ttl > 0 {
+		maxAge = int(ttl.Seconds())
+	}
+	http.SetCookie(w, &http.Cookie{Name: name, Value: value, Path: cookiePath, MaxAge: maxAge,
+		HttpOnly: true, Secure: true, SameSite: http.SameSiteLaxMode})
+}
+
+// extendWriteDeadline lifts the server's write timeout for a handler that waits on the provider
+func extendWriteDeadline(w http.ResponseWriter) {
+	if err := http.NewResponseController(w).SetWriteDeadline(time.Now().Add(oidcWriteTimeout)); err != nil &&
+		!errors.Is(err, http.ErrNotSupported) {
+		log.Printf("[WARN] can't extend write deadline: %v", err)
+	}
+}
+
+// localPath keeps a post-login return target only when it is a path on this host. It returns the cleaned
+// path, as http.Redirect cleans it too: checking the raw value would let "/./\host" through and become
+// "/\host", which browsers treat as "//host". Backslashes, also percent-encoded, are refused outright.
 func localPath(p string) string {
-	if !strings.HasPrefix(p, "/") || strings.HasPrefix(p, "//") || strings.HasPrefix(p, "/\\") {
+	u, err := url.Parse(p)
+	if err != nil || strings.Contains(p, "\\") || strings.Contains(u.Path, "\\") || u.Scheme != "" || u.Host != "" ||
+		u.User != nil || !strings.HasPrefix(u.Path, "/") {
 		return "/"
 	}
-	if u, err := url.Parse(p); err != nil || u.Host != "" || u.Scheme != "" {
+	clean := path.Clean(u.EscapedPath())
+	if strings.HasPrefix(clean, "//") {
 		return "/"
 	}
-	return p
+	if u.RawQuery != "" {
+		clean += "?" + u.RawQuery
+	}
+	return clean
 }

@@ -363,7 +363,10 @@ the running process won't pick up the new value through the web UI.
 - Server: `Server.Enabled`, `Server.ListenAddr`, `Server.AuthUser`,
   `Server.AuthHash`, `Server.OIDC.Issuer`, `Server.OIDC.ClientID`,
   `Server.OIDC.URL`, `Server.OIDC.Allow` (shown read-only as "Web Login";
-  editing the login from the page it guards could lock the operator out)
+  editing the login from the page it guards could lock the operator out;
+  `--server.oidc.issuer` on the CLI overlays all four, and `--server.auth`/
+  `--server.auth-hash` on the CLI without it turns the stored login off for
+  the process)
 - CAS: `CAS.Timeout`, `CAS.UserAgent`
 - Logger: `Logger.FileName`, `Logger.MaxSize`, `Logger.MaxBackups`
 - History: `History.Duration`, `History.MinSize`

@@ -691,8 +691,10 @@ func activateServer(ctx context.Context, settings *config.Settings, sf *bot.Spam
 	authPasswd := settings.Transient.WebAuthPasswd
 	authHash := settings.Server.AuthHash
 
-	if settings.Server.OIDC.Enabled() {
+	var oidcCfg config.OIDCSettings
+	if settings.OIDCActive() {
 		// the OIDC login replaces basic auth entirely
+		oidcCfg = settings.Server.OIDC
 		log.Printf("[INFO] OIDC login enabled for webapi server (issuer: %s)", settings.Server.OIDC.Issuer)
 		authHash = ""
 	} else if authHash != "" {
@@ -742,7 +744,7 @@ func activateServer(ctx context.Context, settings *config.Settings, sf *bot.Spam
 		DMUsersProvider: dmUsersProvider,
 		AuthUser:        settings.Server.AuthUser, // optional basic auth user (defaults to "tg-spam" when empty)
 		AuthHash:        authHash,                 // use the hash (either from options or generated)
-		OIDC:            settings.Server.OIDC,
+		OIDC:            oidcCfg,
 		Version:         revision,
 		Dbg:             settings.Transient.Dbg,
 		BotUsername:     botUsername,
