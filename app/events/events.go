@@ -2,6 +2,7 @@ package events
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"regexp"
@@ -84,6 +85,46 @@ func answerCallback(tbAPI TbAPI, queryID, text string) {
 	if _, err := tbAPI.Request(tbapi.NewCallback(queryID, text)); err != nil {
 		log.Printf("[WARN] failed to answer callback: %v", err)
 	}
+}
+
+// chatMemberStatus returns the user's status in the chat: creator, administrator, member, restricted, left
+// or kicked
+func chatMemberStatus(tbAPI TbAPI, chatID, userID int64) (string, error) {
+	resp, err := tbAPI.Request(tbapi.GetChatMemberConfig{ChatConfigWithUser: tbapi.ChatConfigWithUser{
+		ChatConfig: tbapi.ChatConfig{ChatID: chatID}, UserID: userID}})
+	if err != nil {
+		return "", fmt.Errorf("request: %w", err)
+	}
+	var member tbapi.ChatMember
+	if err := json.Unmarshal(resp.Result, &member); err != nil {
+		return "", fmt.Errorf("unmarshal chat member: %w", err)
+	}
+	return member.Status, nil
+}
+
+// liftRestrictions lifts every restriction from the user. per the Bot API, passing true for all permissions
+// lifts a restriction, the user is then a regular member bound by the chat's default permissions
+func liftRestrictions(tbAPI TbAPI, chatID, userID int64) error {
+	return requestOK(tbAPI, tbapi.RestrictChatMemberConfig{
+		ChatMemberConfig:              tbapi.ChatMemberConfig{ChatConfig: tbapi.ChatConfig{ChatID: chatID}, UserID: userID},
+		UseIndependentChatPermissions: true,
+		Permissions: &tbapi.ChatPermissions{CanSendMessages: true, CanSendAudios: true, CanSendDocuments: true,
+			CanSendPhotos: true, CanSendVideos: true, CanSendVideoNotes: true, CanSendVoiceNotes: true,
+			CanSendPolls: true, CanReactToMessages: true, CanSendOtherMessages: true, CanAddWebPagePreviews: true,
+			CanEditTag: true, CanChangeInfo: true, CanInviteUsers: true, CanPinMessages: true, CanManageTopics: true},
+	})
+}
+
+// requestOK sends a request whose response carries nothing but Ok
+func requestOK(tbAPI TbAPI, cfg tbapi.Chattable) error {
+	resp, err := tbAPI.Request(cfg)
+	if err != nil {
+		return fmt.Errorf("request: %w", err)
+	}
+	if !resp.Ok {
+		return fmt.Errorf("response is not Ok: %s", string(resp.Result))
+	}
+	return nil
 }
 
 // markdownV1LinkLabel makes text safe as a legacy markdown link label. Telegram copies a label verbatim
