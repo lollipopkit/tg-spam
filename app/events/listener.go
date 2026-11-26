@@ -195,6 +195,15 @@ func (l *TelegramListener) Do(ctx context.Context) error {
 		default:
 			l.captcha = newCaptcha(l.TbAPI, l.chatID, l.CaptchaTimeout, l.CaptchaMessage)
 			l.captcha.timeoutMute = l.CaptchaTimeoutMute
+			if l.adminChatID != 0 {
+				reports := &captchaReports{tbAPI: l.TbAPI, chatID: l.adminChatID, interval: captchaReportInterval}
+				l.captcha.report = reports.Add
+				// stops after captcha.Stop, deferred below, so notices of verifications ending in Stop are posted
+				reportCtx, stopReports := context.WithCancel(context.WithoutCancel(ctx))
+				reportsDone := make(chan struct{})
+				go func() { reports.Run(reportCtx); close(reportsDone) }()
+				defer func() { stopReports(); <-reportsDone }()
+			}
 			defer l.captcha.Stop()
 			if l.CaptchaTurnstile.Pages() {
 				if err := l.captcha.WithTurnstile(l.CaptchaTurnstile); err != nil {
@@ -267,6 +276,10 @@ func (l *TelegramListener) Do(ctx context.Context) error {
 
 				if strings.HasPrefix(callbackData, captchaPrefix) {
 					l.procCaptchaCallback(update.CallbackQuery)
+					continue
+				}
+				if strings.HasPrefix(callbackData, captchaReleasePrefix) {
+					l.procCaptchaRelease(update.CallbackQuery)
 					continue
 				}
 

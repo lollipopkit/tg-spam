@@ -1,7 +1,6 @@
 package events
 
 import (
-	"encoding/json"
 	"fmt"
 	"html"
 	"log"
@@ -55,8 +54,12 @@ type captcha struct {
 	// the chat until an admin lifts the restriction. the permanent mute is not recorded in muted, so on a rejoin
 	// it reads as anybody's restriction and is kept, with no new captcha that could lift it
 	timeoutMute bool
-	render      func(code string) ([]byte, error) // draws the challenge image
-	turnstile   *turnstile                        // set in Turnstile mode, nil for the motion animation
+	// report queues a notice to the admin chat about a member the captcha removed or muted, action "banned" or
+	// "muted" and cause the duration and reason; nil without an admin chat. called from timer and worker
+	// goroutines and the update loop, so it must not wait for telegram
+	report    func(user bot.User, action, cause string)
+	render    func(code string) ([]byte, error) // draws the challenge image
+	turnstile *turnstile                        // set in Turnstile mode, nil for the motion animation
 
 	workers chan struct{}  // limits concurrent verifications
 	running sync.WaitGroup // verifications in progress, waited for by Stop
@@ -122,13 +125,14 @@ func (c *captcha) verify(p *pendingCaptcha) {
 		if c.take(c.pending, user.ID, p) == nil {
 			return
 		}
-		if err := c.remove(user, left, "rejoined during captcha cooldown"); err != nil {
+		// telegram bans and mutes for at least a minute here, the notice must say what was applied
+		if err := c.remove(user, max(left, time.Minute), "rejoined during cooldown"); err != nil {
 			log.Printf("[WARN] %v", err)
 		}
 		return
 	}
 
-	status, err := c.memberStatus(user.ID)
+	status, err := chatMemberStatus(c.tbAPI, c.chatID, user.ID)
 	switch {
 	case err != nil && c.timeoutMute && c.mutedForGood(user.ID):
 		if c.take(c.pending, user.ID, p) == nil {
@@ -174,6 +178,7 @@ func (c *captcha) verify(p *pendingCaptcha) {
 					user, err, merr)
 				return
 			}
+			c.notify(user, "muted", 0, "not sent, sign-in required")
 			log.Printf("[ERROR] failed to send captcha to %s, muted for good as sign-in is required: %v", user, err)
 			return
 		}
@@ -184,7 +189,8 @@ func (c *captcha) verify(p *pendingCaptcha) {
 
 	// a slow render or upload must not leave the member too little time to answer: the rest of the timeout is
 	// raised to half of it, with the join mute extended to match
-	if minWait := c.timeout / 2; time.Until(deadline) < minWait {
+	// a captcha taken meanwhile (an admin let the member in, they left) must not be muted again
+	if minWait := c.timeout / 2; time.Until(deadline) < minWait && c.isCurrent(c.pending, p) {
 		extended := time.Now().Add(minWait)
 		if merr := c.muteUntil(user, extended.Add(captchaMuteSlack)); merr != nil {
 			log.Printf("[WARN] failed to extend the captcha mute of %s, the timeout stays: %v", user, merr)
@@ -409,6 +415,18 @@ func (c *captcha) IsPending(userID int64) bool {
 	return ok
 }
 
+// Forget drops everything the captcha holds on a member an admin let in: the pending captcha, with no failure
+// recorded, the failure count and the join mute record
+func (c *captcha) Forget(userID int64) {
+	if p := c.take(c.pending, userID, nil); p != nil {
+		deleteMessage(c.tbAPI, c.chatID, p.msgID, "captcha")
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.failures, userID)
+	delete(c.muted, userID)
+}
+
 // Cancel drops the captcha of a member who has left the chat. once the challenge was posted it counts as a
 // failure, which in the ban mode makes a rejoin run into the cooldown; nobody is banned, the member is gone
 func (c *captcha) Cancel(userID int64) {
@@ -514,7 +532,7 @@ func (c *captcha) expire(p *pendingCaptcha) {
 		log.Printf("[WARN] %v", err)
 	}
 	if c.timeoutMute {
-		c.muteForeverOrBan(p.user, "captcha timeout", true)
+		c.muteForeverOrBan(p.user, "timeout", true)
 	}
 }
 
@@ -524,7 +542,8 @@ func (c *captcha) expire(p *pendingCaptcha) {
 func (c *captcha) muteForeverOrBan(user bot.User, reason string, joinMuted bool) {
 	err := c.muteForever(user)
 	if err == nil {
-		log.Printf("[INFO] %s muted for good, %s", user, reason)
+		log.Printf("[INFO] %s muted for good, captcha %s", user, reason)
+		c.notify(user, "muted", 0, reason)
 		return
 	}
 	d := max(c.cooldownLeft(user.ID), captchaCooldown)
@@ -532,18 +551,34 @@ func (c *captcha) muteForeverOrBan(user bot.User, reason string, joinMuted bool)
 		// under the join mute (timeout) a timed mute only extends it. without one (unknown status on a rejoin)
 		// the member may carry a permanent mute that a timed one would replace, so nothing more is sent
 		if !joinMuted {
-			log.Printf("[ERROR] failed to mute %s for good, %s: %v, and to ban: %v", user, reason, err, berr)
+			log.Printf("[ERROR] failed to mute %s for good, captcha %s: %v, and to ban: %v", user, reason, err, berr)
 			return
 		}
 		if merr := c.mute(user, d); merr != nil {
-			log.Printf("[ERROR] failed to mute %s for good, %s: %v, to ban: %v, and to mute: %v", user, reason, err, berr, merr)
+			log.Printf("[ERROR] failed to mute %s for good, captcha %s: %v, to ban: %v, and to mute: %v", user, reason,
+				err, berr, merr)
 			return
 		}
-		log.Printf("[WARN] failed to mute %s for good, %s, and to ban, muted for %v: %v; %v", user, reason,
+		log.Printf("[WARN] failed to mute %s for good, captcha %s, and to ban, muted for %v: %v; %v", user, reason,
 			d.Round(time.Second), err, berr)
+		c.notify(user, "muted", d, reason)
 		return
 	}
-	log.Printf("[WARN] failed to mute %s for good, %s, banned for %v instead: %v", user, reason, d.Round(time.Second), err)
+	log.Printf("[WARN] failed to mute %s for good, captcha %s, banned for %v instead: %v", user, reason,
+		d.Round(time.Second), err)
+	c.notify(user, "banned", d, reason)
+}
+
+// notify reports a member removed or muted for d, 0 for good, to the admin chat
+func (c *captcha) notify(user bot.User, action string, d time.Duration, reason string) {
+	if c.report == nil {
+		return
+	}
+	cause := "for good"
+	if d > 0 {
+		cause = "for " + compactDuration(d)
+	}
+	c.report(user, action, cause+", captcha: "+reason)
 }
 
 // mutedForGood reports whether the member's last, not forgotten failure muted them for good
@@ -735,6 +770,7 @@ func (c *captcha) remove(user bot.User, d time.Duration, reason string) error {
 	err := c.ban(user, d)
 	if err == nil {
 		log.Printf("[INFO] %s removed for %v, captcha %s", user, d.Round(time.Second), reason)
+		c.notify(user, "banned", d, reason)
 		return nil
 	}
 	if c.timeoutMute {
@@ -743,11 +779,13 @@ func (c *captcha) remove(user bot.User, d time.Duration, reason string) error {
 		if merr := c.muteForever(user); merr != nil {
 			return fmt.Errorf("failed to remove %s after captcha %s: %w, and to mute for good: %w", user, reason, err, merr)
 		}
+		c.notify(user, "muted", 0, reason)
 		return fmt.Errorf("failed to remove %s after captcha %s, muted for good instead: %w", user, reason, err)
 	}
 	if merr := c.mute(user, d); merr != nil {
 		return fmt.Errorf("failed to remove %s after captcha %s: %w, and to mute: %w", user, reason, err, merr)
 	}
+	c.notify(user, "muted", d, reason)
 	return fmt.Errorf("failed to remove %s after captcha %s, muted for %v instead: %w", user, reason, d.Round(time.Second), err)
 }
 
@@ -817,7 +855,7 @@ func (c *captcha) muteForever(user bot.User) error {
 
 // restrict takes every permission from the member until untilDate (unix seconds, 0 for good)
 func (c *captcha) restrict(user bot.User, untilDate int64) error {
-	return c.request(tbapi.RestrictChatMemberConfig{
+	return requestOK(c.tbAPI, tbapi.RestrictChatMemberConfig{
 		ChatMemberConfig: tbapi.ChatMemberConfig{ChatConfig: tbapi.ChatConfig{ChatID: c.chatID}, UserID: user.ID},
 		UntilDate:        untilDate,
 		Permissions:      &tbapi.ChatPermissions{},
@@ -832,37 +870,15 @@ func (c *captcha) isMutedByCaptcha(userID int64) bool {
 	return ok && until.After(time.Now())
 }
 
-// unmute lifts the captcha mute. per the Bot API, passing true for all permissions lifts a restriction,
-// the member is then a regular member bound by the chat's default permissions
+// unmute lifts the captcha mute, the member is then a regular member bound by the chat's default permissions
 func (c *captcha) unmute(user bot.User) {
-	err := c.request(tbapi.RestrictChatMemberConfig{
-		ChatMemberConfig:              tbapi.ChatMemberConfig{ChatConfig: tbapi.ChatConfig{ChatID: c.chatID}, UserID: user.ID},
-		UseIndependentChatPermissions: true,
-		Permissions: &tbapi.ChatPermissions{CanSendMessages: true, CanSendAudios: true, CanSendDocuments: true,
-			CanSendPhotos: true, CanSendVideos: true, CanSendVideoNotes: true, CanSendVoiceNotes: true,
-			CanSendPolls: true, CanReactToMessages: true, CanSendOtherMessages: true, CanAddWebPagePreviews: true,
-			CanEditTag: true, CanChangeInfo: true, CanInviteUsers: true, CanPinMessages: true, CanManageTopics: true},
-	})
-	if err != nil {
+	if err := liftRestrictions(c.tbAPI, c.chatID, user.ID); err != nil {
 		log.Printf("[WARN] failed to unmute %s, the mute expires by itself: %v", user, err)
 		return
 	}
 	c.mu.Lock()
 	delete(c.muted, user.ID)
 	c.mu.Unlock()
-}
-
-func (c *captcha) memberStatus(userID int64) (string, error) {
-	resp, err := c.tbAPI.Request(tbapi.GetChatMemberConfig{ChatConfigWithUser: tbapi.ChatConfigWithUser{
-		ChatConfig: tbapi.ChatConfig{ChatID: c.chatID}, UserID: userID}})
-	if err != nil {
-		return "", fmt.Errorf("request: %w", err)
-	}
-	var member tbapi.ChatMember
-	if err := json.Unmarshal(resp.Result, &member); err != nil {
-		return "", fmt.Errorf("unmarshal chat member: %w", err)
-	}
-	return member.Status, nil
 }
 
 // send posts the animation with the caption and the candidate numbers, three per row
@@ -929,17 +945,6 @@ func (c *captcha) expandPrompt(user bot.User, message string) string {
 	mention := fmt.Sprintf(`<a href="tg://user?id=%d">%s</a>`, user.ID, html.EscapeString(name))
 	return strings.NewReplacer("{user}", mention, "{timeout}", compactDuration(c.timeout)).
 		Replace(html.EscapeString(message))
-}
-
-func (c *captcha) request(cfg tbapi.Chattable) error {
-	resp, err := c.tbAPI.Request(cfg)
-	if err != nil {
-		return fmt.Errorf("request: %w", err)
-	}
-	if !resp.Ok {
-		return fmt.Errorf("response is not Ok: %s", string(resp.Result))
-	}
-	return nil
 }
 
 func parseCaptchaData(data string) (userID int64, key string, err error) {

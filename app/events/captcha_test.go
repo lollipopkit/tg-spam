@@ -8,6 +8,7 @@ import (
 	"image/gif"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -25,14 +26,17 @@ const testCaptchaMsg = "{user}, enter the number within {timeout} <now>"
 // newCaptchaAPI mocks a chat where every member has the given status and every sent message gets ID 77
 func newCaptchaAPI(status string) *mocks.TbAPIMock {
 	return &mocks.TbAPIMock{
-		SendFunc: func(c tbapi.Chattable) (tbapi.Message, error) { return tbapi.Message{MessageID: 77}, nil },
-		RequestFunc: func(c tbapi.Chattable) (*tbapi.APIResponse, error) {
-			if _, ok := c.(tbapi.GetChatMemberConfig); ok {
-				return &tbapi.APIResponse{Ok: true, Result: []byte(`{"status":"` + status + `","user":{"id":1}}`)}, nil
-			}
-			return &tbapi.APIResponse{Ok: true}, nil
-		},
+		SendFunc:    func(c tbapi.Chattable) (tbapi.Message, error) { return tbapi.Message{MessageID: 77}, nil },
+		RequestFunc: func(c tbapi.Chattable) (*tbapi.APIResponse, error) { return memberStatusResponse(c, status), nil },
 	}
+}
+
+// memberStatusResponse answers a member status request with status and any other request with Ok
+func memberStatusResponse(c tbapi.Chattable, status string) *tbapi.APIResponse {
+	if _, ok := c.(tbapi.GetChatMemberConfig); ok {
+		return &tbapi.APIResponse{Ok: true, Result: []byte(`{"status":"` + status + `","user":{"id":1}}`)}
+	}
+	return &tbapi.APIResponse{Ok: true}
 }
 
 func stubRender(string) ([]byte, error) { return []byte("gif"), nil }
@@ -1244,7 +1248,7 @@ func TestCaptcha_TimeoutMute(t *testing.T) {
 		api := statusFails()
 		c := newMuteCaptcha(api, time.Minute)
 		require.NoError(t, c.fail(bot.User{ID: 42}, "timeout", false))
-		c.muteForeverOrBan(bot.User{ID: 42}, "captcha timeout", true)
+		c.muteForeverOrBan(bot.User{ID: 42}, "timeout", true)
 		require.True(t, c.mutedForGood(42))
 		startPosted(t, c, bot.User{ID: 42})
 		rs := requestsOf[tbapi.RestrictChatMemberConfig](api)
@@ -1264,7 +1268,7 @@ func TestCaptcha_TimeoutMute(t *testing.T) {
 		api := newCaptchaAPI("member")
 		c := newMuteCaptcha(api, time.Minute)
 		require.NoError(t, c.fail(bot.User{ID: 42}, "timeout", false))
-		c.muteForeverOrBan(bot.User{ID: 42}, "captcha timeout", true)
+		c.muteForeverOrBan(bot.User{ID: 42}, "timeout", true)
 		base := api.RequestFunc
 		api.RequestFunc = func(cfg tbapi.Chattable) (*tbapi.APIResponse, error) {
 			if _, ok := cfg.(tbapi.GetChatMemberConfig); ok {
@@ -1416,4 +1420,132 @@ func TestCaptcha_BanKeepsNewerJoinMuteRecord(t *testing.T) {
 	}
 	require.NoError(t, c.ban(bot.User{ID: 42}, captchaCooldown))
 	assert.True(t, c.isMutedByCaptcha(42), "the newer record stays")
+}
+
+type reported struct {
+	user          int64
+	action, cause string
+}
+
+// recordReports collects what c reports to the admin chat
+func recordReports(c *captcha) func() []reported {
+	var mu sync.Mutex
+	var res []reported
+	c.report = func(user bot.User, action, cause string) {
+		mu.Lock()
+		defer mu.Unlock()
+		res = append(res, reported{user: user.ID, action: action, cause: cause})
+	}
+	return func() []reported {
+		mu.Lock()
+		defer mu.Unlock()
+		return slices.Clone(res)
+	}
+}
+
+func TestCaptcha_Report(t *testing.T) {
+	newReportCaptcha := func(api *mocks.TbAPIMock, timeout time.Duration, mute bool) (*captcha, func() []reported) {
+		c := newCaptcha(api, 123, timeout, testCaptchaMsg)
+		c.render = stubRender
+		c.timeoutMute = mute
+		t.Cleanup(c.Stop)
+		return c, recordReports(c)
+	}
+	refuse := func(api *mocks.TbAPIMock, refused func(tbapi.Chattable) bool) {
+		base := api.RequestFunc
+		api.RequestFunc = func(cfg tbapi.Chattable) (*tbapi.APIResponse, error) {
+			if refused(cfg) {
+				return nil, errors.New("not enough rights")
+			}
+			return base(cfg)
+		}
+	}
+	isBan := func(cfg tbapi.Chattable) bool { _, ok := cfg.(tbapi.BanChatMemberConfig); return ok }
+	isMuteForever := func(cfg tbapi.Chattable) bool {
+		r, ok := cfg.(tbapi.RestrictChatMemberConfig)
+		return ok && r.UntilDate == 0 && !r.UseIndependentChatPermissions
+	}
+	wrongAnswer := func(t *testing.T, c *captcha) {
+		t.Helper()
+		startPosted(t, c, bot.User{ID: 42})
+		_ = c.HandleCallback(captchaQuery(42, 77, "C42:"+wrongCode(pendingCode(t, c, 42))))
+	}
+
+	t.Run("wrong answer reports the ban", func(t *testing.T) {
+		c, reports := newReportCaptcha(newCaptchaAPI("member"), time.Minute, false)
+		wrongAnswer(t, c)
+		assert.Equal(t, []reported{{42, "banned", "for 5m, captcha: wrong answer"}}, reports())
+	})
+	t.Run("rejoin during the cooldown reports the ban for the rest of it", func(t *testing.T) {
+		c, reports := newReportCaptcha(newCaptchaAPI("member"), time.Minute, false)
+		require.NoError(t, c.fail(bot.User{ID: 42}, "timeout", false))
+		c.Start(bot.User{ID: 42}, "")
+		c.running.Wait()
+		r := reports()
+		require.Len(t, r, 1)
+		assert.Equal(t, "banned", r[0].action)
+		assert.Regexp(t, `^for (5m|4m5\ds), captcha: rejoined during cooldown$`, r[0].cause)
+	})
+	t.Run("rejoin at the end of the cooldown bans and reports at least a minute", func(t *testing.T) {
+		api := newCaptchaAPI("member")
+		c, reports := newReportCaptcha(api, time.Minute, false)
+		c.failures[42] = captchaFailure{count: 1, last: time.Now().Add(-captchaCooldown + 10*time.Second)}
+		c.Start(bot.User{ID: 42}, "")
+		c.running.Wait()
+		assert.Equal(t, []reported{{42, "banned", "for 1m, captcha: rejoined during cooldown"}}, reports())
+		assertBannedFor(t, api, 42, time.Minute)
+	})
+	t.Run("timeout in the ban mode reports the ban", func(t *testing.T) {
+		c, reports := newReportCaptcha(newCaptchaAPI("member"), 50*time.Millisecond, false)
+		startPosted(t, c, bot.User{ID: 42})
+		require.Eventually(t, func() bool { return len(reports()) == 1 }, time.Second, 10*time.Millisecond)
+		assert.Equal(t, reported{42, "banned", "for 5m, captcha: timeout"}, reports()[0])
+	})
+	t.Run("timeout in the mute mode reports the permanent mute", func(t *testing.T) {
+		c, reports := newReportCaptcha(newCaptchaAPI("member"), 50*time.Millisecond, true)
+		startPosted(t, c, bot.User{ID: 42})
+		require.Eventually(t, func() bool { return len(reports()) == 1 }, time.Second, 10*time.Millisecond)
+		assert.Equal(t, reported{42, "muted", "for good, captcha: timeout"}, reports()[0])
+	})
+	t.Run("refused permanent mute reports the ban instead", func(t *testing.T) {
+		api := newCaptchaAPI("member")
+		refuse(api, isMuteForever)
+		c, reports := newReportCaptcha(api, 50*time.Millisecond, true)
+		startPosted(t, c, bot.User{ID: 42})
+		require.Eventually(t, func() bool { return len(reports()) == 1 }, time.Second, 10*time.Millisecond)
+		assert.Equal(t, reported{42, "banned", "for 5m, captcha: timeout"}, reports()[0])
+	})
+	t.Run("refused ban reports the timed mute in the ban mode", func(t *testing.T) {
+		api := newCaptchaAPI("member")
+		refuse(api, isBan)
+		c, reports := newReportCaptcha(api, time.Minute, false)
+		wrongAnswer(t, c)
+		assert.Equal(t, []reported{{42, "muted", "for 5m, captcha: wrong answer"}}, reports())
+	})
+	t.Run("refused ban reports the permanent mute in the mute mode", func(t *testing.T) {
+		api := newCaptchaAPI("member")
+		refuse(api, isBan)
+		c, reports := newReportCaptcha(api, time.Minute, true)
+		wrongAnswer(t, c)
+		assert.Equal(t, []reported{{42, "muted", "for good, captcha: wrong answer"}}, reports())
+	})
+	t.Run("nothing applied, nothing reported", func(t *testing.T) {
+		api := newCaptchaAPI("member")
+		refuse(api, func(cfg tbapi.Chattable) bool {
+			r, ok := cfg.(tbapi.RestrictChatMemberConfig)
+			return isBan(cfg) || ok && r.UntilDate != 0 && time.Until(time.Unix(r.UntilDate, 0)) > time.Minute*2
+		})
+		c, reports := newReportCaptcha(api, time.Minute, false)
+		wrongAnswer(t, c)
+		assert.Empty(t, reports())
+	})
+	t.Run("solving and leaving report nothing", func(t *testing.T) {
+		api := newCaptchaAPI("member")
+		c, reports := newReportCaptcha(api, time.Minute, false)
+		startPosted(t, c, bot.User{ID: 42})
+		press(t, c, api, 42, 42, 77, pendingCode(t, c, 42))
+		startPosted(t, c, bot.User{ID: 43})
+		c.Cancel(43)
+		assert.Empty(t, reports())
+	})
 }

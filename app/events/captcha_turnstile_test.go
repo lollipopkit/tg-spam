@@ -576,11 +576,13 @@ func TestCaptcha_TurnstileOIDC(t *testing.T) {
 
 	t.Run("no animation fallback, an unsent captcha mutes for good", func(t *testing.T) {
 		c, api, _, _ := newSignInCaptcha(t)
+		reports := recordReports(c)
 		api.SendFunc = func(tbapi.Chattable) (tbapi.Message, error) {
 			return tbapi.Message{}, errors.New("Bad Request: BOT_DOMAIN_INVALID")
 		}
 		c.Start(bot.User{ID: 42}, "")
 		c.running.Wait()
+		assert.Equal(t, []reported{{42, "muted", "for good, captcha: not sent, sign-in required"}}, reports())
 		require.Len(t, api.SendCalls(), 1, "only the login button is tried")
 		assert.False(t, c.IsPending(42))
 		restricts := requestsOf[tbapi.RestrictChatMemberConfig](api)
